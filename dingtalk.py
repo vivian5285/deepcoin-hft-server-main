@@ -33,6 +33,13 @@ P_MUTED = "#A569BD"
 
 FOOTER = "*🖨️ Quant AI · 深币紫金趋势大波段引擎*"
 VERIFY_TAG = "✅ 实盘核查通过"
+VERIFY_DELAY_MARK = "REST 同步略延迟"
+
+
+def _verify_line(verify_note, ok_text, delay_text):
+    if verify_note and VERIFY_DELAY_MARK in verify_note:
+        return _p(delay_text, P_ACCENT)
+    return _p(ok_text, P_MAIN)
 
 
 def _p(text, color=P_MAIN):
@@ -154,28 +161,55 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
     send_alert("🖨️ 战神出击：深币大级别主阵地建立", data)
 
 
-def report_intervention(qty, entry_px, new_sl, action_msg, verify_note=""):
+def report_intervention(qty, entry_px, new_sl, action_msg, verify_note="", verified=True):
     data = {
         "🛡️ 战术动作": _p(action_msg, P_ACCENT),
         "📦 利润头寸": _p(f"`{qty}` {UNIT_LABEL}", P_MAIN),
         "💰 原始成本": _p(f"`{entry_px:.2f}` USDT", P_MUTED),
         "🔒 最新硬防线": _p(f"**{new_sl:.2f}** USDT (条件保本单已挂)", P_LIGHT),
-        "📡 实盘核查": _p(f"{VERIFY_TAG} | 移动保本机制已触发", P_MAIN),
+        "📡 实盘核查": _verify_line(
+            verify_note if not verified else "",
+            f"{VERIFY_TAG} | 移动保本机制已触发",
+            f"⏳ 止损已提交，{VERIFY_DELAY_MARK} | 移动保本机制已触发",
+        ),
     }
     if verify_note:
         data["🔍 核查明细"] = _p(verify_note, P_MUTED)
     send_alert("📈 捷报：追踪雷达锁死趋势利润", data, P_DEEP)
 
 
+def report_tp_fill(tp_level, tp_price, filled_qty, remain_qty, entry_px, side, regime,
+                   verify_note="", verified=True):
+    data = {
+        "🎯 成交档位": _p(f"**TP{tp_level}** @ **{tp_price:.2f}** USDT", P_LIGHT),
+        "📦 本次止盈": _p(f"`{filled_qty}` {UNIT_LABEL}", P_ACCENT),
+        "📊 剩余头寸": _p(f"`{remain_qty}` {UNIT_LABEL}", P_MAIN),
+        "💰 持仓均价": _p(f"`{entry_px:.2f}` USDT", P_MUTED),
+        "🧭 方向/档位": _p(f"{side} | Regime {regime}", P_MUTED),
+        "📡 实盘核查": _verify_line(
+            verify_note if not verified else "",
+            f"{VERIFY_TAG} | TP{tp_level} 限价止盈已成交",
+            f"⏳ 止盈已成交，{VERIFY_DELAY_MARK} | 哨兵持续对齐",
+        ),
+    }
+    if verify_note:
+        data["🔍 核查明细"] = _p(verify_note, P_MUTED)
+    send_alert(f"🎯 捷报：深币 TP{tp_level} 止盈成交", data, P_DEEP)
+
+
 def report_manual_position_change(action_type, old_qty, new_qty, new_entry_price,
-                                  verify_note="", tp_audit=None):
+                                  verify_note="", tp_audit=None, verified=True):
     action_txt = _p("手动增仓", P_LIGHT) if "加仓" in action_type else _p("手动部分减仓", P_ACCENT)
     data = {
         "触发机制": _p("🛡️ 智慧大脑态势感知同步", P_MAIN),
         "实盘动作": action_txt,
         "数量变化": _p(f"`{old_qty}` ➔ `{new_qty}` {UNIT_LABEL}", P_ACCENT),
         "最新均价": _p(f"**{new_entry_price:.2f}** USDT", P_MAIN),
-        "后续动作": _p(f"{VERIFY_TAG} | 已按最新仓位比例智能重挂 TP123", P_LIGHT),
+        "后续动作": _verify_line(
+            verify_note if not verified else "",
+            f"{VERIFY_TAG} | 已按最新仓位比例智能重挂 TP123",
+            f"⏳ 重挂已提交，{VERIFY_DELAY_MARK} | 哨兵持续对齐",
+        ),
     }
     if tp_audit:
         data["🕸️ TP123 审计"] = _p(_format_tp_audit(tp_audit), P_ACCENT)
