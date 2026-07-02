@@ -23,7 +23,7 @@ TARGET_DIR="${1:-}"
 TARGET_PORT="${2:-}"
 GIT_REPO="${3:-}"
 
-DEFAULT_REPO="https://github.com/YOUR_USER/YOUR_REPO.git"
+DEFAULT_REPO="git@github.com:vivian5285/deepcoin-hft-server-main.git"
 
 if [ -z "$TARGET_DIR" ] || [ -z "$TARGET_PORT" ]; then
     echo -e "${RED}用法: bash setup_new_instance.sh <目录绝对路径> <端口> [git仓库URL]${NC}"
