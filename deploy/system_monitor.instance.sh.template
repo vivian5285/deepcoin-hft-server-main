@@ -1,0 +1,55 @@
+#!/bin/bash
+# 实例巡检模板 — 由 setup_new_instance.sh 生成，勿直接运行本文件
+
+DIR="__DIR__"
+PORT="__PORT__"
+
+if [ -f "$DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$DIR/.env"
+    set +a
+fi
+
+WEBHOOK_URL="${DINGTALK_WEBHOOK:-}"
+INSTANCE_LABEL="${INSTANCE_LABEL:-deepcoin}"
+
+port_listen() {
+    if command -v ss >/dev/null 2>&1 && ss -lnt "sport = :${PORT}" 2>/dev/null | grep -q LISTEN; then
+        return 0
+    fi
+    if command -v netstat >/dev/null 2>&1 && netstat -tuln 2>/dev/null | grep -q ":${PORT} "; then
+        return 0
+    fi
+    return 1
+}
+
+if ! port_listen; then
+    echo "$(date +'%Y-%m-%d %H:%M:%S') - 🚨 [${INSTANCE_LABEL}] 端口 ${PORT} 离线，执行抢救..."
+    cd "$DIR" || exit 1
+    bash deploy_deepcoin.sh
+    sleep 3
+
+    if port_listen; then
+        STATUS_TEXT="✅ **抢救成功**：${INSTANCE_LABEL} 已恢复监听 ${PORT}"
+    else
+        STATUS_TEXT="❌ **抢救失败**：请 SSH 排查 ${DIR}/logs/"
+    fi
+
+    if [ -n "$WEBHOOK_URL" ]; then
+        MSG=$(cat <<EOF
+{
+    "msgtype": "markdown",
+    "markdown": {
+        "title": "🚨 深币实例掉线",
+        "text": "### 🚨 ${INSTANCE_LABEL} 引擎宕机\n\n> **端口**: ${PORT}\n> **目录**: ${DIR}\n> **时间**: $(date +'%Y-%m-%d %H:%M:%S')\n\n${STATUS_TEXT}"
+    },
+    "at": {"isAtAll": false}
+}
+EOF
+)
+        curl -s -H "Content-Type: application/json" -d "$MSG" "$WEBHOOK_URL" > /dev/null || true
+    fi
+else
+    echo "$(date +'%Y-%m-%d %H:%M:%S') - ✅ [${INSTANCE_LABEL}] 端口 ${PORT} 正常"
+fi

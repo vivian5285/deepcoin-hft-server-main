@@ -1,0 +1,32 @@
+# 密钥与本地配置（切勿提交）
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 运行时状态与日志
+logs/
+*.log
+deepcoin_vps_state.json
+*.pid
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 部署生成的 per-instance 文件（可由 setup 脚本再生）
+deploy/nginx-*.conf.snippet
