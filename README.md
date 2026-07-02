@@ -192,55 +192,72 @@ curl -s http://127.0.0.1:5004/health
 
 ## 多用户 / 多实例部署（同一 VPS）
 
+> **⚠️ 若 VPS 已有币安(5003)、深币主实例(5004)、Gemini 等，新用户必须先审计，严禁复用端口/目录/Nginx 路径。**
+
 代码共用 **同一 GitHub 仓库**，每个用户 = **独立目录 + 独立 `.env` + 独立端口 + 独立反向代理**。
+
+### 部署前必做：审计现有服务
+
+```bash
+# 在 VPS 任意目录 clone 后，或在新实例目录内执行：
+bash deploy/audit_vps_before_new_instance.sh
+```
+
+会列出：5000–5010 监听端口、已知项目目录、`reserved_ports.conf`、Nginx 已有 location。
+
+### 已占用资源（勿冲突）
+
+| 服务 | 典型目录 | 典型端口 | 说明 |
+|------|---------|---------|------|
+| 币安 | `~/binance-engine` | **5003** | 勿动 |
+| 深币（主账户） | `~/deepcoin-hft-server` | **5004** | 勿动 |
+| Gemini | （以 VPS 实际为准） | **查 audit** | 写入 `deploy/reserved_ports.conf` |
+| **新用户 B** | `~/deepcoin-user2` | **5007+** | 建议从 5007 起，避开 5005/5006 若已被占 |
+
+编辑 `deploy/reserved_ports.conf` 登记 Gemini 实际端口后再跑 `setup_new_instance.sh`。
 
 | 实例 | 目录示例 | 端口 |
 |------|---------|------|
-| 主账户 | `/root/deepcoin-hft-server` | 5004 |
-| 用户 B | `/root/deepcoin-user2` | 5005 |
-| 用户 C | `/root/deepcoin-user3` | 5006 |
+| 主账户 | `/root/deepcoin-hft-server` | 5004（已占用） |
+| 用户 B | `/root/deepcoin-user2` | **5007**（示例，以 audit 为准） |
 
 ### 一键初始化（root 下执行）
 
 ```bash
-# 1. 先把 setup_new_instance.sh 里的 DEFAULT_REPO 改成你的 GitHub 地址
-# 2. 新建实例
-bash setup_new_instance.sh /root/deepcoin-user2 5005
+# 1. 先审计
+bash deploy/audit_vps_before_new_instance.sh
+
+# 2. 确认 Gemini 端口后写入 reserved_ports.conf，再新建（勿用 5003/5004）
+bash setup_new_instance.sh /root/deepcoin-user2 5007
 
 # 3. 填入该用户的 API / 钉钉
 vim /root/deepcoin-user2/.env
 
-# 4. 部署
+# 4. 部署（仅影响本目录、本端口）
 cd /root/deepcoin-user2 && bash deploy_deepcoin.sh
 ```
 
-脚本会自动：clone 代码 → 创建 venv → 生成 `.env`（含随机 WEBHOOK_SECRET）→ 生成 Nginx 片段 → 生成巡检脚本。
-
 ### Nginx 反向代理
 
-初始化后在 `deploy/nginx-<实例名>.conf.snippet` 有现成片段，例如：
+**只追加新 `location` 块，不要修改币安/深币/Gemini 已有配置。**
+
+初始化后在 `deploy/nginx-<实例名>.conf.snippet` 有现成片段：
 
 ```
 https://你的域名/deepcoin/deepcoin-user2/webhook
-  → 127.0.0.1:5005/webhook
+  → 127.0.0.1:5007/webhook
 ```
 
 ```bash
-# 示例：写入 nginx 并重载
 cat /root/deepcoin-user2/deploy/nginx-deepcoin-user2.conf.snippet >> /etc/nginx/sites-available/default
 nginx -t && systemctl reload nginx
 ```
 
-### TradingView
+### 隔离保证
 
-- URL：`https://域名/deepcoin/deepcoin-user2/webhook`（或直连 `http://IP:5005/webhook`）
-- JSON 里 `secret` 必须与**该实例** `.env` 的 `WEBHOOK_SECRET` 一致
-
-### 注意
-
-- `deploy_deepcoin.sh` 已改为**只杀本实例端口进程**，不会影响 5004 上的主实例
-- 每个实例有独立 `logs/`、`deepcoin_vps_state.json`、TV/开仓日志
-- 更新代码：各目录分别 `git pull && bash deploy_deepcoin.sh`
+- `deploy_deepcoin.sh` **只杀本实例 `--bind` 端口** 的 gunicorn，不会误杀 5003/5004/Gemini
+- 每个实例独立 `venv/`、`logs/`、`deepcoin_vps_state.json`
+- `setup_new_instance.sh` 会拒绝 `reserved_ports.conf` 中的端口及受保护目录
 
 ---
 

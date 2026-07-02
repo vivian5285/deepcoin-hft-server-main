@@ -46,6 +46,39 @@ if [ -d "$TARGET_DIR" ] && [ "$(ls -A "$TARGET_DIR" 2>/dev/null | wc -l)" -gt 0 
     exit 1
 fi
 
+# ── 与 VPS 现有项目冲突检查（币安/深币主实例/Gemini 等）──
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESERVED_FILE="$SCRIPT_DIR/deploy/reserved_ports.conf"
+PROTECTED_DIRS=(
+    "/root/binance-engine"
+    "/root/deepcoin-hft-server"
+    "/root/deepcoin-hft-server-main"
+    "/root/gemini-engine"
+    "/root/gemini"
+)
+
+for pdir in "${PROTECTED_DIRS[@]}"; do
+    if [ "$TARGET_DIR" = "$pdir" ]; then
+        echo -e "${RED}禁止覆盖现有项目目录: ${pdir}${NC}"
+        echo -e "${YELLOW}请使用新目录，例如 /root/deepcoin-user2${NC}"
+        exit 1
+    fi
+done
+
+if [ -f "$RESERVED_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="$(echo "$line" | tr -d '[:space:]')"
+        [ -z "$line" ] && continue
+        if [ "$line" = "$TARGET_PORT" ]; then
+            echo -e "${RED}端口 ${TARGET_PORT} 在 deploy/reserved_ports.conf 中已登记为占用（币安/深币/Gemini 等）${NC}"
+            echo -e "${YELLOW}请先运行: bash deploy/audit_vps_before_new_instance.sh${NC}"
+            echo -e "${YELLOW}并选用未占用端口（如 5007、5008），或仅在确认安全后编辑 reserved_ports.conf${NC}"
+            exit 1
+        fi
+    done < "$RESERVED_FILE"
+fi
+
 # 端口占用检查
 port_busy() {
     if command -v ss >/dev/null 2>&1 && ss -lnt "sport = :${TARGET_PORT}" 2>/dev/null | grep -q LISTEN; then
@@ -125,10 +158,13 @@ echo -e "  健康检查:     curl -s http://127.0.0.1:${TARGET_PORT}/health"
 echo -e "  WEBHOOK_SECRET: ${RAND_SECRET}  (已写入 .env)"
 echo ""
 echo -e "${CYAN}下一步:${NC}"
+echo -e "  0. ${YELLOW}部署前审计（必做）:${NC} bash ${TARGET_DIR}/deploy/audit_vps_before_new_instance.sh"
 echo -e "  1. vim ${TARGET_DIR}/.env   # 填入 DEEPCOIN_API_* 和 DINGTALK_*"
 echo -e "  2. bash ${TARGET_DIR}/deploy_deepcoin.sh   # 改完 env 后再部署"
-echo -e "  3. 配置 Nginx 反向代理 → 参考 ${NGINX_SNIP}"
+echo -e "  3. Nginx ${YELLOW}新增${NC} location 片段（勿改币安/深币/Gemini 已有配置）→ ${NGINX_SNIP}"
 echo -e "  4. TradingView 告警 URL → https://你的域名/deepcoin/${INSTANCE_NAME}/webhook"
-echo -e "  5. crontab 巡检（可选）:"
+echo -e "  5. crontab 巡检（可选，勿与现有实例重复杀进程）:"
 echo -e "     */5 * * * * ${TARGET_DIR}/system_monitor.sh >> ${TARGET_DIR}/logs/monitor.log 2>&1"
+echo -e ""
+echo -e "${YELLOW}⚠️  勿使用 5003(币安)/5004(深币主实例) 及 Gemini 已占端口；新实例仅操作本目录与本端口${NC}"
 echo ""
