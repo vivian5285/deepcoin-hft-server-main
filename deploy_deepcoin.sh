@@ -182,14 +182,14 @@ install_deps() {
     find "$DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
     find "$DIR" -name "*.pyc" -delete 2>/dev/null || true
 
-    if grep -qE "CLIENT_VERSION.*v13\.4\.(7|8)" "$DIR/deepcoin_client.py" 2>/dev/null; then
+    if grep -qE "CLIENT_VERSION.*v13\.4\.(7|8|9)" "$DIR/deepcoin_client.py" 2>/dev/null; then
         log_ok "deepcoin_client.py 版本已就绪 ($(grep CLIENT_VERSION "$DIR/deepcoin_client.py" | head -1))"
     else
         log_fail "deepcoin_client.py 不是最新版！请先 push/pull v13.4.8+ 代码"
         return 1
     fi
 
-    if grep -qE "DEEPCOIN_SUPERVISOR_VERSION.*v13\.4\.(7|8)" "$DIR/position_supervisor_deepcoin.py" 2>/dev/null; then
+    if grep -qE "DEEPCOIN_SUPERVISOR_VERSION.*v13\.4\.(7|8|9|10)" "$DIR/position_supervisor_deepcoin.py" 2>/dev/null; then
         log_ok "position_supervisor_deepcoin.py 版本已就绪 ($(grep DEEPCOIN_SUPERVISOR_VERSION "$DIR/position_supervisor_deepcoin.py" | head -1))"
     else
         log_fail "position_supervisor_deepcoin.py 不是最新版！请先 push/pull v13.4.8+ 代码"
@@ -278,10 +278,10 @@ health_check() {
 
     # 6d. 大脑加载日志（大脑写入 deepcoin_brain.log，非 gunicorn error log）
     sleep 2
-    if grep -qE "v13\.4\.(7|8)" "$BRAIN_LOG" 2>/dev/null; then
-        log_ok "VPS 大脑 v13.4.8+ 已成功加载"
+    if grep -qE "v13\.4\.(7|8|9)" "$BRAIN_LOG" 2>/dev/null; then
+        log_ok "VPS 大脑 v13.4.9+ 已成功加载"
     elif grep -q "深币 VPS" "$BRAIN_LOG" 2>/dev/null || grep -q "军师托管版" "$BRAIN_LOG" 2>/dev/null; then
-        log_warn "大脑已加载但版本可能过旧（日志中无 v13.4.8+，请确认代码已更新）"
+        log_warn "大脑已加载但版本可能过旧（日志中无 v13.4.9+，请确认代码已更新）"
     elif grep -q "深币 VPS" "$LOG_DIR/gunicorn_error.log" 2>/dev/null; then
         log_ok "VPS 大脑模块已成功加载 (gunicorn_error.log)"
     else
