@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.4.8-tp-radar-dingtalk"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.4.10-recover-dingtalk"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -380,6 +380,12 @@ class PositionSupervisor:
                 return True
         return False
 
+    def _verify_position_qty(self, expected_qty, expected_side=None):
+        pos = self._verify_position(expected_side)
+        if not pos or self._safe_qty(pos.get("size")) != expected_qty:
+            return None
+        return pos
+
     def _report_flat_close(self, reason, swept_dust=False):
         """平仓/止盈收网钉钉：REST 核查重试"""
         flat = self._wait_verify(self._verify_flat, retries=6, delay=0.5)
@@ -430,7 +436,35 @@ class PositionSupervisor:
         deepcoin_client.cancel_all_open_orders(self.symbol)
         self._report_flat_close(reason, swept_dust=True)
 
-    def _scan_and_sweep_dust_on_startup(self):
+    def _apply_recover_live_alignment(self, side, reconcile):
+        """重启以实盘为准：不回放 TV 平仓，不因日志方向差异核武全平（仅 live webhook 才平仓）"""
+        extra_notes = []
+        if reconcile.get("tv_close"):
+            action = (self.last_tv_signal or {}).get("action", "CLOSE")
+            msg = (
+                f"TV日志末条为 {action}，重启不回放平仓 → 以实盘 {side} 继续闪电接管"
+            )
+            logger.warning(f"🔄 [重启] {msg}")
+            extra_notes.append(msg)
+            last_open_tv = self._load_last_tv_open_signal()
+            if last_open_tv:
+                self.last_tv_side = (last_open_tv.get("action") or side).upper()
+                open_tps = self._sanitize_tp_prices(last_open_tv.get("tv_tps", []))
+                if sum(1 for t in open_tps if t > 0) > 0:
+                    self.tv_tps = open_tps
+        if reconcile.get("direction_mismatch") or (
+                self.last_tv_side and side != self.last_tv_side
+        ):
+            old_tv = self.last_tv_side
+            self.last_tv_side = side
+            msg = f"方向以实盘为准: {side} (TV日志={old_tv})"
+            logger.warning(f"🔄 [重启] {msg}")
+            extra_notes.append(msg)
+        elif not self.last_tv_side:
+            self.last_tv_side = side
+        return extra_notes
+
+    def _scan_and_sweep_dust_on_startup(self, was_monitoring=False):
         """重启首检：发现蚂蚁仓/止盈残张 → 扫尾收网，避免误接管为正常持仓"""
         pos = self._get_active_position()
         if not pos or self._safe_qty(pos.get("size")) <= 0:
@@ -438,6 +472,15 @@ class PositionSupervisor:
         if not self.current_side:
             self.current_side = "LONG" if pos.get("posSide") == "long" else "SHORT"
         real_amt = self._safe_qty(pos["size"])
+        ref = max(self._safe_qty(self.initial_qty), self._safe_qty(self.watched_qty))
+        if was_monitoring and not self._is_dust_qty(real_amt):
+            if ref <= 0 or real_amt > max(
+                DUST_ORPHAN_CONTRACTS, int(ref * TP_COMPLETE_RESIDUAL_RATIO)
+            ):
+                logger.info(
+                    f"🔄 [重启扫描] 活跃主仓 {real_amt}张 (ref={ref})，跳过蚂蚁扫尾"
+                )
+                return False
         if not self._is_dust_qty(real_amt) and not self._should_finalize_tp_victory(real_amt):
             return False
         if self._safe_qty(self.initial_qty) > 0 or self._safe_qty(self.watched_qty) > 0:
@@ -1682,7 +1725,7 @@ class PositionSupervisor:
                     self.initial_qty = s.get("initial_qty", 0)
                     self.last_tv_signal = s.get("last_tv_signal")
 
-            if self._scan_and_sweep_dust_on_startup():
+            if self._scan_and_sweep_dust_on_startup(was_monitoring=saved_monitoring):
                 return
 
             if self._recover_missed_flat_on_startup(was_monitoring=saved_monitoring):
@@ -1696,22 +1739,8 @@ class PositionSupervisor:
                 side = "LONG" if pos.get("posSide") == "long" else "SHORT"
                 self.current_side = side
 
-                if reconcile.get("tv_close"):
-                    logger.warning("🔄 [重启] TV 最新为平仓指令，执行清场")
-                    self._close_all(
-                        f"🔄 重启对账: TV已发{(self.last_tv_signal or {}).get('action', 'CLOSE')}，执行清场"
-                    )
-                    return
-
-                if reconcile.get("direction_mismatch") or side != self.last_tv_side:
-                    logger.warning(
-                        f"🔄 [重启] 方向背离 实盘{side} vs TV{self.last_tv_side} → 核武对齐"
-                    )
-                    self._close_all(
-                        f"🔄 重启方向背离: 实盘({side}) vs TV({self.last_tv_side})",
-                        force_align=(side, self.last_tv_side),
-                    )
-                    return
+                align_notes = self._apply_recover_live_alignment(side, reconcile)
+                reconcile_notes.extend(align_notes)
 
                 saved_initial = self._safe_qty(self.initial_qty)
                 if saved_initial <= 0:
@@ -1761,50 +1790,65 @@ class PositionSupervisor:
 
                 threading.Thread(target=self._sentinel_loop, daemon=True).start()
 
-                verified = self._verify_position(self.current_side)
-                if verified and self._safe_qty(verified['size']) == real_amt:
-                    tv_note = ""
-                    if self.last_tv_signal:
-                        tv_note = (
-                            f" | 最新TV: {self.last_tv_signal.get('action')} "
-                            f"@{self.last_tv_signal.get('ts', '')}"
-                        )
-                    reconcile_txt = (" | " + " ; ".join(reconcile_notes)) if reconcile_notes else ""
-                    skip_note = " | 盘口已齐全，未重复补挂" if not _rebuilt else ""
-                    verify_note = (
-                        f"接管 {real_amt}张 @ {verified['entry_price']:.2f} | "
-                        f"TV方向 {self.last_tv_side} | "
-                        f"止盈 {matched}/{expected} 档 | "
-                        f"{self._format_audit_summary(audit)}{skip_note}{tv_note}{reconcile_txt}"
+                verified = self._wait_verify(
+                    lambda: self._verify_position_qty(real_amt, self.current_side),
+                    retries=8,
+                    delay=0.5,
+                )
+                entry_px = float(
+                    (verified or pos).get("entry_price", self.watched_entry)
+                )
+                tv_note = ""
+                if self.last_tv_signal:
+                    tv_note = (
+                        f" | 最新TV: {self.last_tv_signal.get('action')} "
+                        f"@{self.last_tv_signal.get('ts', '')}"
                     )
-                    dingtalk.report_recover_takeover(
-                        self.current_side, real_amt, verified['entry_price'],
-                        self.tv_tps, self.regime, radar_active, self.current_sl,
-                        verify_note=verify_note,
-                        tp_matched=matched,
-                        tp_expected=expected,
+                reconcile_txt = (" | " + " ; ".join(reconcile_notes)) if reconcile_notes else ""
+                skip_note = " | 盘口已齐全，未重复补挂" if not _rebuilt else ""
+                verify_note = (
+                    f"接管 {real_amt}张 @ {entry_px:.2f} | "
+                    f"TV方向 {self.last_tv_side} | "
+                    f"止盈 {matched}/{expected} 档 | "
+                    f"{self._format_audit_summary(audit)}{skip_note}{tv_note}{reconcile_txt}"
+                )
+                if not verified:
+                    verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
+                self._call_dingtalk(
+                    dingtalk.report_recover_takeover,
+                    side=self.current_side,
+                    qty=real_amt,
+                    entry=entry_px,
+                    tv_tps=self.tv_tps,
+                    regime=self.regime,
+                    radar_active=radar_active,
+                    sl_price=self.current_sl,
+                    verify_note=verify_note,
+                    tp_matched=matched,
+                    tp_expected=expected,
+                    tp_audit=audit,
+                    last_tv_signal=self.last_tv_signal,
+                    radar_sl_ok=sl_ok,
+                )
+                if qty_change:
+                    old_q, new_q, action_msg = qty_change
+                    self._call_dingtalk(
+                        dingtalk.report_manual_position_change,
+                        action_type=action_msg,
+                        old_qty=old_q,
+                        new_qty=new_q,
+                        new_entry_price=entry_px,
+                        verify_note=f"重启接管检测 | {verify_note}",
                         tp_audit=audit,
-                        last_tv_signal=self.last_tv_signal,
-                        radar_sl_ok=sl_ok,
+                        verified=bool(verified),
                     )
-                    if qty_change:
-                        old_q, new_q, action_msg = qty_change
-                        dingtalk.report_manual_position_change(
-                            action_msg, old_q, new_q, verified['entry_price'],
-                            verify_note=(
-                                f"重启接管检测 | {verify_note}"
-                            ),
-                            tp_audit=audit,
-                        )
-                    if expected > 0 and matched < expected:
-                        dingtalk.report_system_alert(
-                            "重启接管后限价止盈未对齐",
-                            f"{self.current_side} {real_amt}张 @ {verified['entry_price']:.2f} | "
-                            f"仅 {matched}/{expected} 档 | {self._format_audit_summary(audit)} | "
-                            f"请查 logs/deepcoin_brain.log",
-                        )
-                else:
-                    logger.warning("重启接管钉钉跳过：实盘核查未通过")
+                if expected > 0 and matched < expected:
+                    dingtalk.report_system_alert(
+                        "重启接管后限价止盈未对齐",
+                        f"{self.current_side} {real_amt}张 @ {entry_px:.2f} | "
+                        f"仅 {matched}/{expected} 档 | {self._format_audit_summary(audit)} | "
+                        f"请查 logs/deepcoin_brain.log",
+                    )
                 logger.info("  -> 🎉 实盘阵地接管完毕，TP123 及雷达系统已复位。")
             else:
                 deepcoin_client.cancel_all_open_orders(self.symbol)
@@ -1814,6 +1858,17 @@ class PositionSupervisor:
                 self.initial_qty = 0
                 self.current_side = None
                 self._save_state()
+                flat_ok = self._wait_verify(self._verify_flat, retries=6, delay=0.5)
+                standby_note = (
+                    f"重启完成 | 盘口无持仓 | 挂单已清空 | "
+                    f"{DEEPCOIN_SUPERVISOR_VERSION}"
+                )
+                if not flat_ok:
+                    standby_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
+                dingtalk.report_recover_standby(
+                    verify_note=standby_note,
+                    version=DEEPCOIN_SUPERVISOR_VERSION,
+                )
         except Exception as e:
             logger.error(f"❌ 闪电接管异常: {e}")
             dingtalk.report_system_alert("重启接管失败", str(e))
