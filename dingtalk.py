@@ -320,6 +320,17 @@ def report_recover_takeover(side, qty, entry, tv_tps, regime, radar_active, sl_p
     send_alert("🔄 深币 VPS 重启 · 闪电接管报告", data)
 
 
+def report_recover_standby(verify_note="", version=""):
+    data = {
+        "📡 实盘核查": _p(f"{VERIFY_TAG} | 盘口无持仓", P_MAIN),
+        "✅ 系统状态": _p("空仓待命 · 挂单已清空 · 雷达/哨兵复位", P_LIGHT),
+        "🔮 版本": _p(version or "deepcoin_webhook", P_MUTED),
+    }
+    if verify_note:
+        data["🔍 核查明细"] = _p(verify_note, P_MUTED)
+    send_alert("🔄 深币 VPS 重启 · 空仓待命", data, P_ACCENT)
+
+
 def report_system_alert(title, detail):
     send_alert(f"⚠️ 系统告警：{title}", {
         "⚠️ 告警级别": _p("最高级别 (CRITICAL)", P_DEEP),
