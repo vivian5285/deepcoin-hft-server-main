@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# position_supervisor_deepcoin.py — 与币安 VPS 逻辑完全对齐（深币张数/8x 适配）
+# position_supervisor_deepcoin.py — 与币安 VPS 逻辑完全对齐（深币张数/10x 适配）
 import logging
 import time
 import threading
@@ -45,7 +45,7 @@ class PositionSupervisor:
             3: {"margin": 0.35, "ratios": [0.18, 0.32, 0.50], "activation": 0.60, "trail_offset": 0.90},
             4: {"margin": 0.50, "ratios": [0.05, 0.20, 0.75], "activation": 0.70, "trail_offset": 1.30},
         }
-        self.leverage = 8
+        self.leverage = 10
         self.face_value = 0.1
 
         self.regime = 3
