@@ -375,7 +375,7 @@ class DeepcoinClient:
     def get_position_info(self, symbol="ETH-USDT-SWAP"):
         return self._request("GET", "/account/positions", {"instType": "SWAP", "instId": symbol})
 
-    def set_leverage(self, symbol="ETH-USDT-SWAP", leverage=20, mgn_mode="cross", mrg_position="merge"):
+    def set_leverage(self, symbol="ETH-USDT-SWAP", leverage=8, mgn_mode="cross", mrg_position="merge"):
         """POST /deepcoin/account/set-leverage"""
         res = self._request("POST", "/account/set-leverage", {
             "instId": symbol,
