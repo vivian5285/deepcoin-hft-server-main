@@ -20,7 +20,7 @@ DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK", "")
 DINGTALK_SECRET = os.getenv("DINGTALK_SECRET", "")
 
 EXCHANGE_LABEL = "深币 Deepcoin"
-LEVERAGE_LABEL = "8x"
+LEVERAGE_LABEL = "10x"
 UNIT_LABEL = "张"
 
 # 深币专属紫色色板（与币安 #F3BA2F 金色完全区分）
