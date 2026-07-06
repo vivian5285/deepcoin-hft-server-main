@@ -22,13 +22,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.6.6-qty-align-threshold"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.6.7-qty-align-10pct"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
 DUST_ORPHAN_CONTRACTS = 1
 TP_COMPLETE_RESIDUAL_RATIO = 0.12
-OPEN_OVERSIZE_RATIO = 1.05
+OPEN_OVERSIZE_RATIO = 1.10
 SIGNAL_DEDUP_SEC = 45
 DEFENSE_ALIGN_COOLDOWN_SEC = 60
 SENTINEL_GRACE_AFTER_RECOVER_SEC = 45
@@ -37,7 +37,7 @@ REGIME_CAP_TOLERANCE_CONTRACTS = 0
 CAP_MIN_RETAIN_RATIO = 0.25
 CAP_TRIM_MAX_ROUNDS = 4
 QTY_DRIFT_TOLERANCE_PCT = 0.015  # 微漂 ≤1.5%：仅同步账本
-QTY_ALIGN_MIN_PCT = 0.05         # 偏离 ≥5% 才离谱，触发对齐/档位裁减
+QTY_ALIGN_MIN_PCT = 0.10         # 偏离 ≥10% 才离谱，触发对齐/档位裁减
 SHIELD_ACTIVATION_PCT = 0.02
 SHIELD_TIER_PCTS = (0.02, 0.03, 0.05)
 SHIELD_TIER_RATIOS = (0.33, 0.33, 0.34)
@@ -365,7 +365,7 @@ class PositionSupervisor:
         return abs(new - old) / max(old, new, 1e-9)
 
     def _is_material_qty_change(self, old_qty, new_qty):
-        """离谱级异动：偏离 ≥5% 才触发对齐；微漂仅同步账本"""
+        """离谱级异动：偏离 ≥10% 才触发对齐；微漂仅同步账本"""
         old = self._safe_qty(old_qty)
         new = self._safe_qty(new_qty)
         delta = abs(new - old)
@@ -531,7 +531,7 @@ class PositionSupervisor:
         return qty, balance, margin_usdt, margin_pct
 
     def _regime_cap_tolerance(self, target_qty):
-        """档位裁减容忍：离谱才管 — 超标 ≤5% 不裁"""
+        """档位裁减容忍：离谱才管 — 超标 ≤10% 不裁"""
         target = int(target_qty or 0)
         if target <= 0:
             return REGIME_CAP_TOLERANCE_CONTRACTS
