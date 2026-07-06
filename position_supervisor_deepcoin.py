@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.6.9-shield-single-set"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.7.0-shield-smart"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -42,7 +42,10 @@ SHIELD_ACTIVATION_PCT = 0.03  # ETH 现价相对开仓价浮亏 ≥3% 才激活�
 SHIELD_TIER_PCTS = (0.03, 0.04, 0.05)  # 以开仓价为基准挂条件止损：-3% / -4% / -5%
 SHIELD_TIER_RATIOS = (0.33, 0.33, 0.34)
 SHIELD_STOP_TOLERANCE = 2.0
-SHIELD_PLACE_COOLDOWN_SEC = 30
+SHIELD_MAINTAIN_COOLDOWN_SEC = 60
+SHIELD_FAIL_BACKOFF_BASE_SEC = 45
+SHIELD_FAIL_BACKOFF_MAX_SEC = 300
+SHIELD_QTY_TOLERANCE_PCT = 0.04
 SHIELD_MAX_TIER_ORDERS = 1
 # 同向 TV 智能筛选：① ATR 变化 → 先平后开；② 价差低于该百分比 → 不重复开仓，仅刷新 TP123
 SAME_DIR_MIN_SPREAD_PCT = 0.15
@@ -101,7 +104,9 @@ class PositionSupervisor:
         self._last_regime_cap_ts = 0.0
         self.shield_active = False
         self.shield_tiers_consumed = []
-        self._last_shield_place_ts = 0.0
+        self._last_shield_maintain_ts = 0.0
+        self._shield_fail_streak = 0
+        self._last_shield_fail_ts = 0.0
         self.sizing_principal = 0.0
 
         self.state_file = 'deepcoin_vps_state.json'
@@ -1249,31 +1254,144 @@ class PositionSupervisor:
     def _split_shield_quantities(self, total_qty):
         return self._calculate_tp_quantities(self._safe_qty(total_qty), list(SHIELD_TIER_RATIOS))
 
-    def _shield_orders_ok(self, live_qty, entry=None):
+    def _can_maintain_shield_now(self, force=False):
+        if force:
+            return True
+        now = time.time()
+        if now < getattr(self, "_sentinel_grace_until", 0):
+            return False
+        if now - getattr(self, "_last_shield_maintain_ts", 0) < SHIELD_MAINTAIN_COOLDOWN_SEC:
+            return False
+        streak = getattr(self, "_shield_fail_streak", 0)
+        if streak > 0:
+            backoff = min(
+                SHIELD_FAIL_BACKOFF_BASE_SEC * (2 ** (streak - 1)),
+                SHIELD_FAIL_BACKOFF_MAX_SEC,
+            )
+            if now - getattr(self, "_last_shield_fail_ts", 0) < backoff:
+                return False
+        return True
+
+    def _record_shield_maintain(self, success):
+        self._last_shield_maintain_ts = time.time()
+        if success:
+            self._shield_fail_streak = 0
+        else:
+            self._shield_fail_streak = getattr(self, "_shield_fail_streak", 0) + 1
+            self._last_shield_fail_ts = time.time()
+
+    def _audit_shield_orders(self, live_qty, entry=None):
         tier_prices = self._shield_tier_prices(entry)
         live_qty = self._safe_qty(self._resolve_live_qty(live_qty))
         remaining = self._remaining_shield_tier_indices()
+        result = {
+            "status": "none",
+            "live_qty": live_qty,
+            "remaining": remaining,
+            "tier_prices": tier_prices,
+            "buckets": {},
+            "qty_map": {},
+            "max_drift_pct": 0.0,
+            "issues": [],
+        }
         if not remaining:
-            return live_qty <= 0
+            result["status"] = "ok" if live_qty <= 0 else "none"
+            return result
         if live_qty <= 0:
-            return False
+            result["status"] = "missing"
+            result["issues"].append("no_position")
+            return result
+
         qty_map = self._shield_quantities_for_remaining(live_qty)
+        result["qty_map"] = qty_map
         buckets = self._shield_orders_at_tiers(tier_prices)
+        result["buckets"] = buckets
+
+        has_duplicate = False
+        has_missing = False
+        has_qty_mismatch = False
+        max_drift_pct = 0.0
+
         for idx in remaining:
             q = qty_map.get(idx, 0)
             if q <= 0:
                 continue
             orders = buckets.get(idx, [])
-            if len(orders) != SHIELD_MAX_TIER_ORDERS:
-                return False
-            if abs(orders[0]["qty"] - q) > 0:
-                return False
+            if not orders:
+                has_missing = True
+                result["issues"].append(f"tier{idx + 1}_missing")
+            elif len(orders) > SHIELD_MAX_TIER_ORDERS:
+                has_duplicate = True
+                result["issues"].append(f"tier{idx + 1}_dup:{len(orders)}")
+            else:
+                drift = abs(orders[0]["qty"] - q) / q if q > 0 else 1.0
+                max_drift_pct = max(max_drift_pct, drift)
+                if drift > SHIELD_QTY_TOLERANCE_PCT:
+                    has_qty_mismatch = True
+                    result["issues"].append(
+                        f"tier{idx + 1}_qty:{orders[0]['qty']}vs{q}"
+                    )
+
         for idx, orders in buckets.items():
-            if idx in remaining and orders:
-                continue
-            if orders:
-                return False
-        return True
+            if idx not in remaining and orders:
+                has_duplicate = True
+                result["issues"].append(f"tier{idx + 1}_orphan:{len(orders)}")
+
+        result["max_drift_pct"] = max_drift_pct
+        if has_duplicate:
+            result["status"] = "duplicate"
+        elif has_missing:
+            result["status"] = "missing"
+        elif has_qty_mismatch:
+            result["status"] = "qty_mismatch"
+        else:
+            result["status"] = "ok"
+        return result
+
+    def _shield_orders_adequate(self, audit):
+        if audit["status"] == "ok":
+            return True
+        if audit["status"] == "qty_mismatch":
+            return audit.get("max_drift_pct", 1.0) <= SHIELD_QTY_TOLERANCE_PCT
+        return False
+
+    def _shield_orders_ok(self, live_qty, entry=None):
+        return self._shield_orders_adequate(self._audit_shield_orders(live_qty, entry))
+
+    def _reconcile_shield_on_recover(self, live_qty, curr_px):
+        if live_qty <= 0 or not self.watched_entry:
+            return
+        if self._is_radar_active() or (curr_px > 0 and self._should_radar_trail(curr_px)):
+            if getattr(self, "shield_active", False):
+                self._disarm_shield("重启接管：雷达优先")
+            return
+
+        audit = self._audit_shield_orders(live_qty)
+        if self._shield_orders_adequate(audit):
+            self.shield_active = True
+            self._shield_fail_streak = 0
+            logger.info(
+                f"🛡️ 重启：盘口防护盾已齐 ({len(audit['remaining'])} 档)，跳过重挂"
+            )
+            self._save_state()
+            return
+
+        if audit["status"] == "duplicate":
+            purged = self._purge_shield_stop_orders(audit["tier_prices"])
+            self._record_shield_maintain(success=False)
+            logger.warning(
+                f"🛡️ 重启：撤净防护盾叠单 {purged} 笔，宽限期后哨兵按实盘补挂"
+            )
+            self.shield_active = True
+            self._save_state()
+            return
+
+        if curr_px > 0 and self._should_activate_shield(curr_px):
+            self.shield_active = True
+            logger.info(
+                "🛡️ 重启：防护盾待补挂（宽限期后哨兵按冷却处理，不重复尝试）"
+            )
+            self._save_state()
 
     def _disarm_shield(self, reason=""):
         n = self._cancel_stop_orders(scope="shield")
@@ -1286,7 +1404,7 @@ class PositionSupervisor:
         if reason and (had or n):
             logger.info(f"🛡️ [防护盾解除] {reason} | 撤销 {n} 张分批止损")
 
-    def _place_shield_stops(self, live_qty, entry=None, reason=""):
+    def _place_shield_stops(self, live_qty, entry=None, reason="", force=False):
         entry = float(entry or self.watched_entry or 0)
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0 or entry <= 0 or not self.current_side:
@@ -1298,12 +1416,27 @@ class PositionSupervisor:
             self._save_state()
             return True
 
-        now = time.time()
-        if (
-            self._shield_orders_ok(live_qty, entry)
-            and now - getattr(self, "_last_shield_place_ts", 0) < SHIELD_PLACE_COOLDOWN_SEC
-        ):
+        audit = self._audit_shield_orders(live_qty, entry)
+        if self._shield_orders_adequate(audit):
+            if not getattr(self, "shield_active", False):
+                logger.info(
+                    f"🛡️ 防护盾：盘口已齐 ({len(remaining)} 档 / {live_qty} 张)，跳过撤挂"
+                )
+            self.shield_active = True
+            self._shield_fail_streak = 0
+            self._save_state()
             return True
+
+        if not self._can_maintain_shield_now(force=force):
+            return getattr(self, "shield_active", False)
+
+        if audit["status"] == "duplicate" and not force:
+            purged = self._purge_shield_stop_orders(tier_prices)
+            self._record_shield_maintain(success=False)
+            logger.warning(
+                f"🛡️ 防护盾叠单清理：撤 {purged} 笔，冷却后再按实盘 {live_qty} 张 补挂"
+            )
+            return False
 
         qty_map = self._shield_quantities_for_remaining(live_qty)
         total_shield_qty = sum(qty_map.get(i, 0) for i in remaining)
@@ -1337,8 +1470,9 @@ class PositionSupervisor:
                 )
             time.sleep(0.35)
 
-        self._last_shield_place_ts = now
-        ok = self._shield_orders_ok(live_qty, entry)
+        post_audit = self._audit_shield_orders(live_qty, entry)
+        ok = self._shield_orders_adequate(post_audit)
+        self._record_shield_maintain(success=ok)
         if ok:
             was_new = not getattr(self, "shield_active", False)
             self.shield_active = True
@@ -1371,8 +1505,8 @@ class PositionSupervisor:
             dingtalk.report_system_alert(
                 "防护盾挂单未对齐",
                 f"已撤旧单 {purged} 笔、新挂 {placed} 笔，但核实未通过 | "
-                f"实盘 {live_qty} 张 | 请人工核查 Deepcoin 条件止损",
-                suggestion="可手动撤重复条件单，系统下轮哨兵会重试",
+                f"实盘 {live_qty} 张 | {', '.join(post_audit.get('issues', []))}",
+                suggestion="系统已退避冷却，请勿手动重复挂；下轮哨兵会自动重试",
             )
         return ok
 
@@ -1385,11 +1519,35 @@ class PositionSupervisor:
             return False
         if not self._should_activate_shield(curr_px):
             return False
-        if getattr(self, "shield_active", False) and self._shield_orders_ok(real_amt):
+
+        live_qty = self._resolve_live_qty(real_amt)
+        audit = self._audit_shield_orders(live_qty)
+
+        if self._shield_orders_adequate(audit):
+            if not getattr(self, "shield_active", False):
+                logger.info(
+                    f"🛡️ 防护盾：接管盘口已有止损 ({len(audit['remaining'])} 档 / "
+                    f"{live_qty} 张)，无需重挂"
+                )
+            self.shield_active = True
+            self._shield_fail_streak = 0
+            self._save_state()
             return True
+
+        if not self._can_maintain_shield_now():
+            return getattr(self, "shield_active", False)
+
+        if audit["status"] == "duplicate":
+            purged = self._purge_shield_stop_orders(audit["tier_prices"])
+            self._record_shield_maintain(success=False)
+            logger.warning(
+                f"🛡️ 防护盾叠单清理：撤 {purged} 笔，冷却后再按实盘 {live_qty} 张 补挂"
+            )
+            return False
+
         adverse = self._adverse_move_pct(curr_px)
         return self._place_shield_stops(
-            real_amt,
+            live_qty,
             reason=f"浮亏 {adverse:.1%} ≥ {SHIELD_ACTIVATION_PCT:.0%} 激活防护盾",
         )
 
@@ -1897,7 +2055,9 @@ class PositionSupervisor:
                 reason=f"防护盾{tier_txt}成交后 TP 重算",
             )
             self._place_shield_stops(
-                new_qty, reason=f"防护盾 {tier_txt} 成交，维护剩余止损",
+                new_qty,
+                reason=f"防护盾 {tier_txt} 成交，维护剩余止损",
+                force=True,
             )
             for f in change["shield_fills"]:
                 remain_pcts = [SHIELD_TIER_PCTS[i] for i in self._remaining_shield_tier_indices()]
@@ -1926,7 +2086,7 @@ class PositionSupervisor:
             if self._should_radar_trail(curr_px):
                 self._disarm_shield("行情转有利，切换雷达保本")
             elif self._should_activate_shield(curr_px) or getattr(self, "shield_active", False):
-                self._place_shield_stops(new_qty, reason=f"仓位变化 {old_qty}→{new_qty} 张")
+                self._process_adverse_shield(new_qty, curr_px)
 
         self._save_state()
         return change, result
@@ -3156,6 +3316,8 @@ class PositionSupervisor:
                         self._mark_defense_align_ok()
 
                     self._sentinel_grace_until = time.time() + SENTINEL_GRACE_AFTER_RECOVER_SEC
+                    if not radar_active and curr_px and curr_px > 0:
+                        self._reconcile_shield_on_recover(real_amt, curr_px)
 
                     logger.info("  -> 🎉 实盘阵地接管完毕，TP123 及雷达系统已复位。")
                 finally:
