@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.6.7-qty-align-10pct"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.6.8-shield-345pct"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -38,8 +38,8 @@ CAP_MIN_RETAIN_RATIO = 0.25
 CAP_TRIM_MAX_ROUNDS = 4
 QTY_DRIFT_TOLERANCE_PCT = 0.015  # 微漂 ≤1.5%：仅同步账本
 QTY_ALIGN_MIN_PCT = 0.10         # 偏离 ≥10% 才离谱，触发对齐/档位裁减
-SHIELD_ACTIVATION_PCT = 0.02
-SHIELD_TIER_PCTS = (0.02, 0.03, 0.05)
+SHIELD_ACTIVATION_PCT = 0.03  # ETH 现价相对开仓价浮亏 ≥3% 才激活防护盾
+SHIELD_TIER_PCTS = (0.03, 0.04, 0.05)  # 以开仓价为基准挂条件止损：-3% / -4% / -5%
 SHIELD_TIER_RATIOS = (0.33, 0.33, 0.34)
 SHIELD_STOP_TOLERANCE = 2.0
 # 同向 TV 智能筛选：① ATR 变化 → 先平后开；② 价差低于该百分比 → 不重复开仓，仅刷新 TP123
