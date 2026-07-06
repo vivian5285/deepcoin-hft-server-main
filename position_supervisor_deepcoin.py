@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.6.2-cap-safe"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.6.3-principal-snapshot"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -426,22 +426,57 @@ class PositionSupervisor:
             return self._wait_verify(self._verify_flat, retries=6, delay=0.5)
         return False
 
-    def _resolve_cap_sizing_base(self, equity_balance):
-        equity = max(0.0, float(equity_balance or 0))
+    def _snapshot_sizing_principal(self, reason=""):
+        """全平/开仓前：锁定 USDT 合约本金余额，供本周期开仓与超标核查共用"""
+        principal = deepcoin_client.get_principal_wallet_balance()
+        if principal > 0:
+            self.sizing_principal = principal
+            self._save_state()
+            logger.info(f"📸 本金快照 {principal:.2f} USDT ({reason})")
+            if reason and ("全平" in reason or "开仓前" in reason):
+                target_qty = None
+                margin_pct = None
+                if self.regime in self.regime_settings and "开仓前" in reason:
+                    margin_pct = self.regime_settings[self.regime]["margin"]
+                    if self.tv_price > 0:
+                        t, _, _, _, _ = self._regime_cap_target_qty(self.tv_price, self.regime)
+                        target_qty = t
+                try:
+                    dingtalk.report_principal_snapshot(
+                        reason=reason,
+                        principal=principal,
+                        regime=self.regime if "开仓前" in reason else None,
+                        margin_pct=margin_pct,
+                        target_qty=target_qty,
+                        leverage=self.leverage,
+                    )
+                except Exception as e:
+                    logger.warning(f"本金快照钉钉跳过: {e}")
+        return principal
+
+    def _resolve_cap_sizing_base(self, wallet_balance=None):
+        """
+        档位额度唯一基数：sizing_principal 快照 × TV 档位%。
+        亏损导致 wallet 低于快照时，用实时 wallet 下限（不放大浮盈）。
+        """
+        wallet = float(
+            wallet_balance if wallet_balance is not None
+            else deepcoin_client.get_principal_wallet_balance()
+        )
         principal = float(getattr(self, "sizing_principal", 0) or 0)
         if principal > 0:
-            if equity > 0 and equity < principal:
-                return equity
+            if wallet > 0 and wallet < principal:
+                return wallet
             return principal
-        return equity
+        return wallet
 
     def _regime_cap_target_qty(self, curr_px, regime=None):
-        """按 TV 档位 regime 保证金比例 × 杠杆 × 本金锚点，计算仓位上限张数"""
+        """按 TV 档位：本金快照 × margin% × 杠杆 → 仓位上限张数"""
         regime = int(regime if regime is not None else self.regime)
         if regime not in self.regime_settings:
             regime = 3
-        equity = deepcoin_client.get_cap_equity_balance()
-        balance = self._resolve_cap_sizing_base(equity)
+        wallet = deepcoin_client.get_principal_wallet_balance()
+        balance = self._resolve_cap_sizing_base(wallet)
         margin_pct = self.regime_settings[regime]["margin"]
         margin_usdt = balance * margin_pct
         if curr_px <= 0:
@@ -454,22 +489,22 @@ class PositionSupervisor:
         target = int(target_qty or 0)
         trim = int(trim_qty or 0)
         if live <= 0 or target <= 0:
-            return "invalid_qty"
+            return "数量无效，无法裁减"
         if trim <= 0:
             return None
         retain = target / live if live > 0 else 0
         if retain < CAP_MIN_RETAIN_RATIO and live > target * 2:
             return (
-                f"unsafe_retain_ratio={retain:.3f}: target {target} vs live {live} "
-                f"(sizing base likely skewed by depleted available)"
+                f"目标仅相当于实盘的 {retain:.1%}，疑似误用「可用保证金」而非「本金快照」"
+                f"（目标 {target} 张 vs 实盘 {live} 张）"
             )
         if trim > live * 0.85 and target < live * 0.15:
             return (
-                f"unsafe_trim_ratio: would cut {trim} of {live}, retaining only {target}"
+                f"裁减幅度过大：将平掉 {trim} 张，仅保留 {target} 张，疑似额度基数算错"
             )
         expected = live - target
         if abs(trim - expected) > max(int(live * 0.05), 1):
-            return f"trim_mismatch: trim={trim} expected={expected}"
+            return f"裁减量不符：计划 {trim} 张，应为 {expected} 张"
         return None
 
     def _calc_target_open_qty(self, curr_px):
@@ -497,8 +532,11 @@ class PositionSupervisor:
         if plan_err:
             logger.error(f"✂️ {reason_tag} 中止: {plan_err} | live={real} target={target_qty}")
             dingtalk.report_system_alert(
-                "档位裁减中止(安全校验)",
-                f"{reason_tag} | 实盘 {real} 张 | 目标 {target_qty} 张 | {plan_err}",
+                "档位裁减已中止（安全保护）",
+                f"场景：{reason_tag}\n"
+                f"实盘：**{real}** 张 → 目标：**{target_qty}** 张\n"
+                f"原因：{plan_err}",
+                suggestion="请核对本金快照与 TV 档位是否一致；勿手动干预，待下一 TV 信号或人工核查后重试",
             )
             return real
         close_side = "sell" if action == "LONG" else "buy"
@@ -609,7 +647,8 @@ class PositionSupervisor:
 
         self._last_regime_cap_ts = now
         verify_note = (
-            f"R{regime} 上限 {target} 张 (保证金 {margin_usdt:.0f}U) | "
+            f"本金 {balance:.2f}U × R{regime} {margin_pct:.0%} × {self.leverage}x "
+            f"= 保证金 {margin_usdt:.0f}U → 上限 {target} 张 | "
             f"裁减 {old_qty} → {new_qty} 张 | "
             f"TP {result['matched']}/{result['expected']} | "
             f"{self._format_audit_summary(result['audit'])} | "
@@ -625,6 +664,10 @@ class PositionSupervisor:
             margin_pct=margin_pct,
             tp_audit=result["audit"],
             verify_note=verify_note,
+            principal_balance=balance,
+            margin_usdt=margin_usdt,
+            leverage=self.leverage,
+            trim_qty=old_qty - new_qty,
         )
         return {"new_qty": new_qty, "target": target, "result": result}
 
@@ -2337,9 +2380,7 @@ class PositionSupervisor:
             return
         self._open_in_progress = True
         try:
-            equity = deepcoin_client.get_cap_equity_balance()
-            if equity > 0:
-                self.sizing_principal = equity
+            self._snapshot_sizing_principal(f"开仓前 R{self.regime}")
             qty, balance, margin_usdt, margin_pct = self._calc_target_open_qty(curr_px)
             if qty <= 0:
                 logger.error(f"开仓跳过：目标张数无效 balance={balance:.2f} px={curr_px}")
@@ -2447,6 +2488,10 @@ class PositionSupervisor:
                 vqty, tp_pxs, self.current_atr, self.regime, self.tv_tps,
                 verify_note=verify_note,
                 tp_audit=audit,
+                principal_balance=self.sizing_principal or deepcoin_client.get_principal_wallet_balance(),
+                margin_pct=self.regime_settings.get(self.regime, {}).get("margin"),
+                margin_usdt=(self.sizing_principal or 0) * self.regime_settings.get(self.regime, {}).get("margin", 0),
+                leverage=self.leverage,
             )
             if expected > 0 and matched < expected:
                 self._open_tp_unconfirmed = True
@@ -2787,6 +2832,7 @@ class PositionSupervisor:
                 self.current_side = None
                 self.shield_active = False
                 self.shield_tiers_consumed = []
+                self._snapshot_sizing_principal("全平后本金重置")
             else:
                 residual = self._get_active_position()
                 if residual:
@@ -2839,7 +2885,7 @@ class PositionSupervisor:
                     self.shield_tiers_consumed = list(s.get("shield_tiers_consumed", []) or [])
                     self.sizing_principal = float(s.get("sizing_principal", 0) or 0)
                     if self.sizing_principal <= 0:
-                        eq = deepcoin_client.get_cap_equity_balance()
+                        eq = deepcoin_client.get_principal_wallet_balance()
                         if eq > 0:
                             self.sizing_principal = eq
 

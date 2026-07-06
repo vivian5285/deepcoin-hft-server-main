@@ -136,13 +136,49 @@ def _format_tp_audit(audit, tv_tps=None):
     return "".join(lines) or "暂无有效 TP 审计"
 
 
+def _format_sizing_basis(principal, margin_pct, leverage, margin_usdt=None):
+    if margin_usdt is None:
+        margin_usdt = float(principal or 0) * float(margin_pct or 0)
+    return (
+        f"本金快照 **{float(principal):.2f}** USDT × 档位保证金 **{margin_pct:.0%}** "
+        f"= **{margin_usdt:.2f}** USDT × **{leverage}x** 杠杆"
+    )
+
+
+def report_principal_snapshot(reason, principal, regime=None, margin_pct=None, target_qty=None,
+                              leverage=None, verify_note=""):
+    lev = leverage or LEVERAGE_LABEL.replace("x", "")
+    data = {
+        "📸 快照时机": _p(reason or "本金重置", P_MAIN),
+        "💰 合约本金": _p(f"**{float(principal):.2f}** USDT（cashBal，非可用保证金）", P_ACCENT),
+        "📌 口径说明": _p(
+            "仅用 USDT 合约本金余额 × TV 档位% × 杠杆计算仓位；"
+            "禁止用 availBal / 剩余保证金",
+            P_MUTED,
+        ),
+    }
+    if regime and margin_pct is not None:
+        data["🔢 TV 档位"] = get_regime_name(int(regime))
+        data["📐 预算公式"] = _p(
+            _format_sizing_basis(principal, margin_pct, f"{lev}x"),
+            P_LIGHT,
+        )
+    if target_qty is not None and float(target_qty) > 0:
+        data["🎯 目标仓位"] = _p(f"**{target_qty}** {UNIT_LABEL}", P_MAIN)
+    if verify_note:
+        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
+    send_alert("📸 本金快照 · 档位预算基数已锁定", data, P_TITLE)
+
+
 def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime, tv_tps=None,
-                           verify_note="", tp_audit=None):
+                           verify_note="", tp_audit=None,
+                           principal_balance=None, margin_pct=None, margin_usdt=None, leverage=None):
     side_str = _p("🟣 开多 (LONG)", P_LIGHT) if side == "LONG" else _p("🟪 开空 (SHORT)", P_DEEP)
     slip_txt = (
         f"{(entry_price - tv_price if side == 'LONG' else tv_price - entry_price):+.2f} 刀"
         if tv_price > 0 else "未知"
     )
+    lev = leverage or 10
 
     data = {
         "🎛️ 趋势方向": side_str,
@@ -156,6 +192,11 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
         "📏 波动参考": _p(f"ATR = {atr:.4f}", P_MUTED),
         "📡 哨兵状态": _p(f"🟢 {VERIFY_TAG} | 限价 TP123 已挂，雷达待命", P_MAIN),
     }
+    if principal_balance and margin_pct is not None:
+        data["📐 仓位预算"] = _p(
+            _format_sizing_basis(principal_balance, margin_pct, lev, margin_usdt),
+            P_LIGHT,
+        )
     if verify_note:
         data["🔍 核查明细"] = _p(verify_note, P_MUTED)
     send_alert("🖨️ 战神出击：深币大级别主阵地建立", data)
@@ -185,7 +226,7 @@ def report_tp_fill(tp_level, tp_price, filled_qty, remain_qty, entry_px, side, r
         "📦 本次止盈": _p(f"`{filled_qty}` {UNIT_LABEL}", P_ACCENT),
         "📊 剩余头寸": _p(f"`{remain_qty}` {UNIT_LABEL}", P_MAIN),
         "💰 持仓均价": _p(f"`{entry_px:.2f}` USDT", P_MUTED),
-        "🧭 方向/档位": _p(f"{side} | Regime {regime}", P_MUTED),
+        "🧭 方向/档位": _p(f"{side} | TV {regime} 档", P_MUTED),
         "📡 实盘核查": _verify_line(
             verify_note if not verified else "",
             f"{VERIFY_TAG} | TP{tp_level} 限价止盈已成交",
@@ -386,11 +427,15 @@ def report_smart_same_dir_decision(side, decision, live_entry, tv_price, diff_pc
     send_alert(title, data, color)
 
 
-def report_system_alert(title, detail):
-    send_alert(f"⚠️ 系统告警：{title}", {
-        "⚠️ 告警级别": _p("最高级别 (CRITICAL)", P_DEEP),
-        "📝 核心详情": _p(f"**{detail}**", P_ACCENT),
-    }, P_TITLE)
+def report_system_alert(title, detail, level="紧急", suggestion=""):
+    data = {
+        "⚠️ 告警级别": _p(f"【{level}】需管理员关注", P_DEEP),
+        "📝 发生了什么": _p(f"**{title}**", P_MAIN),
+        "📋 详细说明": _p(detail, P_ACCENT),
+    }
+    if suggestion:
+        data["💡 建议操作"] = _p(suggestion, P_LIGHT)
+    send_alert(f"⚠️ 系统告警：{title}", data, P_TITLE)
 
 
 def report_radar_guardian_realigned(side, qty, tp_audit=None, verify_note=""):
@@ -409,11 +454,26 @@ def report_radar_guardian_realigned(side, qty, tp_audit=None, verify_note=""):
 
 
 def report_radar_regime_cap_trim(side, old_qty, new_qty, target_qty, regime, margin_pct,
-                                 tp_audit=None, verify_note=""):
+                                 tp_audit=None, verify_note="",
+                                 principal_balance=None, margin_usdt=None, leverage=None,
+                                 trim_qty=None):
+    lev = leverage or 10
+    excess = max(0.0, float(old_qty) - float(target_qty))
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
-        "📊 TV档位上限": _p(
-            f"**R{regime}** · 保证金 **{margin_pct:.0%}** · 目标 **{target_qty}** {UNIT_LABEL}",
+        "📊 TV 档位上限": _p(
+            f"**R{regime}** 档 · 保证金比例 **{margin_pct:.0%}** · 允许持仓 **{target_qty}** {UNIT_LABEL}",
+            P_ACCENT,
+        ),
+        "📐 核算公式": _p(
+            _format_sizing_basis(
+                principal_balance or 0, margin_pct, lev, margin_usdt,
+            ) if principal_balance else "本金快照 × 档位% × 杠杆（详见核实明细）",
+            P_LIGHT,
+        ),
+        "⚖️ 超标情况": _p(
+            f"实盘 **{old_qty}** {UNIT_LABEL} 超出目标 **{excess:.3f}** {UNIT_LABEL}"
+            + (f" · 本次裁减 **{trim_qty}** {UNIT_LABEL}" if trim_qty else ""),
             P_ACCENT,
         ),
         "✂️ 裁减结果": _p(f"`{old_qty}` ➔ `{new_qty}` {UNIT_LABEL}", P_MAIN),

@@ -146,25 +146,31 @@ class DeepcoinClient:
 
     # ── 账户与行情 ──────────────────────────────────────────────
 
-    def get_cap_equity_balance(self, ccy="USDT"):
-        """档位额度用总权益(eq)，绝不用 depleted availBal"""
+    def get_principal_wallet_balance(self, ccy="USDT"):
+        """
+        USDT 合约本金余额（cashBal）— 唯一合法的档位额度基数。
+        禁止用 availBal / eq(含浮盈) 参与开仓与超标核查。
+        """
         res = self._request("GET", "/account/balances", {"instType": "SWAP"})
         if isinstance(res, dict) and "data" in res:
             for item in res["data"]:
                 if item.get("ccy") != ccy:
                     continue
-                eq = float(item.get("eq", 0) or 0)
                 cash = float(item.get("cashBal", 0) or 0)
-                if eq > 0:
-                    return eq
                 if cash > 0:
                     return cash
-                return float(item.get("availBal", 0) or 0)
+                eq = float(item.get("eq", 0) or 0)
+                if eq > 0:
+                    return eq
         return 0.0
 
+    def get_cap_equity_balance(self, ccy="USDT"):
+        """档位额度基数 = 本金 cashBal（兼容旧名）"""
+        return self.get_principal_wallet_balance(ccy)
+
     def get_sizing_balance(self, ccy="USDT"):
-        """本金口径（总权益），用于 regime 仓位预算"""
-        return self.get_cap_equity_balance(ccy)
+        """本金口径（cashBal），用于 regime 仓位预算"""
+        return self.get_principal_wallet_balance(ccy)
 
     def get_available_balance(self, ccy="USDT"):
         res = self._request("GET", "/account/balances", {"instType": "SWAP"})
