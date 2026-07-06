@@ -146,6 +146,19 @@ class DeepcoinClient:
 
     # ── 账户与行情 ──────────────────────────────────────────────
 
+    def get_sizing_balance(self, ccy="USDT"):
+        """本金口径（eq/wallet），用于 regime 仓位预算"""
+        res = self._request("GET", "/account/balances", {"instType": "SWAP"})
+        if isinstance(res, dict) and "data" in res:
+            for item in res["data"]:
+                if item.get("ccy") == ccy:
+                    cash = float(item.get("cashBal", 0) or 0)
+                    if cash > 0:
+                        return cash
+                    eq = float(item.get("eq", 0) or 0)
+                    return eq if eq > 0 else float(item.get("availBal", 0) or 0)
+        return 0.0
+
     def get_available_balance(self, ccy="USDT"):
         res = self._request("GET", "/account/balances", {"instType": "SWAP"})
         if isinstance(res, dict) and "data" in res:

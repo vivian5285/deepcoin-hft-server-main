@@ -331,8 +331,142 @@ def report_recover_standby(verify_note="", version=""):
     send_alert("🔄 深币 VPS 重启 · 空仓待命", data, P_ACCENT)
 
 
+def report_smart_same_dir_decision(side, decision, live_entry, tv_price, diff_pct, threshold_pct,
+                                   open_regime, tv_regime, open_atr, tv_atr, qty,
+                                   tp_audit=None, verify_note=""):
+    atr_txt = f"持仓 `{open_atr:.2f}` · TV `{tv_atr:.2f}`"
+    atr_changed = abs(float(open_atr or 0) - float(tv_atr or 0)) > 0 and (
+        max(abs(open_atr), abs(tv_atr), 1) == 0 or
+        abs(float(open_atr) - float(tv_atr)) / max(abs(open_atr), abs(tv_atr), 1) > 0.03
+    )
+
+    if decision == "skip_duplicate_flat":
+        title = "🧠 智能筛选：短时重复同向 · 已忽略"
+        status = _p(
+            f"**5 分钟内** ATR 未变 ({atr_txt})，价差 **{diff_pct:.3f}%** < **{threshold_pct}%**，"
+            f"档位 **R{tv_regime}** → **未重复下单**。",
+            P_ACCENT,
+        )
+    elif decision.startswith("reentry_"):
+        reason_map = {
+            "reentry_atr_changed": f"**① ATR 变化** ({atr_txt}) → **先平后开** 刷新仓位",
+            "reentry_regime_changed": f"**② 档位** R{open_regime}→R{tv_regime} → **先平后开** 刷新仓位",
+            "reentry_spread_ok": (
+                f"**③ 理论价差** **{diff_pct:.3f}%** ≥ **{threshold_pct}%** "
+                f"(ATR 未变 {atr_txt}) → **先平后开**"
+            ),
+        }
+        title = "🧠 智能筛选：同向持仓 · 刷新仓位"
+        status = _p(reason_map.get(decision, "同向刷新仓位 → **先平后开**"), P_TITLE)
+    else:
+        title = "🧠 智能筛选：同向持仓 · 仅刷新止盈"
+        status = _p(
+            f"**① ATR 未变** ({atr_txt}) + **③ 价差** **{diff_pct:.3f}%** < **{threshold_pct}%** "
+            f"(档位 R{open_regime}) → **未再开仓**，已核实持仓并按新 TV 价刷新 TP123。",
+            P_LIGHT,
+        )
+    data = {
+        "📊 智能决策": status,
+        "🎯 TV方向": _p(side, P_MAIN),
+        "💰 实盘成本": _p(f"`{live_entry:.2f}` USDT" if live_entry > 0 else "空仓", P_MUTED),
+        "📡 TV理论价": _p(f"`{tv_price:.2f}` USDT", P_MUTED),
+        "🌊 ATR (优先)": _p(
+            f"{atr_txt}" + (" ⚡已变化" if atr_changed and decision == "reentry_atr_changed" else " ✓未变"),
+            P_ACCENT if atr_changed else P_MUTED,
+        ),
+        "📏 理论价差": _p(f"{diff_pct:.3f}% / 阈值 {threshold_pct}%", P_ACCENT),
+        "🔢 档位": _p(f"开仓 R{open_regime} · TV R{tv_regime}", P_MUTED),
+        "📦 持有": _p(f"**{qty}** {UNIT_LABEL}" if qty > 0 else "无持仓", P_ACCENT),
+    }
+    if tp_audit:
+        data["🕸️ TP123 审计"] = _p(_format_tp_audit(tp_audit), P_ACCENT)
+    if verify_note:
+        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
+    color = P_ACCENT if decision == "skip_duplicate_flat" else P_TITLE
+    send_alert(title, data, color)
+
+
 def report_system_alert(title, detail):
     send_alert(f"⚠️ 系统告警：{title}", {
         "⚠️ 告警级别": _p("最高级别 (CRITICAL)", P_DEEP),
         "📝 核心详情": _p(f"**{detail}**", P_ACCENT),
     }, P_TITLE)
+
+
+def report_radar_guardian_realigned(side, qty, tp_audit=None, verify_note=""):
+    data = {
+        "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
+        "📦 核实头寸": _p(f"**{qty}** {UNIT_LABEL}", P_MAIN),
+        "🕸️ TP123 比例审计": _p(
+            _format_tp_audit(tp_audit, None) if tp_audit else "已对齐",
+            P_MAIN,
+        ),
+        "✅ 纠偏结果": _p("雷达守护已完成止盈对齐（重启接管竞态后补报）", P_MAIN),
+    }
+    if verify_note:
+        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
+    send_alert("📡 雷达守护 · 止盈已重新对齐", data, P_MAIN)
+
+
+def report_radar_regime_cap_trim(side, old_qty, new_qty, target_qty, regime, margin_pct,
+                                 tp_audit=None, verify_note=""):
+    data = {
+        "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
+        "📊 TV档位上限": _p(
+            f"**R{regime}** · 保证金 **{margin_pct:.0%}** · 目标 **{target_qty}** {UNIT_LABEL}",
+            P_ACCENT,
+        ),
+        "✂️ 裁减结果": _p(f"`{old_qty}` ➔ `{new_qty}` {UNIT_LABEL}", P_MAIN),
+        "🕸️ TP123 重挂": _p(
+            _format_tp_audit(tp_audit, None) if tp_audit else "已按新仓位重挂",
+            P_MAIN,
+        ),
+        "✅ 纠偏结果": _p(
+            "雷达最高权限：超标裁减至档位额度 → TP123 已对齐 · 移动止损逻辑不变",
+            P_MAIN,
+        ),
+    }
+    if verify_note:
+        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
+    send_alert("📡 雷达守护 · 档位限额强制对齐", data, P_TITLE)
+
+
+def report_adverse_shield_armed(side, entry, live_qty, adverse_pct, tier_prices, tier_pcts,
+                                verify_note=""):
+    tier_lines = []
+    for pct, px in zip(tier_pcts, tier_prices):
+        tier_lines.append(f"**-{pct:.0%}** → `{px:.2f}` USDT")
+    data = {
+        "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
+        "💰 开仓成本": _p(f"`{entry:.2f}` USDT", P_MUTED),
+        "📦 保护头寸": _p(f"**{live_qty}** {UNIT_LABEL}", P_MAIN),
+        "📉 当前浮亏": _p(f"**{adverse_pct:.1%}** (≥2% 激活)", P_ACCENT),
+        "🛡️ 分批止损线": _p(" · ".join(tier_lines), P_MAIN),
+        "✅ 风控动作": _p(
+            "VPS 逆势防护盾：2%/3%/5% 限价止损已挂 · 最多承受 5% 波动 · 转有利后切换雷达保本",
+            P_MAIN,
+        ),
+    }
+    if verify_note:
+        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
+    send_alert("🛡️ 逆势防护盾 · 分批止损已武装", data, P_TITLE)
+
+
+def report_shield_tier_fill(side, tier_pct, tier_price, filled_qty, remain_qty, entry_px,
+                            remaining_tiers=None, verify_note=""):
+    remain_txt = "无"
+    if remaining_tiers:
+        remain_txt = "/".join(f"-{p:.0%}" for p in remaining_tiers)
+    elif remaining_tiers is not None and len(remaining_tiers) == 0:
+        remain_txt = "无（已全部触发或转雷达）"
+    data = {
+        "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
+        "🛡️ 触发档位": _p(f"**-{tier_pct:.0%}** @ `{tier_price:.2f}` USDT", P_ACCENT),
+        "✂️ 本次止损": _p(f"`{filled_qty}` {UNIT_LABEL}", P_MAIN),
+        "📊 剩余头寸": _p(f"`{remain_qty}` {UNIT_LABEL}", P_MAIN),
+        "📌 仍挂档位": _p(remain_txt, P_LIGHT),
+        "✅ 风控动作": _p("防护盾层级成交 → TP123 已重算 → 剩余档位继续守护", P_MAIN),
+    }
+    if verify_note:
+        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
+    send_alert("🛡️ 防护盾 · 分批止损成交", data, P_TITLE)

@@ -185,11 +185,23 @@ install_deps() {
     CLIENT_VER="$(grep 'CLIENT_VERSION' "$DIR/deepcoin_client.py" 2>/dev/null | head -1 || true)"
     SUPERVISOR_VER="$(grep 'DEEPCOIN_SUPERVISOR_VERSION' "$DIR/position_supervisor_deepcoin.py" 2>/dev/null | head -1 || true)"
 
-    if echo "$SUPERVISOR_VER" | grep -qE 'DEEPCOIN_SUPERVISOR_VERSION.*v13\.4\.'; then
+    if echo "$SUPERVISOR_VER" | grep -qE 'DEEPCOIN_SUPERVISOR_VERSION.*"v13\.(4\.[6-9]|[5-9][0-9]*\.)'; then
         log_ok "position_supervisor_deepcoin.py 版本已就绪 (${SUPERVISOR_VER})"
     else
-        log_fail "position_supervisor_deepcoin.py 缺少 v13.4.x 版本号，请同步最新代码"
+        log_fail "position_supervisor_deepcoin.py 缺少 v13.4.6+ / v13.5+ 版本号，请同步最新代码"
         return 1
+    fi
+
+    if grep -q "report_smart_same_dir_decision" "$DIR/dingtalk.py" 2>/dev/null \
+        && grep -q "open_atr" "$DIR/dingtalk.py" 2>/dev/null \
+        && grep -q "tv_atr" "$DIR/dingtalk.py" 2>/dev/null \
+        && grep -q "report_radar_guardian_realigned" "$DIR/dingtalk.py" 2>/dev/null; then
+        log_ok "dingtalk.py 智能同向 + 雷达纠偏补报 已就绪"
+    elif echo "$SUPERVISOR_VER" | grep -qE 'v13\.5\.'; then
+        log_fail "dingtalk.py 未同步！v13.5+ 需 open_atr/tv_atr + report_radar_guardian_realigned"
+        return 1
+    else
+        log_warn "dingtalk.py 可能缺少智能同向筛选推送"
     fi
 
     if echo "$CLIENT_VER" | grep -qE 'CLIENT_VERSION.*v13\.4\.'; then
@@ -280,8 +292,8 @@ health_check() {
 
     # 6d. 大脑加载日志（大脑写入 deepcoin_brain.log，非 gunicorn error log）
     sleep 2
-    if grep -qE "v13\.4\." "$BRAIN_LOG" 2>/dev/null; then
-        log_ok "VPS 大脑 v13.4.x 已成功加载"
+    if grep -qE "v13\.(4\.[6-9]|[5-9])" "$BRAIN_LOG" 2>/dev/null; then
+        log_ok "VPS 大脑 v13.4.6+ / v13.5+ 已成功加载"
     elif grep -q "深币 VPS" "$BRAIN_LOG" 2>/dev/null || grep -q "军师托管版" "$BRAIN_LOG" 2>/dev/null; then
         log_warn "大脑已加载但版本可能过旧（日志中无 v13.4.x，请确认代码已更新）"
     elif grep -q "深币 VPS" "$LOG_DIR/gunicorn_error.log" 2>/dev/null; then

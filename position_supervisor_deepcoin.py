@@ -22,12 +22,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.4.10-recover-dingtalk"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.6.1-smart-defense"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
 DUST_ORPHAN_CONTRACTS = 1
 TP_COMPLETE_RESIDUAL_RATIO = 0.12
+OPEN_OVERSIZE_RATIO = 1.06
+SIGNAL_DEDUP_SEC = 45
+DEFENSE_ALIGN_COOLDOWN_SEC = 60
+SENTINEL_GRACE_AFTER_RECOVER_SEC = 45
+REGIME_CAP_COOLDOWN_SEC = 90
+SHIELD_ACTIVATION_PCT = 0.02
+SHIELD_TIER_PCTS = (0.02, 0.03, 0.05)
+SHIELD_TIER_RATIOS = (0.33, 0.33, 0.34)
+SHIELD_STOP_TOLERANCE = 2.0
+# 同向 TV 智能筛选：① ATR 变化 → 先平后开；② 价差低于该百分比 → 不重复开仓，仅刷新 TP123
+SAME_DIR_MIN_SPREAD_PCT = 0.15
+SAME_DIR_DEDUP_SEC = 300
+ATR_SIMILAR_RATIO = 0.03  # 持仓 ATR 与 TV ATR 偏差 ≤3% 视为未变
 TV_JOURNAL = "logs/deepcoin_tv_journal.jsonl"
 OPEN_JOURNAL = "logs/deepcoin_open_journal.jsonl"
 
@@ -64,6 +77,23 @@ class PositionSupervisor:
         self._scan_ticks = 0
         self._signal_queue = queue.Queue()
         self._signal_worker_started = False
+        self._sentinel_active = False
+        self.open_regime = 3
+        self.open_atr = 30.0
+        self._last_entry_signal = None
+        self._recover_in_progress = False
+        self._recover_tp_unconfirmed = False
+        self._open_in_progress = False
+        self._open_tp_unconfirmed = False
+        self._last_signal_fp = None
+        self._last_signal_fp_ts = 0.0
+        self._defense_align_in_progress = False
+        self._last_defense_align_ok_ts = 0.0
+        self._guardian_bad_streak = 0
+        self._sentinel_grace_until = 0.0
+        self._last_regime_cap_ts = 0.0
+        self.shield_active = False
+        self.shield_tiers_consumed = []
 
         self.state_file = 'deepcoin_vps_state.json'
         logger.info(
@@ -135,9 +165,32 @@ class PositionSupervisor:
             finally:
                 self._signal_queue.task_done()
 
+    def _signal_fingerprint(self, payload):
+        return (
+            str(payload.get("action", "")).strip().upper(),
+            self._safe_int(payload.get("regime"), 3),
+            round(self._safe_float(payload.get("price"), 0), 2),
+            round(self._safe_float(payload.get("atr"), 0), 2),
+        )
+
     def enqueue_signal(self, payload):
+        fp = self._signal_fingerprint(payload)
+        action = fp[0] or "?"
+        now = time.time()
+        if (
+            fp == self._last_signal_fp
+            and now - self._last_signal_fp_ts < SIGNAL_DEDUP_SEC
+        ):
+            logger.warning(
+                f"📬 TV信号去重忽略: {action} | {SIGNAL_DEDUP_SEC}s 内重复推送"
+            )
+            return
+        if self._open_in_progress and action in ("LONG", "SHORT"):
+            logger.warning(f"📬 开仓进行中，忽略重复建仓信号 {action}")
+            return
+        self._last_signal_fp = fp
+        self._last_signal_fp_ts = now
         depth = self._signal_queue.qsize()
-        action = (payload.get("action") or "?").upper()
         self._signal_queue.put(payload)
         logger.info(f"📬 TV信号入队: {action} | 队列深度 {depth + 1}")
 
@@ -326,6 +379,10 @@ class PositionSupervisor:
                     "best_price": self.best_price,
                     "initial_qty": self.initial_qty,
                     "last_tv_signal": self.last_tv_signal,
+                    "open_regime": self.open_regime,
+                    "open_atr": self.open_atr,
+                    "shield_active": getattr(self, "shield_active", False),
+                    "shield_tiers_consumed": list(getattr(self, "shield_tiers_consumed", []) or []),
                 }, f)
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
@@ -355,6 +412,154 @@ class PositionSupervisor:
     def _verify_flat(self):
         pos = self._get_active_position()
         return pos is None or self._safe_qty(pos.get("size")) == 0
+
+    def _ensure_flat_before_open(self, reason_tag="开仓前"):
+        if self._wait_verify(self._verify_flat, retries=4, delay=0.4):
+            return True
+        logger.warning(f"⚠️ {reason_tag}：检测到残留持仓，启动强制平仓")
+        if self._close_all(f"{reason_tag} · 强制清场", reset_state=True):
+            return self._wait_verify(self._verify_flat, retries=6, delay=0.5)
+        return False
+
+    def _regime_cap_target_qty(self, curr_px, regime=None):
+        """按 TV 档位 regime 保证金比例 × 杠杆 × 本金，计算仓位上限张数"""
+        regime = int(regime if regime is not None else self.regime)
+        if regime not in self.regime_settings:
+            regime = 3
+        balance = deepcoin_client.get_sizing_balance()
+        margin_pct = self.regime_settings[regime]["margin"]
+        margin_usdt = balance * margin_pct
+        if curr_px <= 0:
+            return 0, balance, margin_usdt, margin_pct, regime
+        qty = max(int((margin_usdt * self.leverage) / (curr_px * self.face_value)), 1)
+        return qty, balance, margin_usdt, margin_pct, regime
+
+    def _calc_target_open_qty(self, curr_px):
+        qty, balance, margin_usdt, margin_pct, _ = self._regime_cap_target_qty(curr_px, self.regime)
+        return qty, balance, margin_usdt, margin_pct
+
+    def _is_oversize_for_regime(self, live_qty, curr_px, regime=None):
+        target, _, _, margin_pct, reg = self._regime_cap_target_qty(curr_px, regime)
+        live_qty = self._safe_qty(live_qty)
+        if target <= 0 or live_qty <= 0:
+            return False, target, margin_pct, reg
+        return live_qty > int(target * OPEN_OVERSIZE_RATIO), target, margin_pct, reg
+
+    def _trim_position_to_target(self, target_qty, action, reason_tag="叠仓Remediation"):
+        """叠仓Remediation：实盘超标时 reduceOnly 裁减至目标张数"""
+        pos = self._get_active_position()
+        real = self._safe_qty(pos.get("size")) if pos else 0
+        if not pos or real <= int(target_qty * OPEN_OVERSIZE_RATIO):
+            return real
+        excess = real - int(target_qty)
+        if excess <= 0:
+            return real
+        close_side = "sell" if action == "LONG" else "buy"
+        pos_side = "long" if action == "LONG" else "short"
+        logger.warning(
+            f"✂️ {reason_tag}: 裁减 {excess} 张 "
+            f"(实盘 {real} → 目标 {target_qty})"
+        )
+        deepcoin_client.cancel_all_open_orders(self.symbol)
+        time.sleep(0.5)
+        self._cancel_all_tp_limit_orders(max_rounds=3)
+        time.sleep(0.3)
+        deepcoin_client.place_market_order(
+            self.symbol, close_side, pos_side, excess, reduce_only=True,
+        )
+        time.sleep(1.5)
+        verified = self._wait_verify(
+            lambda: self._get_active_position(),
+            retries=6,
+            delay=0.5,
+        )
+        new_sz = self._safe_qty(verified.get("size")) if verified else int(target_qty)
+        if new_sz > int(target_qty * OPEN_OVERSIZE_RATIO):
+            dingtalk.report_system_alert(
+                "叠仓裁减未达标",
+                f"目标 {target_qty} 张，裁减后仍 {new_sz} 张，请人工核查",
+            )
+        return new_sz
+
+    def _radar_enforce_regime_cap(self, live_qty, curr_px, force=False):
+        """
+        雷达最高权限：实盘超过 TV 档位保证金上限 → reduceOnly 裁减 → 重挂 TP123。
+        雷达移动止损位不变，仅补挂缺失 STOP。
+        """
+        live_qty = self._safe_qty(live_qty)
+        if live_qty <= 0 or not self.current_side:
+            return None
+        if not force and (
+            getattr(self, "_open_in_progress", False)
+            or getattr(self, "_recover_in_progress", False)
+        ):
+            return None
+
+        oversize, target, margin_pct, regime = self._is_oversize_for_regime(
+            live_qty, curr_px, self.regime,
+        )
+        if not oversize:
+            return None
+
+        now = time.time()
+        severe = live_qty > int(target * 1.35)
+        if (
+            not severe
+            and now - getattr(self, "_last_regime_cap_ts", 0) < REGIME_CAP_COOLDOWN_SEC
+        ):
+            logger.info(
+                f"📡 [雷达档位限额] 超标 {live_qty}>{target} 张 但冷却中 "
+                f"(R{regime} {margin_pct:.0%})"
+            )
+            return None
+
+        _, balance, margin_usdt, margin_pct, regime = self._regime_cap_target_qty(curr_px, regime)
+        old_qty = live_qty
+        logger.warning(
+            f"📡 [雷达档位限额] R{regime} 上限 {target} 张 "
+            f"(本金 {balance:.0f}U×{margin_pct:.0%}×{self.leverage}x) | "
+            f"实盘 {live_qty} 张 超标 → 强制裁减"
+        )
+
+        new_qty = self._trim_position_to_target(
+            target, self.current_side, reason_tag=f"雷达R{regime}档位限额",
+        )
+        pos = self._get_active_position()
+        entry = float(pos["entry_price"]) if pos else self.watched_entry
+        self.watched_qty = new_qty
+        self.initial_qty = new_qty
+        if pos:
+            self.watched_entry = entry
+        self._save_state()
+
+        sl = self._radar_sl_to_pass()
+        result = self._enforce_defense_alignment(
+            new_qty, entry, dynamic_sl=sl,
+            reason=f"雷达档位限额 R{regime} 裁减后 TP 对齐", rounds=3,
+        )
+        if sl and not self._has_trigger_sl_near(sl):
+            self._ensure_radar_sl(new_qty, sl)
+
+        self._last_regime_cap_ts = now
+        verify_note = (
+            f"R{regime} 上限 {target} 张 (保证金 {margin_usdt:.0f}U) | "
+            f"裁减 {old_qty} → {new_qty} 张 | "
+            f"TP {result['matched']}/{result['expected']} | "
+            f"{self._format_audit_summary(result['audit'])} | "
+            f"雷达SL={'已保留/已补' if sl else '待命'}"
+        )
+        self._call_dingtalk(
+            dingtalk.report_radar_regime_cap_trim,
+            side=self.current_side,
+            old_qty=old_qty,
+            new_qty=new_qty,
+            target_qty=target,
+            regime=regime,
+            margin_pct=margin_pct,
+            tp_audit=result["audit"],
+            verify_note=verify_note,
+        )
+        return {"new_qty": new_qty, "target": target, "result": result}
 
     def _is_dust_qty(self, qty):
         """深币最小 1 张；无主仓账本时的孤立 1 张视为蚂蚁仓"""
@@ -593,8 +798,14 @@ class PositionSupervisor:
         tp_pxs = tp_pxs if tp_pxs is not None else self.tv_tps
         return sum(1 for t in tp_pxs if t > 0)
 
+    def _tp_split_regime(self):
+        if self.watched_qty and self._safe_qty(self.watched_qty) > 0:
+            return int(getattr(self, "open_regime", self.regime) or self.regime)
+        return int(self.regime)
+
     def _expected_tp_levels(self, live_qty):
-        ratios = self.regime_settings[self.regime]["ratios"]
+        regime = self._tp_split_regime()
+        ratios = self.regime_settings[regime]["ratios"]
         q1, q2, q3 = self._calculate_tp_quantities(live_qty, ratios)
         return [
             {"level": 1, "qty": q1, "price": self.tv_tps[0]},
@@ -628,7 +839,7 @@ class PositionSupervisor:
                 actual_qty = at_px[0]["qty"]
                 issues.append(
                     f"TP{lv['level']} {actual_qty}张 ≠ 期望 {lv['qty']}张 "
-                    f"({self.regime_settings[self.regime]['ratios']})"
+                    f"({self.regime_settings[self._tp_split_regime()]['ratios']})"
                 )
             else:
                 matched_full += 1
@@ -713,10 +924,14 @@ class PositionSupervisor:
         return True
 
     def _patch_missing_tp_levels(self, live_qty, tolerance=1.0):
+        live_qty = self._resolve_live_qty(live_qty)
+        audit = self._audit_tp_levels(live_qty, tolerance)
+        if self._defense_needs_immediate_fix(audit):
+            logger.warning("补挂跳过：检测到重复/缺失/偏差，改走核武对齐")
+            return 0
         close_side = "sell" if self.current_side == "LONG" else "buy"
         pos_side = "long" if self.current_side == "LONG" else "short"
-        live_qty = self._resolve_live_qty(live_qty)
-        ratios = self.regime_settings[self.regime]["ratios"]
+        ratios = self.regime_settings[self._tp_split_regime()]["ratios"]
         qty1, qty2, qty3 = self._calculate_tp_quantities(live_qty, ratios)
         levels = [(qty1, self.tv_tps[0]), (qty2, self.tv_tps[1]), (qty3, self.tv_tps[2])]
         placed = 0
@@ -754,15 +969,232 @@ class PositionSupervisor:
             logger.info(f"🧹 撤销 {cancelled} 张孤儿止盈单")
         return cancelled
 
-    def _cancel_stop_orders(self):
+    def _cancel_stop_orders(self, scope="all"):
         cancelled = 0
         for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
+            if scope == "radar" and not self._is_radar_trigger_order(t):
+                continue
+            if scope == "shield" and not self._is_shield_trigger_order(t):
+                continue
             oid = t.get("ordId")
             if oid:
                 deepcoin_client.cancel_trigger_order(self.symbol, oid)
                 cancelled += 1
                 time.sleep(0.2)
         return cancelled
+
+    @staticmethod
+    def _trigger_order_price(t):
+        for key in ("triggerPx", "slTriggerPrice", "triggerPrice"):
+            val = t.get(key)
+            if val is not None and str(val).strip() not in ("", "0"):
+                try:
+                    return round(float(val), 2)
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    def _shield_tier_prices(self, entry=None):
+        entry = float(entry or self.watched_entry or 0)
+        if entry <= 0:
+            return []
+        out = []
+        for pct in SHIELD_TIER_PCTS:
+            if self.current_side == "LONG":
+                out.append(round(entry * (1 - pct), 2))
+            elif self.current_side == "SHORT":
+                out.append(round(entry * (1 + pct), 2))
+        return out
+
+    def _is_shield_trigger_order(self, t, tier_prices=None):
+        px = self._trigger_order_price(t)
+        if px is None:
+            return False
+        tier_prices = tier_prices or self._shield_tier_prices()
+        return any(abs(px - tp) <= SHIELD_STOP_TOLERANCE for tp in tier_prices)
+
+    def _is_radar_trigger_order(self, t):
+        if not self._is_radar_active():
+            return False
+        px = self._trigger_order_price(t)
+        if px is None:
+            return False
+        return abs(px - round(float(self.current_sl), 2)) <= SHIELD_STOP_TOLERANCE
+
+    def _adverse_move_pct(self, curr_px):
+        entry = self.watched_entry
+        if not entry or curr_px <= 0:
+            return 0.0
+        if self.current_side == "LONG":
+            return max(0.0, (entry - curr_px) / entry)
+        if self.current_side == "SHORT":
+            return max(0.0, (curr_px - entry) / entry)
+        return 0.0
+
+    def _should_activate_shield(self, curr_px):
+        if not self.watched_entry or curr_px <= 0 or not self.current_side:
+            return False
+        if self._is_radar_active() or self._should_radar_trail(curr_px):
+            return False
+        return self._adverse_move_pct(curr_px) >= SHIELD_ACTIVATION_PCT
+
+    def _remaining_shield_tier_indices(self):
+        consumed = set(getattr(self, "shield_tiers_consumed", []) or [])
+        return [i for i, pct in enumerate(SHIELD_TIER_PCTS) if pct not in consumed]
+
+    def _shield_quantities_for_remaining(self, live_qty):
+        remaining = self._remaining_shield_tier_indices()
+        live_qty = self._safe_qty(live_qty)
+        if not remaining or live_qty <= 0:
+            return {}
+        if len(remaining) == 1:
+            return {remaining[0]: live_qty}
+        weights = [SHIELD_TIER_RATIOS[i] for i in remaining]
+        wsum = sum(weights) or 1.0
+        norm = [w / wsum for w in weights]
+        qs = self._calculate_tp_quantities(live_qty, norm)
+        return {remaining[i]: qs[i] for i in range(len(remaining))}
+
+    def _has_shield_stop_at_price(self, tp, tier_prices=None):
+        tier_prices = tier_prices or self._shield_tier_prices()
+        for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
+            if not self._is_shield_trigger_order(t, tier_prices):
+                continue
+            px = self._trigger_order_price(t)
+            if px is not None and abs(px - tp) <= SHIELD_STOP_TOLERANCE:
+                return True
+        return False
+
+    def _split_shield_quantities(self, total_qty):
+        return self._calculate_tp_quantities(self._safe_qty(total_qty), list(SHIELD_TIER_RATIOS))
+
+    def _shield_orders_ok(self, live_qty, entry=None):
+        tier_prices = self._shield_tier_prices(entry)
+        live_qty = self._safe_qty(live_qty)
+        remaining = self._remaining_shield_tier_indices()
+        if not remaining:
+            return live_qty <= 0
+        if live_qty <= 0:
+            return False
+        qty_map = self._shield_quantities_for_remaining(live_qty)
+        matched = 0
+        for idx in remaining:
+            q = qty_map.get(idx, 0)
+            tp = tier_prices[idx]
+            if q <= 0:
+                continue
+            found = False
+            for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
+                if not self._is_shield_trigger_order(t, tier_prices):
+                    continue
+                px = self._trigger_order_price(t)
+                if px is None or abs(px - tp) > SHIELD_STOP_TOLERANCE:
+                    continue
+                tsz = self._safe_qty(t.get("sz", t.get("size", 0)))
+                if abs(tsz - q) <= 0:
+                    found = True
+                    break
+            if found:
+                matched += 1
+        expected = sum(1 for idx in remaining if qty_map.get(idx, 0) > 0)
+        return matched >= expected
+
+    def _disarm_shield(self, reason=""):
+        n = self._cancel_stop_orders(scope="shield")
+        had = getattr(self, "shield_active", False) or bool(
+            getattr(self, "shield_tiers_consumed", [])
+        )
+        self.shield_active = False
+        self.shield_tiers_consumed = []
+        self._save_state()
+        if reason and (had or n):
+            logger.info(f"🛡️ [防护盾解除] {reason} | 撤销 {n} 张分批止损")
+
+    def _place_shield_stops(self, live_qty, entry=None, reason=""):
+        entry = float(entry or self.watched_entry or 0)
+        live_qty = self._resolve_live_qty(live_qty)
+        if live_qty <= 0 or entry <= 0 or not self.current_side:
+            return False
+        tier_prices = self._shield_tier_prices(entry)
+        remaining = self._remaining_shield_tier_indices()
+        if not remaining:
+            self.shield_active = False
+            self._save_state()
+            return True
+        close_side = "sell" if self.current_side == "LONG" else "buy"
+        pos_side = "long" if self.current_side == "LONG" else "short"
+        qty_map = self._shield_quantities_for_remaining(live_qty)
+        placed = 0
+        for idx in remaining:
+            q = qty_map.get(idx, 0)
+            tp = tier_prices[idx]
+            if q <= 0:
+                continue
+            already = False
+            for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
+                if not self._is_shield_trigger_order(t, tier_prices):
+                    continue
+                px = self._trigger_order_price(t)
+                if px is not None and abs(px - tp) <= SHIELD_STOP_TOLERANCE:
+                    tsz = self._safe_qty(t.get("sz", t.get("size", 0)))
+                    if abs(tsz - q) <= 0:
+                        already = True
+                        break
+            if already:
+                continue
+            limit_px = tp * (0.9995 if close_side == "sell" else 1.0005)
+            res = deepcoin_client.place_trigger_order(
+                self.symbol, close_side, pos_side, q, tp,
+                order_type="limit", price=limit_px,
+                td_mode="cross", mrg_position="merge",
+            )
+            if res and str(res.get("code", "0")) in ("0", "00000", ""):
+                placed += 1
+            time.sleep(0.35)
+        ok = self._shield_orders_ok(live_qty, entry)
+        if ok:
+            was_new = not getattr(self, "shield_active", False)
+            self.shield_active = True
+            self._save_state()
+            adverse = self._adverse_move_pct(
+                deepcoin_client.get_current_price(self.symbol) or entry,
+            )
+            active_tiers = "/".join(f"-{SHIELD_TIER_PCTS[i]:.0%}" for i in remaining)
+            tier_txt = " / ".join(f"{tier_prices[i]:.2f}" for i in remaining)
+            logger.warning(
+                f"🛡️ [逆势防护盾] {'激活' if was_new else '维护'} | "
+                f"浮亏 {adverse:.1%} | 档位 {active_tiers} @ {tier_txt} | "
+                f"新挂 {placed} 笔"
+            )
+            if was_new and not getattr(self, "shield_tiers_consumed", []):
+                self._call_dingtalk(
+                    dingtalk.report_adverse_shield_armed,
+                    side=self.current_side,
+                    entry=entry,
+                    live_qty=live_qty,
+                    adverse_pct=adverse,
+                    tier_prices=tier_prices,
+                    tier_pcts=SHIELD_TIER_PCTS,
+                    verify_note=reason or f"浮亏达 {adverse:.1%}，VPS 分批止损已武装",
+                )
+        return ok
+
+    def _process_adverse_shield(self, real_amt, curr_px):
+        if real_amt <= 0 or curr_px <= 0 or not self.watched_entry:
+            return False
+        if self._is_radar_active() or self._should_radar_trail(curr_px):
+            if getattr(self, "shield_active", False):
+                self._disarm_shield("行情转有利，切换雷达保本")
+            return False
+        if not self._should_activate_shield(curr_px):
+            return False
+        if getattr(self, "shield_active", False) and self._shield_orders_ok(real_amt):
+            return True
+        adverse = self._adverse_move_pct(curr_px)
+        return self._place_shield_stops(
+            real_amt,
+            reason=f"浮亏 {adverse:.1%} ≥ {SHIELD_ACTIVATION_PCT:.0%} 激活防护盾",
+        )
 
     def _is_radar_active(self):
         if not self.watched_entry or not self.current_sl:
@@ -791,25 +1223,50 @@ class PositionSupervisor:
         if bad:
             return True
         missing = sum(1 for lv in audit.get("levels", []) if lv.get("status") == "missing")
-        if missing >= 2:
+        if missing >= 1:
             return True
         if audit.get("orphans"):
             return True
         return False
 
-    def _cancel_all_tp_limit_orders(self):
-        cancelled = 0
-        for o in deepcoin_client.get_pending_orders(self.symbol):
-            if not self._is_tp_limit_order(o):
-                continue
-            oid = o.get("ordId")
-            if oid:
-                deepcoin_client.cancel_order(self.symbol, ord_id=oid)
-                cancelled += 1
-                time.sleep(0.15)
-        if cancelled:
-            logger.info(f"🧹 已撤销全部限价止盈 {cancelled} 张")
-        return cancelled
+    def _cancel_all_tp_limit_orders(self, max_rounds=4):
+        total = 0
+        for round_i in range(max_rounds):
+            orders = [
+                o for o in deepcoin_client.get_pending_orders(self.symbol)
+                if self._is_tp_limit_order(o)
+            ]
+            if not orders:
+                break
+            for o in orders:
+                oid = o.get("ordId")
+                if oid:
+                    deepcoin_client.cancel_order(self.symbol, ord_id=oid)
+                    total += 1
+                    time.sleep(0.12)
+            logger.info(f"🧹 撤限价止盈 第{round_i + 1}轮: {len(orders)} 张")
+            time.sleep(0.6)
+        if total:
+            logger.info(f"🧹 已撤销限价止盈合计 {total} 张")
+        return total
+
+    def _scorched_earth_cancel_for_recover(self):
+        for attempt in range(6):
+            deepcoin_client.cancel_all_open_orders(self.symbol)
+            time.sleep(0.8)
+            self._cancel_all_tp_limit_orders(max_rounds=4)
+            time.sleep(0.6)
+            remaining = self._collect_tp_limit_orders()
+            if not remaining:
+                logger.info(f"☢️ 重启撤单完成，限价止盈已清零 (第 {attempt + 1} 轮)")
+                return True
+            remain_txt = ", ".join(f"{o['qty']}@{o['price']}" for o in remaining[:4])
+            logger.warning(
+                f"⚠️ 撤单后仍剩 {len(remaining)} 张限价止盈 ({remain_txt}) "
+                f"→ 重试 {attempt + 1}/6"
+            )
+        logger.error("❌ 重启撤单未净：重复 TP 可能残留，非权限问题时请 APP 手动全撤后重启")
+        return False
 
     def _ensure_radar_sl(self, live_qty, sl_price):
         if not sl_price:
@@ -884,95 +1341,210 @@ class PositionSupervisor:
             time.sleep(1.5)
         return last_audit
 
-    def _full_rebuild_tp_loop(self, live_qty, entry, dynamic_sl=None):
-        audit = self._nuclear_realign_tp(live_qty, entry, dynamic_sl=dynamic_sl, rounds=3)
-        return audit["matched_full"], audit["pending_prices"], audit["expected"]
-
-    def _ensure_defenses_on_recover(self, live_qty, entry, dynamic_sl=None):
-        audit = self._audit_tp_levels(live_qty)
-        expected = audit["expected"]
-        matched = audit["matched_full"]
-        pending_prices = audit["pending_prices"]
-        logger.info(
-            f"📊 防线审计: 持仓 {live_qty}张 | TP {matched}/{expected} | "
-            f"{self._format_audit_summary(audit)}"
+    def _tp_audit_ok(self, audit):
+        expected = audit.get("expected", 0)
+        if expected <= 0:
+            return True
+        return (
+            audit.get("matched_full", 0) >= expected
+            and not audit.get("orphans")
+            and not self._defense_needs_immediate_fix(audit)
         )
 
-        if self._audit_requires_nuclear(audit) or self._has_duplicate_tp_orders():
-            logger.warning(
-                f"☢️ 审计触发核武级重挂: {len(self._collect_tp_limit_orders())} 张止盈 | "
+    def _mark_defense_align_ok(self):
+        self._last_defense_align_ok_ts = time.time()
+        self._guardian_bad_streak = 0
+
+    def _defense_needs_immediate_fix(self, audit):
+        if self._audit_requires_nuclear(audit):
+            return True
+        for lv in audit.get("levels", []):
+            if lv.get("status") in ("duplicate", "missing", "qty_mismatch"):
+                return True
+        return bool(audit.get("issues") or audit.get("orphans"))
+
+    def _enforce_defense_alignment(self, live_qty, entry, dynamic_sl=None, reason="", rounds=3,
+                                   recover_mode=False):
+        live_qty = self._resolve_live_qty(live_qty)
+        if live_qty <= 0:
+            audit = self._audit_tp_levels(live_qty)
+            return {
+                "matched": 0, "expected": audit.get("expected", 0),
+                "pending_prices": [], "rebuilt": False, "audit": audit, "nuclear": False,
+            }
+        if reason:
+            logger.info(f"🛡️ 防线对齐: {reason} | 持仓 {live_qty}张")
+
+        self._defense_align_in_progress = True
+        try:
+            audit = self._audit_tp_levels(live_qty)
+            if not recover_mode and self._tp_audit_ok(audit):
+                logger.info(f"✅ TP 已齐，跳过撤单: {self._format_audit_summary(audit)}")
+                if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
+                    self._ensure_radar_sl(live_qty, dynamic_sl)
+                self._mark_defense_align_ok()
+                return {
+                    "matched": audit["matched_full"],
+                    "expected": audit["expected"],
+                    "pending_prices": audit["pending_prices"],
+                    "rebuilt": False,
+                    "audit": audit,
+                    "nuclear": False,
+                }
+
+            if recover_mode:
+                self._scorched_earth_cancel_for_recover()
+            else:
+                self._cancel_all_tp_limit_orders()
+            time.sleep(0.45)
+            audit = self._audit_tp_levels(live_qty)
+            if self._tp_audit_ok(audit):
+                logger.info(f"✅ 撤单后 TP 已齐: {self._format_audit_summary(audit)}")
+                if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
+                    self._ensure_radar_sl(live_qty, dynamic_sl)
+                self._mark_defense_align_ok()
+                return {
+                    "matched": audit["matched_full"],
+                    "expected": audit["expected"],
+                    "pending_prices": audit["pending_prices"],
+                    "rebuilt": False,
+                    "audit": audit,
+                    "nuclear": False,
+                }
+
+            sl_preserve = dynamic_sl if (dynamic_sl and self._is_radar_active() and not recover_mode) else None
+            audit = self._nuclear_realign_tp(
+                live_qty, entry, dynamic_sl=sl_preserve, rounds=rounds,
+            )
+            if audit["matched_full"] < audit["expected"]:
+                logger.warning("☢️ 首轮核武未齐，追加一轮重挂")
+                if recover_mode:
+                    self._scorched_earth_cancel_for_recover()
+                else:
+                    self._cancel_all_tp_limit_orders(max_rounds=4)
+                time.sleep(0.6)
+                audit = self._nuclear_realign_tp(
+                    live_qty, entry, dynamic_sl=sl_preserve, rounds=max(2, rounds - 1),
+                )
+            if dynamic_sl and not recover_mode and not self._has_trigger_sl_near(dynamic_sl):
+                self._ensure_radar_sl(live_qty, dynamic_sl)
+            if self._tp_audit_ok(audit):
+                self._mark_defense_align_ok()
+            return {
+                "matched": audit["matched_full"],
+                "expected": audit["expected"],
+                "pending_prices": audit["pending_prices"],
+                "rebuilt": True,
+                "audit": audit,
+                "nuclear": True,
+            }
+        finally:
+            self._defense_align_in_progress = False
+
+    def _radar_guardian_audit(self, real_amt, curr_px):
+        if real_amt <= 0 or not self.monitoring:
+            return None
+        if getattr(self, "_recover_in_progress", False):
+            return None
+        if getattr(self, "_open_in_progress", False):
+            return None
+        if getattr(self, "_defense_align_in_progress", False):
+            return None
+
+        cap = self._radar_enforce_regime_cap(real_amt, curr_px)
+        if cap:
+            real_amt = cap["new_qty"]
+            if self._tp_audit_ok(cap["result"]["audit"]):
+                return cap
+
+        audit = self._audit_tp_levels(real_amt)
+        sl = self._radar_sl_to_pass()
+
+        if self._tp_audit_ok(audit):
+            self._guardian_bad_streak = 0
+            if sl and not self._has_trigger_sl_near(sl):
+                self._ensure_radar_sl(real_amt, sl)
+            return None
+
+        self._guardian_bad_streak += 1
+        now = time.time()
+        severe = self._defense_needs_immediate_fix(audit)
+        in_grace = now < getattr(self, "_sentinel_grace_until", 0)
+        in_cooldown = (
+            now - getattr(self, "_last_defense_align_ok_ts", 0)
+            < DEFENSE_ALIGN_COOLDOWN_SEC
+        )
+        if (in_grace or in_cooldown) and not severe and self._guardian_bad_streak < 2:
+            logger.info(
+                f"📡 [雷达守护] TP 审计波动，暂不重挂 "
+                f"({'重启宽限期' if in_grace else '冷却期'}) | "
                 f"{self._format_audit_summary(audit)}"
             )
-            audit = self._nuclear_realign_tp(live_qty, entry, dynamic_sl=dynamic_sl, rounds=3)
-            return audit["matched_full"], audit["pending_prices"], audit["expected"], True
-
-        if self._defenses_fully_ok(live_qty, dynamic_sl):
-            logger.info(
-                f"✅ TP123 比例齐全 ({matched}/{expected}) @ {pending_prices}，跳过补挂"
-            )
-            if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
-                self._place_radar_sl(live_qty, dynamic_sl)
-            return matched, pending_prices, expected, False
-
-        self._cancel_orphan_tp_orders(live_qty)
-        logger.info(f"📋 止盈未齐 ({matched}/{expected})，增量补挂缺失档（保留已有正确单）")
-        self._patch_missing_tp_levels(live_qty)
-        time.sleep(0.8)
-        audit = self._audit_tp_levels(live_qty)
-        matched = audit["matched_full"]
-
-        if self._defenses_fully_ok(live_qty, dynamic_sl):
-            logger.info(f"✅ 增量补挂成功 ({matched}/{expected}) @ {audit['pending_prices']}")
-            if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
-                self._place_radar_sl(live_qty, dynamic_sl)
-            return matched, audit["pending_prices"], expected, True
+            return None
 
         logger.warning(
-            f"⚠️ 增量补挂仍不足 ({matched}/{expected}) {audit['issues']}，升级核武级重挂"
+            f"📡 [雷达守护] TP 未对齐 → 撤单重算重挂 | "
+            f"{self._format_audit_summary(audit)}"
         )
-        audit = self._nuclear_realign_tp(live_qty, entry, dynamic_sl=dynamic_sl, rounds=3)
-        return audit["matched_full"], audit["pending_prices"], expected, True
+        sl_preserve = sl if self._is_radar_active() else None
+        result = self._enforce_defense_alignment(
+            real_amt, self.watched_entry, dynamic_sl=sl_preserve,
+            reason="雷达守护实时纠偏", rounds=3,
+        )
+        new_audit = result["audit"]
+        if new_audit["matched_full"] < new_audit["expected"]:
+            dingtalk.report_system_alert(
+                "雷达守护：止盈仍未对齐",
+                (
+                    f"{self.current_side} {real_amt}张 | "
+                    f"{self._format_audit_summary(new_audit)} | 请人工核查 Deepcoin 挂单"
+                ),
+            )
+        elif self._defense_needs_immediate_fix(audit):
+            logger.info(
+                f"📡 [雷达守护] 纠偏完成: "
+                f"{new_audit['matched_full']}/{new_audit['expected']} | "
+                f"{self._format_audit_summary(new_audit)}"
+            )
+            if getattr(self, "_recover_tp_unconfirmed", False):
+                self._recover_tp_unconfirmed = False
+                self._call_dingtalk(
+                    dingtalk.report_radar_guardian_realigned,
+                    side=self.current_side,
+                    qty=real_amt,
+                    tp_audit=new_audit,
+                    verify_note=(
+                        f"重启接管竞态后雷达已纠偏 | "
+                        f"{new_audit['matched_full']}/{new_audit['expected']} | "
+                        f"{self._format_audit_summary(new_audit)}"
+                    ),
+                )
+            elif getattr(self, "_open_tp_unconfirmed", False):
+                self._open_tp_unconfirmed = False
+                self._call_dingtalk(
+                    dingtalk.report_radar_guardian_realigned,
+                    side=self.current_side,
+                    qty=real_amt,
+                    tp_audit=new_audit,
+                    verify_note=(
+                        f"开仓后雷达已纠偏 | "
+                        f"{new_audit['matched_full']}/{new_audit['expected']} | "
+                        f"{self._format_audit_summary(new_audit)}"
+                    ),
+                )
+        return result
+
+    def _full_rebuild_tp_loop(self, live_qty, entry, dynamic_sl=None):
+        result = self._enforce_defense_alignment(
+            live_qty, entry, dynamic_sl=dynamic_sl, reason="全量重建", rounds=3,
+        )
+        audit = result["audit"]
+        return audit["matched_full"], audit["pending_prices"], audit["expected"]
 
     def _smart_realign_defenses(self, live_qty, entry, dynamic_sl=None, reason=""):
-        if reason:
-            logger.info(f"🧠 智能防线对齐: {reason}")
-        initial = self._audit_tp_levels(live_qty)
-        if self._defenses_fully_ok(live_qty, dynamic_sl):
-            logger.info(f"✅ 防线已齐，跳过: {self._format_audit_summary(initial)}")
-            return {
-                "matched": initial["matched_full"],
-                "expected": initial["expected"],
-                "pending_prices": initial["pending_prices"],
-                "rebuilt": False,
-                "audit": initial,
-                "nuclear": False,
-            }
-
-        self._cancel_orphan_tp_orders(live_qty)
-        matched, pending_prices, expected, rebuilt = self._ensure_defenses_on_recover(
-            live_qty, entry, dynamic_sl=dynamic_sl,
+        return self._enforce_defense_alignment(
+            live_qty, entry, dynamic_sl=dynamic_sl, reason=reason or "智能防线对齐", rounds=3,
         )
-        audit = self._audit_tp_levels(live_qty)
-        nuclear = False
-
-        if expected > 0 and audit["matched_full"] < expected:
-            logger.warning(
-                f"⚠️ 常规对齐未达标 ({audit['matched_full']}/{expected})，"
-                f"升级核武级清场重挂"
-            )
-            audit = self._nuclear_realign_tp(live_qty, entry, dynamic_sl=dynamic_sl, rounds=3)
-            matched = audit["matched_full"]
-            pending_prices = audit["pending_prices"]
-            rebuilt = nuclear = True
-
-        return {
-            "matched": matched,
-            "expected": expected,
-            "pending_prices": pending_prices,
-            "rebuilt": rebuilt,
-            "audit": audit,
-            "nuclear": nuclear,
-        }
 
     def _place_radar_sl(self, live_qty, sl_price):
         close_side = "sell" if self.current_side == "LONG" else "buy"
@@ -995,7 +1567,7 @@ class PositionSupervisor:
         """根据张数变化 + 盘口 TP 单消失推断成交档位"""
         if new_qty >= old_qty:
             return []
-        ratios = self.regime_settings[self.regime]["ratios"]
+        ratios = self.regime_settings[self._tp_split_regime()]["ratios"]
         o1, o2, o3 = self._calculate_tp_quantities(old_qty, ratios)
         fills = []
         budget = old_qty - new_qty
@@ -1012,6 +1584,154 @@ class PositionSupervisor:
                 fills.append({"level": level, "price": tp_px, "qty": fill_qty})
                 budget -= fill_qty
         return fills
+
+    def _detect_shield_fills(self, old_qty, new_qty, curr_px):
+        if not getattr(self, "shield_active", False):
+            return []
+        if new_qty >= old_qty:
+            return []
+        tier_prices = self._shield_tier_prices()
+        q1, q2, q3 = self._split_shield_quantities(old_qty)
+        consumed = set(getattr(self, "shield_tiers_consumed", []) or [])
+        budget = old_qty - new_qty
+        fills = []
+        for tier_no, (pct, tp, slice_qty) in enumerate(
+            zip(SHIELD_TIER_PCTS, tier_prices, (q1, q2, q3)), start=1,
+        ):
+            if pct in consumed or slice_qty <= 0 or budget <= 0:
+                continue
+            if not self._has_shield_stop_at_price(tp, tier_prices):
+                if budget >= max(1, slice_qty - 1):
+                    fill_qty = min(budget, slice_qty)
+                    fills.append({
+                        "tier": tier_no, "pct": pct, "price": tp, "qty": fill_qty,
+                    })
+                    budget -= fill_qty
+        return fills
+
+    def _classify_position_change(self, old_qty, new_qty, curr_px):
+        if new_qty > old_qty:
+            return {"kind": "add", "tp_fills": [], "shield_fills": []}
+        if new_qty >= old_qty:
+            return {"kind": "unchanged", "tp_fills": [], "shield_fills": []}
+        tp_fills = self._detect_tp_fills(old_qty, new_qty)
+        shield_fills = self._detect_shield_fills(old_qty, new_qty, curr_px)
+        adverse = self._adverse_move_pct(curr_px) if curr_px > 0 else 0.0
+        favorable = (
+            self._is_radar_active()
+            or (curr_px > 0 and self._radar_activation_progress(curr_px) >= 0.25)
+        )
+        if tp_fills and shield_fills:
+            if favorable and adverse < SHIELD_ACTIVATION_PCT:
+                shield_fills = []
+            elif adverse >= SHIELD_ACTIVATION_PCT * 0.85:
+                tp_fills = []
+        if tp_fills:
+            return {"kind": "tp_fill", "tp_fills": tp_fills, "shield_fills": []}
+        if shield_fills:
+            return {"kind": "shield_fill", "tp_fills": [], "shield_fills": shield_fills}
+        return {"kind": "reduce_unknown", "tp_fills": [], "shield_fills": []}
+
+    def _advance_radar_on_tp_fill(self, tp_fills, curr_px, live_qty):
+        if not tp_fills:
+            return None
+        for f in tp_fills:
+            px = f["price"]
+            if self.current_side == "LONG":
+                self.best_price = max(self.best_price, px, curr_px or 0)
+            else:
+                bp = curr_px if curr_px and curr_px > 0 else px
+                self.best_price = min(self.best_price, px, bp)
+        max_level = max(f["level"] for f in tp_fills)
+        tp3 = self.tv_tps[2] if len(self.tv_tps) > 2 else 0.0
+        new_sl = self._compute_radar_sl()
+        if new_sl is not None:
+            fee_buffer = self.watched_entry * 0.0015
+            if self.current_side == "LONG":
+                floor = self.watched_entry + fee_buffer
+                self.current_sl = max(self.current_sl or floor, new_sl, floor)
+            else:
+                ceiling = self.watched_entry - fee_buffer
+                self.current_sl = min(self.current_sl or ceiling, new_sl, ceiling)
+        note = f"TP{max_level}成交"
+        if max_level >= 2 and tp3 > 0:
+            note += f" → 雷达止损向 TP3({tp3:.2f}) 动态收紧"
+        logger.info(
+            f"📈 [雷达推进] {note} | SL={self.current_sl:.2f} | best={self.best_price:.2f}"
+        )
+        self._save_state()
+        return self.current_sl if self._is_radar_active() else None
+
+    def _handle_smart_qty_change(self, old_qty, new_qty, curr_px):
+        change = self._classify_position_change(old_qty, new_qty, curr_px)
+        kind = change["kind"]
+        result = None
+        sl_to_pass = None
+
+        if kind == "add":
+            sl_to_pass = self._radar_sl_to_pass()
+            result = self._smart_realign_defenses(
+                new_qty, self.watched_entry, dynamic_sl=sl_to_pass,
+                reason="加仓后防线对齐",
+            )
+        elif kind == "tp_fill":
+            levels = ",".join(f"TP{f['level']}" for f in change["tp_fills"])
+            self._disarm_shield(f"{levels} 成交，切换雷达追踪")
+            sl_to_pass = self._advance_radar_on_tp_fill(
+                change["tp_fills"], curr_px, new_qty,
+            )
+            result = self._smart_realign_defenses(
+                new_qty, self.watched_entry, dynamic_sl=sl_to_pass,
+                reason=f"{levels} 成交智能对齐",
+            )
+            if sl_to_pass and not self._has_trigger_sl_near(sl_to_pass):
+                self._ensure_radar_sl(new_qty, sl_to_pass)
+        elif kind == "shield_fill":
+            tier_txt = "/".join(f"-{f['pct']:.0%}" for f in change["shield_fills"])
+            if not hasattr(self, "shield_tiers_consumed") or self.shield_tiers_consumed is None:
+                self.shield_tiers_consumed = []
+            for f in change["shield_fills"]:
+                if f["pct"] not in self.shield_tiers_consumed:
+                    self.shield_tiers_consumed.append(f["pct"])
+            self.shield_active = True
+            result = self._smart_realign_defenses(
+                new_qty, self.watched_entry, dynamic_sl=None,
+                reason=f"防护盾{tier_txt}成交后 TP 重算",
+            )
+            self._place_shield_stops(
+                new_qty, reason=f"防护盾 {tier_txt} 成交，维护剩余止损",
+            )
+            for f in change["shield_fills"]:
+                remain_pcts = [SHIELD_TIER_PCTS[i] for i in self._remaining_shield_tier_indices()]
+                self._call_dingtalk(
+                    dingtalk.report_shield_tier_fill,
+                    side=self.current_side,
+                    tier_pct=f["pct"],
+                    tier_price=f["price"],
+                    filled_qty=f["qty"],
+                    remain_qty=new_qty,
+                    entry_px=self.watched_entry,
+                    remaining_tiers=remain_pcts,
+                    verify_note=(
+                        f"防护盾 -{f['pct']:.0%} @ {f['price']:.2f} 成交 | "
+                        f"仍挂: {'/'.join(f'-{p:.0%}' for p in remain_pcts) or '无'}"
+                    ),
+                )
+        else:
+            self._bump_best_on_tp_fill(old_qty, new_qty, curr_px)
+            self._sync_radar_sl_from_best(curr_px)
+            sl_to_pass = self._radar_sl_to_pass()
+            result = self._smart_realign_defenses(
+                new_qty, self.watched_entry, dynamic_sl=sl_to_pass,
+                reason="人工异动重对齐",
+            )
+            if self._should_radar_trail(curr_px):
+                self._disarm_shield("行情转有利，切换雷达保本")
+            elif self._should_activate_shield(curr_px) or getattr(self, "shield_active", False):
+                self._place_shield_stops(new_qty, reason=f"仓位变化 {old_qty}→{new_qty} 张")
+
+        self._save_state()
+        return change, result
 
     def _report_qty_change_dingtalk(self, old_qty, new_qty, realign_result):
         """TP 成交 / 减仓：REST 重试核查后必达钉钉"""
@@ -1105,19 +1825,17 @@ class PositionSupervisor:
         )
 
     def _realign_radar_defenses(self, live_qty, entry, new_sl):
-        self._cancel_stop_orders()
+        """雷达推升：TP 异常才核武；止损单独换"""
+        self._cancel_stop_orders(scope="radar")
         time.sleep(0.35)
-        sl_placed = False
-        if not self._defenses_fully_ok(live_qty, dynamic_sl=None):
-            if self._audit_requires_nuclear(self._audit_tp_levels(live_qty)):
-                self._nuclear_realign_tp(live_qty, entry, dynamic_sl=new_sl, rounds=2)
-                sl_placed = self._has_trigger_sl_near(new_sl) or self._ensure_radar_sl(live_qty, new_sl)
-            else:
-                self._cancel_orphan_tp_orders(live_qty)
-                self._patch_missing_tp_levels(live_qty)
-                time.sleep(0.6)
-                sl_placed = self._ensure_radar_sl(live_qty, new_sl)
-        else:
+        audit = self._audit_tp_levels(live_qty)
+        if self._defense_needs_immediate_fix(audit):
+            self._enforce_defense_alignment(
+                live_qty, entry, dynamic_sl=new_sl,
+                reason="雷达推升前 TP 纠偏", rounds=2,
+            )
+        sl_placed = self._ensure_radar_sl(live_qty, new_sl)
+        if not sl_placed:
             self._place_radar_sl(live_qty, new_sl)
             time.sleep(0.35)
             sl_placed = self._has_trigger_sl_near(new_sl)
@@ -1138,6 +1856,17 @@ class PositionSupervisor:
                 return matched, pending
             time.sleep(delay)
         return matched, pending
+
+    def _wait_defense_settled(self, live_qty, dynamic_sl=None, retries=8, delay=0.75):
+        sl = dynamic_sl if dynamic_sl is not None else self._radar_sl_to_pass()
+        last = self._audit_tp_levels(live_qty)
+        for i in range(retries):
+            if not self._defense_needs_immediate_fix(last) and self._defenses_fully_ok(live_qty, sl):
+                return last
+            if i + 1 < retries:
+                time.sleep(delay)
+                last = self._audit_tp_levels(live_qty)
+        return last
 
     def _has_trigger_sl_near(self, sl_price, tolerance=2.0):
         for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
@@ -1246,7 +1975,12 @@ class PositionSupervisor:
             return
 
         try:
-            self.monitoring = False
+            is_close = (
+                raw_action in ("CLOSE", "CLOSE_PROTECT", "CLOSE_TP3")
+                or raw_action.startswith("CLOSE")
+            )
+            if is_close:
+                self.monitoring = False
             if raw_action == "CLOSE_PROTECT" or raw_action.startswith("CLOSE_PROTECT"):
                 extra = ""
                 if close_side:
@@ -1274,6 +2008,181 @@ class PositionSupervisor:
         finally:
             self._lock.release()
 
+    @staticmethod
+    def _pos_side_label(pos):
+        return "LONG" if str(pos.get("posSide", "long")).lower() == "long" else "SHORT"
+
+    def _entry_price_diff_pct(self, price_a, price_b, ref_px):
+        ref = ref_px or max(abs(price_a), abs(price_b), 1.0)
+        return abs(float(price_a) - float(price_b)) / ref * 100.0
+
+    def _is_similar_atr(self, atr_a, atr_b):
+        a, b = float(atr_a or 0), float(atr_b or 0)
+        if a <= 0 and b <= 0:
+            return True
+        if a <= 0 or b <= 0:
+            return False
+        return abs(a - b) / max(a, b) <= ATR_SIMILAR_RATIO
+
+    def _touch_entry_signal_signature(self, action):
+        self._last_entry_signal = {
+            "action": action,
+            "tv_price": self.tv_price,
+            "atr": self.current_atr,
+            "regime": self.regime,
+            "tv_tps": list(self.tv_tps),
+            "ts": time.time(),
+        }
+
+    def _is_duplicate_flat_entry(self, action, curr_px):
+        sig = self._last_entry_signal
+        if not sig or sig.get("action") != action:
+            return False
+        if time.time() - float(sig.get("ts", 0)) > SAME_DIR_DEDUP_SEC:
+            return False
+        if not self._is_similar_atr(sig.get("atr"), self.current_atr):
+            return False
+        if int(sig.get("regime", 0)) != int(self.regime):
+            return False
+        ref_px = curr_px or self.tv_price or sig.get("tv_price") or 1.0
+        diff = self._entry_price_diff_pct(sig.get("tv_price", 0), self.tv_price, ref_px)
+        return diff < SAME_DIR_MIN_SPREAD_PCT
+
+    def _same_direction_entry_mode(self, action, pos, curr_px):
+        """同向智能决策：① ATR → ② 档位 → ③ 理论开仓价差"""
+        ref_px = curr_px or self.tv_price or pos["entry_price"]
+        live_entry = pos["entry_price"]
+        diff_pct = self._entry_price_diff_pct(live_entry, self.tv_price, ref_px)
+        open_regime = int(getattr(self, "open_regime", self.regime) or self.regime)
+        open_atr = float(getattr(self, "open_atr", self.current_atr) or self.current_atr)
+        tv_atr = float(self.current_atr)
+
+        if not self._is_similar_atr(open_atr, tv_atr):
+            logger.info(
+                f"🔄 同向 [{action}] ATR {open_atr:.2f}→{tv_atr:.2f} 变化 "
+                f"(>{ATR_SIMILAR_RATIO:.0%}) → 先平后开重入"
+            )
+            return "FULL_REENTRY", diff_pct, "atr_changed", open_atr, tv_atr
+
+        if int(self.regime) != open_regime:
+            logger.info(
+                f"🔄 同向 [{action}] 档位 R{open_regime}→R{self.regime} → 先平后开重入"
+            )
+            return "FULL_REENTRY", diff_pct, "regime_changed", open_atr, tv_atr
+
+        if diff_pct >= SAME_DIR_MIN_SPREAD_PCT:
+            logger.info(
+                f"🔄 同向 [{action}] 价差 {diff_pct:.3f}% ≥ {SAME_DIR_MIN_SPREAD_PCT}% → 先平后开"
+            )
+            return "FULL_REENTRY", diff_pct, "spread_ok", open_atr, tv_atr
+
+        logger.info(
+            f"🧠 同向 [{action}] ATR {tv_atr:.2f} 未变 + 价差 {diff_pct:.3f}% "
+            f"< {SAME_DIR_MIN_SPREAD_PCT}% → 仅刷新 TP123"
+        )
+        return "REFRESH_TP", diff_pct, "refresh_tp", open_atr, tv_atr
+
+    def _report_smart_reentry(self, action, pos, diff_pct, reason, open_atr, tv_atr):
+        live_entry = pos["entry_price"]
+        real_qty = self._safe_qty(pos.get("size"))
+        reason_txt = {
+            "atr_changed": f"TV ATR `{tv_atr:.2f}` ≠ 持仓 ATR `{open_atr:.2f}` → 刷新仓位",
+            "regime_changed": f"档位 R{self.open_regime}→R{self.regime} → 刷新仓位",
+            "spread_ok": f"理论价差 {diff_pct:.3f}% ≥ {SAME_DIR_MIN_SPREAD_PCT}% → 刷新仓位",
+        }.get(reason, "同向刷新仓位")
+        self._call_dingtalk(
+            dingtalk.report_smart_same_dir_decision,
+            side=action,
+            decision=f"reentry_{reason}",
+            live_entry=live_entry,
+            tv_price=self.tv_price,
+            diff_pct=diff_pct,
+            threshold_pct=SAME_DIR_MIN_SPREAD_PCT,
+            open_regime=self.open_regime,
+            tv_regime=self.regime,
+            open_atr=open_atr,
+            tv_atr=tv_atr,
+            qty=real_qty,
+            verify_note=(
+                f"核实持仓 {real_qty}张 @ {live_entry:.2f} | {reason_txt} | 执行先平后开"
+            ),
+        )
+
+    def _same_direction_refresh_tp(self, action, pos, curr_px, diff_pct, open_atr, tv_atr):
+        live_pos = self._get_active_position()
+        if not live_pos or self._safe_qty(live_pos.get("size", 0)) <= 0:
+            logger.warning("🧠 同向刷新: 实盘已无持仓，跳过")
+            return
+
+        real_qty = self._safe_qty(live_pos["size"])
+        entry = live_pos["entry_price"]
+        self.current_side = action
+        self.watched_qty = real_qty
+        self.watched_entry = entry
+        self.monitoring = True
+        self._save_state()
+
+        sl_to_pass = self._radar_sl_to_pass()
+        result = self._smart_realign_defenses(
+            real_qty, entry, dynamic_sl=sl_to_pass,
+            reason="同向TV智能刷新止盈",
+        )
+        self._ensure_sentinel_running()
+
+        verify_note = (
+            f"核实持仓 {real_qty}张 @ {entry:.2f} | TV理论 {self.tv_price:.2f} | "
+            f"持仓ATR {open_atr:.2f} = TV ATR {tv_atr:.2f} | "
+            f"价差 {diff_pct:.3f}% (< {SAME_DIR_MIN_SPREAD_PCT}%) | "
+            f"止盈 {result['matched']}/{result['expected']} 档 | "
+            f"{self._format_audit_summary(result['audit'])}"
+        )
+        self._call_dingtalk(
+            dingtalk.report_smart_same_dir_decision,
+            side=action,
+            decision="skip_refresh_tp",
+            live_entry=entry,
+            tv_price=self.tv_price,
+            diff_pct=diff_pct,
+            threshold_pct=SAME_DIR_MIN_SPREAD_PCT,
+            open_regime=self.open_regime,
+            tv_regime=self.regime,
+            open_atr=open_atr,
+            tv_atr=tv_atr,
+            qty=real_qty,
+            tp_audit=result["audit"],
+            verify_note=verify_note,
+        )
+        logger.info("🧠 同向智能处理完成: ATR未变+价差不足，未再开仓，TP123 已按新 TV 价刷新")
+
+    def _ensure_sentinel_running(self):
+        if self.monitoring and not self._sentinel_active:
+            threading.Thread(
+                target=self._sentinel_loop, daemon=True, name="sentinel",
+            ).start()
+
+    def _full_reentry(self, action, close_reason):
+        deepcoin_client.cancel_all_open_orders(self.symbol)
+        time.sleep(0.5)
+        if not self._close_all(close_reason, reset_state=True):
+            logger.error("❌ 先平后开中止：平仓未归零，拒绝叠仓开仓")
+            dingtalk.report_system_alert(
+                "先平后开中止 · 平仓未归零",
+                "6 轮强平后盘口仍有持仓，已拒绝新开仓，请人工核查 Deepcoin 盘口",
+            )
+            return
+        if not self._wait_verify(self._verify_flat, retries=8, delay=0.5):
+            logger.error("❌ 先平后开中止：空仓核查未通过")
+            dingtalk.report_system_alert(
+                "先平后开中止 · 空仓核查失败",
+                "平仓指令已发但 REST 仍显示持仓，已拒绝叠仓开仓",
+            )
+            return
+        deepcoin_client.cancel_all_open_orders(self.symbol)
+        time.sleep(0.5)
+        curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
+        if curr_px > 0:
+            self._open_position(action, curr_px)
+
     def _handle_manual_flat_detected(self, reason):
         """人工全平 / 止盈吃满：智能复位账本"""
         logger.info(f"📭 感知空仓: {reason}")
@@ -1286,86 +2195,204 @@ class PositionSupervisor:
         self._report_flat_close(reason or "仓位归零 (人工全平 / 止盈吃满)")
 
     def _handle_smart_entry(self, action):
-        """三重把关之一：新 TV 方向到达 → 先平后开（撤单→平仓→再开仓）"""
-        logger.info(f"⚡ 收到建仓信号 [{action}]，启动绝对先平后开机制")
+        """同向智能筛选；反向一律先平后开"""
+        curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
+        pos = self._get_active_position()
+
+        if pos and self._safe_qty(pos.get("size", 0)) > 0:
+            current_side = self._pos_side_label(pos)
+            if current_side != action:
+                logger.info(f"⚡ 反方向 [{action}] vs 实盘 [{current_side}] → 先平后开")
+                self._full_reentry(action, "反方向指令到达，触发【先平后开】原子对冲换防")
+                self._touch_entry_signal_signature(action)
+                return
+
+            mode, diff_pct, reason, open_atr, tv_atr = self._same_direction_entry_mode(action, pos, curr_px)
+            if mode == "REFRESH_TP":
+                self._same_direction_refresh_tp(action, pos, curr_px, diff_pct, open_atr, tv_atr)
+                self._touch_entry_signal_signature(action)
+                return
+
+            close_msgs = {
+                "atr_changed": f"同向 TV ATR 变化 ({open_atr:.2f}→{tv_atr:.2f})，触发【先平后开】刷新仓位",
+                "regime_changed": "同向 TV 档位变化，触发【先平后开】重入",
+                "spread_ok": f"同向理论价差 {diff_pct:.3f}% 达标，触发【先平后开】重入",
+            }
+            self._report_smart_reentry(action, pos, diff_pct, reason, open_atr, tv_atr)
+            self._full_reentry(action, close_msgs.get(reason, "同方向刷新仓位，触发【先平后开】重入"))
+            self._touch_entry_signal_signature(action)
+            return
+
+        if self._is_duplicate_flat_entry(action, curr_px):
+            ref_px = curr_px or self.tv_price or 1.0
+            diff_pct = self._entry_price_diff_pct(
+                self._last_entry_signal.get("tv_price", 0), self.tv_price, ref_px,
+            )
+            logger.info(f"🧠 空仓短时重复同向 TV [{action}] → 忽略开仓")
+            self._call_dingtalk(
+                dingtalk.report_smart_same_dir_decision,
+                side=action,
+                decision="skip_duplicate_flat",
+                live_entry=0.0,
+                tv_price=self.tv_price,
+                diff_pct=diff_pct,
+                threshold_pct=SAME_DIR_MIN_SPREAD_PCT,
+                open_regime=self.regime,
+                tv_regime=self.regime,
+                open_atr=self._last_entry_signal.get("atr", self.current_atr),
+                tv_atr=self.current_atr,
+                qty=0.0,
+                verify_note=(
+                    f"5分钟内重复 {action} | ATR {self.current_atr:.2f} 未变 | "
+                    f"TV {self.tv_price:.2f} 价差 {diff_pct:.3f}% | 档位 R{self.regime} | 未重复下单"
+                ),
+            )
+            self._touch_entry_signal_signature(action)
+            return
+
+        logger.info(f"⚡ 收到建仓信号 [{action}]，空仓极速开仓")
+        if not self._ensure_flat_before_open("空仓开仓"):
+            dingtalk.report_system_alert(
+                "开仓中止 · 盘口非空",
+                f"收到 TV {action} 但实盘仍有残留持仓，已拒绝叠仓开仓",
+            )
+            return
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
-
-        pos = self._get_active_position()
-        if pos and pos.get('size', 0) > 0:
-            current_side = "LONG" if pos["posSide"] == "long" else "SHORT"
-            if current_side == action:
-                self._close_all("同方向新指令到达，触发【先平后开】洗清旧阵地")
-            else:
-                self._close_all("反方向指令到达，触发【先平后开】原子对冲换防")
-            time.sleep(1.2)
-            deepcoin_client.cancel_all_open_orders(self.symbol)
-            time.sleep(0.5)
-
-        curr_px = deepcoin_client.get_current_price(self.symbol)
+        curr_px = curr_px or deepcoin_client.get_current_price(self.symbol)
         if curr_px > 0:
             self._open_position(action, curr_px)
+        self._touch_entry_signal_signature(action)
 
     def _open_position(self, action, curr_px):
-        balance = deepcoin_client.get_available_balance()
-        margin_pct = self.regime_settings[self.regime]["margin"]
+        if self._open_in_progress:
+            logger.error(f"开仓中止：已有开仓流程进行中，拒绝叠仓 [{action}]")
+            return
+        self._open_in_progress = True
+        try:
+            qty, balance, margin_usdt, margin_pct = self._calc_target_open_qty(curr_px)
+            if qty <= 0:
+                logger.error(f"开仓跳过：目标张数无效 balance={balance:.2f} px={curr_px}")
+                return
 
-        deepcoin_client.set_leverage(self.symbol, leverage=self.leverage)
-        qty = max(int((balance * margin_pct * self.leverage) / (curr_px * self.face_value)), 1)
-        open_side = "buy" if action == "LONG" else "sell"
-        pos_side = "long" if action == "LONG" else "short"
+            deepcoin_client.set_leverage(self.symbol, leverage=self.leverage)
+            notional = qty * self.face_value * curr_px
+            logger.info(
+                f"📐 仓位预算 R{self.regime}: 本金 {balance:.2f}U × {margin_pct:.0%} "
+                f"= 保证金 {margin_usdt:.2f}U × {self.leverage}x → 目标 {qty} 张 "
+                f"(名义 ~{notional:.0f}U)"
+            )
 
-        logger.info(f"🚀 [唯一主仓] 极速开仓: {open_side} {qty} 张 | 档位 {self.regime}")
-        deepcoin_client.place_market_order(self.symbol, open_side, pos_side, qty)
-        time.sleep(2.0)
+            if not self._wait_verify(self._verify_flat, retries=4, delay=0.35):
+                logger.error("开仓中止：市价下单前盘口仍非空")
+                dingtalk.report_system_alert(
+                    "开仓中止 · 下单前盘口非空",
+                    f"TV {action} 目标 {qty} 张，下单前 REST 仍显示持仓，已拒绝叠仓",
+                )
+                return
 
-        pos = self._get_active_position()
-        if pos and pos.get('size', 0) > 0:
+            open_side = "buy" if action == "LONG" else "sell"
+            pos_side = "long" if action == "LONG" else "short"
+            logger.info(f"🚀 [唯一主仓] 极速开仓: {open_side} {qty} 张 | 档位 {self.regime}")
+            res = deepcoin_client.place_market_order(self.symbol, open_side, pos_side, qty)
+            if not res or not deepcoin_client._is_success(res):
+                logger.error("开仓失败：市价单未成交")
+                dingtalk.report_system_alert("开仓失败", f"TV {action} {qty} 张 市价单失败")
+                return
+            time.sleep(2.0)
+
+            pos = self._get_active_position()
+            if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
+                logger.error("开仓失败：成交后 REST 无持仓")
+                return
+
+            real_qty = self._safe_qty(pos["size"])
+            if real_qty > int(qty * OPEN_OVERSIZE_RATIO):
+                logger.error(
+                    f"🚨 持仓超标: 目标 {qty} 张，实盘 {real_qty} 张，启动裁减"
+                )
+                dingtalk.report_system_alert(
+                    "持仓超标 · 自动裁减",
+                    f"目标 {qty} 张 (保证金 {margin_usdt:.0f}U)，"
+                    f"实盘 {real_qty} 张 @ {pos['entry_price']:.2f}，正在 reduceOnly 裁减",
+                )
+                real_qty = self._trim_position_to_target(qty, action)
+
             self.current_side = action
-            real_qty = self._safe_qty(pos['size'])
+            self.open_regime = self.regime
+            self.open_atr = self.current_atr
             self.initial_qty = real_qty
-            self._protect_and_monitor(real_qty, pos['entry_price'])
+            self._protect_and_monitor(
+                real_qty, pos['entry_price'],
+                budget_note=(
+                    f"本金 {balance:.0f}U | R{self.regime} {margin_pct:.0%} "
+                    f"→ 保证金 {margin_usdt:.0f}U | 目标 {qty} 张"
+                ),
+                target_qty=qty,
+            )
+        finally:
+            self._open_in_progress = False
 
-    def _protect_and_monitor(self, qty, entry_price):
+    def _protect_and_monitor(self, qty, entry_price, budget_note="", target_qty=0):
         tp_pxs = self.tv_tps
         self.current_sl = entry_price
         self.best_price = entry_price
+        self.shield_active = False
+        self.shield_tiers_consumed = []
         self.watched_qty, self.watched_entry, self.monitoring = qty, entry_price, True
         self._save_state()
 
         self._ensure_price_ws()
-        self._rebuild_defenses(qty, entry_price, dynamic_sl=None)
 
         verified = self._wait_verify(lambda: self._verify_position(self.current_side))
         if verified:
-            result = self._smart_realign_defenses(
-                self._safe_qty(verified["size"]), verified["entry_price"],
-                reason="开仓后二次核查",
+            vqty = self._safe_qty(verified["size"])
+            if target_qty > 0 and vqty > int(target_qty * OPEN_OVERSIZE_RATIO):
+                vqty = self._trim_position_to_target(target_qty, self.current_side)
+                self.watched_qty = vqty
+                self.initial_qty = vqty
+                self._save_state()
+
+            self._scorched_earth_cancel_for_recover()
+            self._enforce_defense_alignment(
+                vqty, verified["entry_price"],
+                dynamic_sl=None, reason="开仓后防线对齐", rounds=4,
+                recover_mode=True,
             )
-            matched, expected = result["matched"], result["expected"]
-            audit = result["audit"]
+            audit = self._wait_defense_settled(vqty)
+            matched, expected = audit["matched_full"], audit["expected"]
             verify_note = (
-                f"持仓 {verified['size']}张 @ {verified['entry_price']:.2f} | "
+                f"{budget_note} | " if budget_note else ""
+            ) + (
+                f"持仓 {vqty}张 @ {verified['entry_price']:.2f} | "
                 f"限价止盈 {matched}/{expected} 档 | {self._format_audit_summary(audit)}"
             )
+            if target_qty > 0 and vqty > int(target_qty * OPEN_OVERSIZE_RATIO):
+                verify_note += f" | ⚠️ 超标目标 {target_qty} 张"
             self._record_open_log(
-                self.current_side, self._safe_qty(verified["size"]), verified["entry_price"], source="open",
+                self.current_side, vqty, verified["entry_price"], source="open",
             )
             dingtalk.report_supervisor_open(
                 self.current_side, verified['entry_price'], self.tv_price,
-                verified['size'], tp_pxs, self.current_atr, self.regime, self.tv_tps,
+                vqty, tp_pxs, self.current_atr, self.regime, self.tv_tps,
                 verify_note=verify_note,
                 tp_audit=audit,
             )
             if expected > 0 and matched < expected:
+                self._open_tp_unconfirmed = True
+                dupes = [lv for lv in audit.get("levels", []) if lv.get("status") == "duplicate"]
+                hint = (
+                    "重复 TP 占满可减仓额度 | 雷达将接力纠偏"
+                    if dupes else "请查 logs/deepcoin_brain.log"
+                )
                 dingtalk.report_system_alert(
                     "开仓后限价止盈未全部挂上",
-                    f"{self.current_side} {verified['size']}张 | 仅 {matched}/{expected} 档 | "
-                    f"{self._format_audit_summary(audit)}",
+                    f"{self.current_side} {vqty}张 | 仅 {matched}/{expected} 档 | "
+                    f"{self._format_audit_summary(audit)} | {hint}",
                 )
         else:
             logger.warning("开仓钉钉跳过：实盘持仓核查未通过")
-        threading.Thread(target=self._sentinel_loop, daemon=True).start()
+        self._ensure_sentinel_running()
 
     def _ensure_price_ws(self):
         deepcoin_client.start_public_price_ws(self.symbol)
@@ -1477,8 +2504,11 @@ class PositionSupervisor:
     def _sentinel_poll_sec(self, curr_px=0.0):
         if self._is_radar_active():
             return SENTINEL_POLL_RADAR
-        if curr_px > 0 and self._radar_activation_progress(curr_px) >= 0.5:
-            return SENTINEL_POLL_ARMING
+        if curr_px > 0:
+            if self._radar_activation_progress(curr_px) >= 0.5:
+                return SENTINEL_POLL_ARMING
+            if self._adverse_move_pct(curr_px) >= SHIELD_ACTIVATION_PCT * 0.75:
+                return SENTINEL_POLL_ARMING
         return SENTINEL_POLL_NORMAL
 
     def _process_radar_trailing(self, real_amt, curr_px):
@@ -1514,108 +2544,99 @@ class PositionSupervisor:
 
     def _sentinel_loop(self):
         """哨兵：持仓/TP 防线 + 雷达移动保本（自适应轮询 2~6 秒）"""
+        self._sentinel_active = True
         last_px = 0.0
-        while self.monitoring:
-            try:
-                if not self._lock.acquire(timeout=2.0):
-                    continue
+        try:
+            while self.monitoring:
                 try:
-                    pos = self._get_active_position()
-                    real_amt = self._safe_qty(pos.get("size")) if pos else 0
-                    actual_side = "LONG" if pos and pos.get('posSide') == "long" else "SHORT"
+                    if not self._lock.acquire(timeout=2.0):
+                        continue
+                    try:
+                        pos = self._get_active_position()
+                        real_amt = self._safe_qty(pos.get("size")) if pos else 0
+                        actual_side = "LONG" if pos and pos.get('posSide') == "long" else "SHORT"
 
-                    if real_amt == 0:
-                        if self.watched_qty > 0:
-                            self._handle_manual_flat_detected(
+                        if real_amt == 0:
+                            if self.watched_qty > 0:
+                                self._handle_manual_flat_detected(
+                                    "仓位归零 (止盈吃单 / 人工全平 / TV 强制平仓)"
+                                )
+                            break
+
+                        if self.watched_qty > 0 and self._should_finalize_tp_victory(real_amt):
+                            self._sweep_dust_and_finalize(
                                 "仓位归零 (止盈吃单 / 人工全平 / TV 强制平仓)"
                             )
-                        break
+                            break
 
-                    if self.watched_qty > 0 and self._should_finalize_tp_victory(real_amt):
-                        self._sweep_dust_and_finalize(
-                            "仓位归零 (止盈吃单 / 人工全平 / TV 强制平仓)"
-                        )
-                        break
+                        if actual_side != self.last_tv_side:
+                            reason = f"致命方向背离：实盘({actual_side}) vs TV({self.last_tv_side})"
+                            self._close_all(reason, force_align=(actual_side, self.last_tv_side))
+                            break
 
-                    if actual_side != self.last_tv_side:
-                        reason = f"致命方向背离：实盘({actual_side}) vs TV({self.last_tv_side})"
-                        self._close_all(reason, force_align=(actual_side, self.last_tv_side))
-                        break
+                        curr_px = deepcoin_client.get_current_price(self.symbol)
+                        if curr_px <= 0:
+                            curr_px = last_px
+                        elif curr_px > 0:
+                            last_px = curr_px
+                        if curr_px > 0:
+                            if self.current_side == "LONG":
+                                self.best_price = max(self.best_price, curr_px)
+                            else:
+                                self.best_price = min(self.best_price, curr_px)
 
-                    curr_px = deepcoin_client.get_current_price(self.symbol)
-                    if curr_px <= 0:
-                        curr_px = last_px
-                    elif curr_px > 0:
-                        last_px = curr_px
-                    if curr_px > 0:
-                        if self.current_side == "LONG":
-                            self.best_price = max(self.best_price, curr_px)
-                        else:
-                            self.best_price = min(self.best_price, curr_px)
+                        qty_changed = real_amt != self.watched_qty
+                        if qty_changed:
+                            old_qty = self.watched_qty
+                            self.watched_qty = real_amt
+                            self.watched_entry = pos['entry_price']
+                            change, result = self._handle_smart_qty_change(
+                                old_qty, real_amt, curr_px,
+                            )
+                            if result:
+                                self._report_qty_change_dingtalk(old_qty, real_amt, result)
 
-                    qty_changed = real_amt != self.watched_qty
-                    if qty_changed:
-                        old_qty = self.watched_qty
-                        self.watched_qty = real_amt
-                        self.watched_entry = pos['entry_price']
-                        pct = abs(real_amt - old_qty) / old_qty if old_qty > 0 else 1.0
-                        action_msg = (
-                            "手动加仓" if real_amt > old_qty
-                            else "部分止盈吃单 / 手动减仓"
-                        )
-                        logger.info(
-                            f"🔄 [智慧大脑] 仓位变化 {old_qty} ➔ {real_amt} ({pct:.1%})，智能重对齐"
-                        )
-                        self._bump_best_on_tp_fill(old_qty, real_amt, curr_px)
-                        self._sync_radar_sl_from_best(curr_px)
-                        sl_to_pass = self._radar_sl_to_pass()
-                        result = self._smart_realign_defenses(
-                            real_amt, self.watched_entry, dynamic_sl=sl_to_pass,
-                            reason=f"人工异动: {action_msg}",
-                        )
-                        self._save_state()
-                        self._report_qty_change_dingtalk(old_qty, real_amt, result)
+                        self._scan_ticks += 1
+                        if not qty_changed:
+                            self._radar_guardian_audit(real_amt, curr_px)
 
-                    self._scan_ticks += 1
-                    if not qty_changed and self._scan_ticks % 10 == 0:
-                        audit = self._audit_tp_levels(real_amt)
-                        if audit["issues"]:
+                        if curr_px <= 0:
+                            continue
+
+                        progress = self._radar_activation_progress(curr_px)
+                        if self._should_radar_trail(curr_px):
+                            if getattr(self, "shield_active", False):
+                                self._disarm_shield("行情转有利，切换雷达保本")
+                            self._process_radar_trailing(real_amt, curr_px)
+                        elif not self._is_radar_active():
+                            self._process_adverse_shield(real_amt, curr_px)
+                        elif progress >= 0.5 and self._scan_ticks % 5 == 0:
                             logger.info(
-                                f"🔍 定期扫描发现异常: {audit['issues']}，触发智能补挂"
+                                f"📡 雷达预热: 进度 {progress:.0%} | 现价 {curr_px:.2f} | "
+                                f"轮询 {SENTINEL_POLL_ARMING}s"
                             )
-                            sl_to_pass = self._radar_sl_to_pass()
-                            self._smart_realign_defenses(
-                                real_amt, self.watched_entry, dynamic_sl=sl_to_pass,
-                                reason="定期防线扫描",
-                            )
-
-                    if curr_px <= 0:
-                        continue
-
-                    progress = self._radar_activation_progress(curr_px)
-                    if self._should_radar_trail(curr_px):
-                        self._process_radar_trailing(real_amt, curr_px)
-                    elif progress >= 0.5 and self._scan_ticks % 5 == 0:
-                        logger.info(
-                            f"📡 雷达预热: 进度 {progress:.0%} | 现价 {curr_px:.2f} | "
-                            f"轮询 {SENTINEL_POLL_ARMING}s"
-                        )
-                finally:
-                    self._lock.release()
-            except Exception as e:
-                logger.error(f"哨兵异常: {e}")
-            if self.monitoring:
-                time.sleep(self._sentinel_poll_sec(last_px))
+                    finally:
+                        self._lock.release()
+                except Exception as e:
+                    logger.error(f"哨兵异常: {e}")
+                if self.monitoring:
+                    time.sleep(self._sentinel_poll_sec(last_px))
+        finally:
+            self._sentinel_active = False
 
     def _rebuild_defenses(self, qty, entry, dynamic_sl=None):
         close_side = "sell" if self.current_side == "LONG" else "buy"
         pos_side = "long" if self.current_side == "LONG" else "short"
-        ratios = self.regime_settings[self.regime]["ratios"]
+        ratios = self.regime_settings[self._tp_split_regime()]["ratios"]
 
         live_qty = self._resolve_live_qty(qty)
         if live_qty <= 0:
             logger.warning(f"重建防线跳过：交易所无可用持仓 (传入 {qty} 张)")
             return 0
+
+        self._cancel_all_tp_limit_orders()
+        time.sleep(0.35)
+
         if live_qty != qty:
             self.watched_qty = live_qty
             self._save_state()
@@ -1626,7 +2647,7 @@ class PositionSupervisor:
 
         logger.info(
             f"🕸️ 补挂 TP123: 总 {live_qty}张 → TP1={qty1} TP2={qty2} TP3={qty3} "
-            f"(合计 {qty1 + qty2 + qty3})"
+            f"(R{self._tp_split_regime()} 比例 {ratios})"
         )
 
         for q, px in ((qty1, tp_pxs[0]), (qty2, tp_pxs[1]), (qty3, tp_pxs[2])):
@@ -1646,10 +2667,12 @@ class PositionSupervisor:
             )
         return placed
 
-    def _close_all(self, reason="", force_align=None):
-        """三重把关之二：TV 全平/保护性全平 → 先撤单释放冻结仓位，6 轮阶梯强平至归零"""
+    def _close_all(self, reason="", force_align=None, reset_state=True):
+        """先撤全部挂单再阶梯强平；返回是否已空仓"""
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
+        self._cancel_all_tp_limit_orders()
+        time.sleep(0.3)
         closed_successfully = False
 
         for round_i in range(6):
@@ -1686,11 +2709,25 @@ class PositionSupervisor:
                     f"6 轮市价平仓后仍剩 {residual_sz} 张，请人工核查 Deepcoin 盘口",
                 )
 
-        self.monitoring = False
-        self.watched_qty = 0
-        self.initial_qty = 0
-        self.current_side = None
-        self._save_state()
+        if reset_state:
+            if closed_successfully:
+                self.monitoring = False
+                self.watched_qty = 0
+                self.initial_qty = 0
+                self.current_side = None
+                self.shield_active = False
+                self.shield_tiers_consumed = []
+            else:
+                residual = self._get_active_position()
+                if residual:
+                    self.watched_qty = self._safe_qty(residual["size"])
+                    self.current_side = self._pos_side_label(residual)
+                    self.watched_entry = residual["entry_price"]
+                    logger.warning(
+                        f"强平未归零，账本同步实盘: {self.current_side} {self.watched_qty} 张"
+                    )
+            self._save_state()
+
         deepcoin_client.cancel_all_open_orders(self.symbol)
 
         if reason and closed_successfully:
@@ -1703,6 +2740,8 @@ class PositionSupervisor:
                 dingtalk.report_force_align(real_side, expected_side, verify_note=verify_note)
             else:
                 self._report_flat_close(reason)
+
+        return closed_successfully
 
     def recover_state_on_startup(self):
         """重启闪电接管：对账 TV/开仓日志 → 核实实盘 → 智能补挂 TP123 → 恢复雷达"""
@@ -1724,6 +2763,10 @@ class PositionSupervisor:
                     self.watched_entry = s.get("watched_entry", 0.0)
                     self.initial_qty = s.get("initial_qty", 0)
                     self.last_tv_signal = s.get("last_tv_signal")
+                    self.open_regime = int(s.get("open_regime", s.get("regime", 3)) or 3)
+                    self.open_atr = float(s.get("open_atr", s.get("current_atr", 30.0)) or 30.0)
+                    self.shield_active = bool(s.get("shield_active", False))
+                    self.shield_tiers_consumed = list(s.get("shield_tiers_consumed", []) or [])
 
             if self._scan_and_sweep_dust_on_startup(was_monitoring=saved_monitoring):
                 return
@@ -1733,123 +2776,161 @@ class PositionSupervisor:
 
             pos = self._get_active_position()
             if pos and self._safe_qty(pos.get("size", 0)) != 0:
-                reconcile = self._reconcile_context_on_recover(pos)
-                reconcile_notes = reconcile["notes"]
-                real_amt = self._safe_qty(pos["size"])
-                side = "LONG" if pos.get("posSide") == "long" else "SHORT"
-                self.current_side = side
+                self._recover_in_progress = True
+                if not self._lock.acquire(timeout=120.0):
+                    logger.error("❌ 重启接管无法获取锁，跳过")
+                    self._recover_in_progress = False
+                    return
+                try:
+                    reconcile = self._reconcile_context_on_recover(pos)
+                    reconcile_notes = reconcile["notes"]
+                    real_amt = self._safe_qty(pos["size"])
+                    side = "LONG" if pos.get("posSide") == "long" else "SHORT"
+                    self.current_side = side
 
-                align_notes = self._apply_recover_live_alignment(side, reconcile)
-                reconcile_notes.extend(align_notes)
+                    align_notes = self._apply_recover_live_alignment(side, reconcile)
+                    reconcile_notes.extend(align_notes)
 
-                saved_initial = self._safe_qty(self.initial_qty)
-                if saved_initial <= 0:
-                    saved_initial = real_amt
-                self.watched_qty = real_amt
-                self.initial_qty = saved_initial
-                self.watched_entry = float(pos["entry_price"])
-                qty_change = reconcile.get("qty_manual_change")
+                    saved_initial = self._safe_qty(self.initial_qty)
+                    if saved_initial <= 0:
+                        saved_initial = real_amt
+                    self.watched_qty = real_amt
+                    self.initial_qty = saved_initial
+                    self.watched_entry = float(pos["entry_price"])
+                    if not getattr(self, "open_regime", None):
+                        self.open_regime = self.regime
+                    if not getattr(self, "open_atr", None):
+                        self.open_atr = self.current_atr
+                    qty_change = reconcile.get("qty_manual_change")
 
-                curr_px = deepcoin_client.get_current_price(self.symbol)
-                self._refresh_radar_state_on_recover(curr_px, self.watched_entry)
+                    curr_px = deepcoin_client.get_current_price(self.symbol)
+                    self._refresh_radar_state_on_recover(curr_px, self.watched_entry)
 
-                radar_active = self._is_radar_active()
-                sl_to_pass = self.current_sl if radar_active else None
+                    radar_active = self._is_radar_active()
+                    saved_sl = self.current_sl if radar_active else None
 
-                logger.info(
-                    f"🔄 [系统重启点火] 检测到实盘持仓 {self.current_side} {real_amt}张 @ "
-                    f"{self.watched_entry:.2f} | 雷达={'已激活' if radar_active else '待命'} | "
-                    f"TV对齐 {self.last_tv_side} | 对账 {len(reconcile_notes)} 项"
-                )
+                    logger.info(
+                        f"🔄 [系统重启点火] 检测到实盘持仓 {self.current_side} {real_amt}张 @ "
+                        f"{self.watched_entry:.2f} | 雷达={'已激活' if radar_active else '待命'} | "
+                        f"TV对齐 {self.last_tv_side} | 对账 {len(reconcile_notes)} 项"
+                    )
 
-                result = self._smart_realign_defenses(
-                    real_amt, self.watched_entry, dynamic_sl=sl_to_pass,
-                    reason="重启闪电接管" + (
-                        f" | {qty_change[2]}" if qty_change else ""
-                    ),
-                )
-                matched = result["matched"]
-                expected = result["expected"]
-                _rebuilt = result["rebuilt"]
-                audit = result["audit"]
+                    cap = self._radar_enforce_regime_cap(real_amt, curr_px, force=True)
+                    if cap:
+                        real_amt = cap["new_qty"]
+                        pos = self._get_active_position() or pos
+                        if pos:
+                            self.watched_qty = real_amt
+                            self.initial_qty = real_amt
 
-                self.monitoring = True
-                self._save_state()
-                self._ensure_price_ws()
-                self._record_open_log(
-                    self.current_side, real_amt, self.watched_entry, source="recover",
-                )
+                    result = self._enforce_defense_alignment(
+                        real_amt, self.watched_entry, dynamic_sl=None,
+                        reason="重启闪电接管 · 核武撤单重挂",
+                        rounds=4, recover_mode=True,
+                    )
+                    if saved_sl and radar_active:
+                        sl_ok = self._ensure_radar_sl(real_amt, saved_sl)
+                    else:
+                        sl_ok = True
+                    _rebuilt = result["rebuilt"]
+                    audit = self._wait_defense_settled(
+                        real_amt, saved_sl if radar_active else None,
+                    )
+                    matched = audit["matched_full"]
+                    expected = audit["expected"]
 
-                sl_ok = True
+                    self.monitoring = True
+                    self._save_state()
+                    self._ensure_price_ws()
+                    self._record_open_log(
+                        self.current_side, real_amt, self.watched_entry, source="recover",
+                    )
+
+                    verified = self._wait_verify(
+                        lambda: self._verify_position_qty(real_amt, self.current_side),
+                        retries=8,
+                        delay=0.5,
+                    )
+                    entry_px = float(
+                        (verified or pos).get("entry_price", self.watched_entry)
+                    )
+                    tv_note = ""
+                    if self.last_tv_signal:
+                        tv_note = (
+                            f" | 最新TV: {self.last_tv_signal.get('action')} "
+                            f"@{self.last_tv_signal.get('ts', '')}"
+                        )
+                    reconcile_txt = (" | " + " ; ".join(reconcile_notes)) if reconcile_notes else ""
+                    skip_note = " | 盘口已齐全，未重复补挂" if not _rebuilt else ""
+                    verify_note = (
+                        f"接管 {real_amt}张 @ {entry_px:.2f} | "
+                        f"TV方向 {self.last_tv_side} | "
+                        f"止盈 {matched}/{expected} 档 | "
+                        f"{self._format_audit_summary(audit)}{skip_note}{tv_note}{reconcile_txt}"
+                    )
+                    if not verified:
+                        verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
+                    self._call_dingtalk(
+                        dingtalk.report_recover_takeover,
+                        side=self.current_side,
+                        qty=real_amt,
+                        entry=entry_px,
+                        tv_tps=self.tv_tps,
+                        regime=self.regime,
+                        radar_active=radar_active,
+                        sl_price=self.current_sl,
+                        verify_note=verify_note,
+                        tp_matched=matched,
+                        tp_expected=expected,
+                        tp_audit=audit,
+                        last_tv_signal=self.last_tv_signal,
+                        radar_sl_ok=sl_ok,
+                    )
+                    if qty_change:
+                        old_q, new_q, action_msg = qty_change
+                        self._call_dingtalk(
+                            dingtalk.report_manual_position_change,
+                            action_type=action_msg,
+                            old_qty=old_q,
+                            new_qty=new_q,
+                            new_entry_price=entry_px,
+                            verify_note=f"重启接管检测 | {verify_note}",
+                            tp_audit=audit,
+                            verified=bool(verified),
+                        )
+                    if expected > 0 and matched < expected:
+                        dupes = [lv for lv in audit.get("levels", []) if lv.get("status") == "duplicate"]
+                        hint = (
+                            "重复 TP 占满可减仓额度→TP3 无法挂 | 非 API 权限问题"
+                            if dupes else "请查 logs/deepcoin_brain.log 是否有撤单/限价失败"
+                        )
+                        self._recover_tp_unconfirmed = True
+                        dingtalk.report_system_alert(
+                            "重启接管后限价止盈未对齐",
+                            f"{self.current_side} {real_amt}张 @ {entry_px:.2f} | "
+                            f"仅 {matched}/{expected} 档 | {self._format_audit_summary(audit)} | "
+                            f"{hint} | 雷达哨兵将接力纠偏；仍失败请 APP 手动全撤后重启",
+                        )
+                    else:
+                        self._mark_defense_align_ok()
+
+                    self._sentinel_grace_until = time.time() + SENTINEL_GRACE_AFTER_RECOVER_SEC
+
+                    logger.info("  -> 🎉 实盘阵地接管完毕，TP123 及雷达系统已复位。")
+                finally:
+                    self._recover_in_progress = False
+                    self._lock.release()
+
                 if radar_active:
-                    sl_ok = self._ensure_radar_sl(real_amt, self.current_sl)
                     logger.info(
                         f"📡 [重启] 雷达哨兵已点火 | SL={self.current_sl:.2f} | "
                         f"止损={'已挂/已确认' if sl_ok else '待哨兵补挂'}"
                     )
 
-                threading.Thread(target=self._sentinel_loop, daemon=True).start()
-
-                verified = self._wait_verify(
-                    lambda: self._verify_position_qty(real_amt, self.current_side),
-                    retries=8,
-                    delay=0.5,
-                )
-                entry_px = float(
-                    (verified or pos).get("entry_price", self.watched_entry)
-                )
-                tv_note = ""
-                if self.last_tv_signal:
-                    tv_note = (
-                        f" | 最新TV: {self.last_tv_signal.get('action')} "
-                        f"@{self.last_tv_signal.get('ts', '')}"
-                    )
-                reconcile_txt = (" | " + " ; ".join(reconcile_notes)) if reconcile_notes else ""
-                skip_note = " | 盘口已齐全，未重复补挂" if not _rebuilt else ""
-                verify_note = (
-                    f"接管 {real_amt}张 @ {entry_px:.2f} | "
-                    f"TV方向 {self.last_tv_side} | "
-                    f"止盈 {matched}/{expected} 档 | "
-                    f"{self._format_audit_summary(audit)}{skip_note}{tv_note}{reconcile_txt}"
-                )
-                if not verified:
-                    verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
-                self._call_dingtalk(
-                    dingtalk.report_recover_takeover,
-                    side=self.current_side,
-                    qty=real_amt,
-                    entry=entry_px,
-                    tv_tps=self.tv_tps,
-                    regime=self.regime,
-                    radar_active=radar_active,
-                    sl_price=self.current_sl,
-                    verify_note=verify_note,
-                    tp_matched=matched,
-                    tp_expected=expected,
-                    tp_audit=audit,
-                    last_tv_signal=self.last_tv_signal,
-                    radar_sl_ok=sl_ok,
-                )
-                if qty_change:
-                    old_q, new_q, action_msg = qty_change
-                    self._call_dingtalk(
-                        dingtalk.report_manual_position_change,
-                        action_type=action_msg,
-                        old_qty=old_q,
-                        new_qty=new_q,
-                        new_entry_price=entry_px,
-                        verify_note=f"重启接管检测 | {verify_note}",
-                        tp_audit=audit,
-                        verified=bool(verified),
-                    )
-                if expected > 0 and matched < expected:
-                    dingtalk.report_system_alert(
-                        "重启接管后限价止盈未对齐",
-                        f"{self.current_side} {real_amt}张 @ {entry_px:.2f} | "
-                        f"仅 {matched}/{expected} 档 | {self._format_audit_summary(audit)} | "
-                        f"请查 logs/deepcoin_brain.log",
-                    )
-                logger.info("  -> 🎉 实盘阵地接管完毕，TP123 及雷达系统已复位。")
+                if not self._sentinel_active:
+                    threading.Thread(
+                        target=self._sentinel_loop, daemon=True, name="sentinel",
+                    ).start()
             else:
                 deepcoin_client.cancel_all_open_orders(self.symbol)
                 logger.info("🔄 [系统重启点火] 盘口干净无持仓，账本复位为空仓待命。")
