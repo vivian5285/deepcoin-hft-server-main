@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.6.8-shield-345pct"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.6.9-shield-single-set"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -42,6 +42,8 @@ SHIELD_ACTIVATION_PCT = 0.03  # ETH 现价相对开仓价浮亏 ≥3% 才激活�
 SHIELD_TIER_PCTS = (0.03, 0.04, 0.05)  # 以开仓价为基准挂条件止损：-3% / -4% / -5%
 SHIELD_TIER_RATIOS = (0.33, 0.33, 0.34)
 SHIELD_STOP_TOLERANCE = 2.0
+SHIELD_PLACE_COOLDOWN_SEC = 30
+SHIELD_MAX_TIER_ORDERS = 1
 # 同向 TV 智能筛选：① ATR 变化 → 先平后开；② 价差低于该百分比 → 不重复开仓，仅刷新 TP123
 SAME_DIR_MIN_SPREAD_PCT = 0.15
 SAME_DIR_DEDUP_SEC = 300
@@ -99,6 +101,7 @@ class PositionSupervisor:
         self._last_regime_cap_ts = 0.0
         self.shield_active = False
         self.shield_tiers_consumed = []
+        self._last_shield_place_ts = 0.0
         self.sizing_principal = 0.0
 
         self.state_file = 'deepcoin_vps_state.json'
@@ -1212,39 +1215,65 @@ class PositionSupervisor:
                 return True
         return False
 
+    def _shield_orders_at_tiers(self, tier_prices):
+        buckets = {i: [] for i in range(len(tier_prices))}
+        for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
+            px = self._trigger_order_price(t)
+            if px is None:
+                continue
+            for i, tp in enumerate(tier_prices):
+                if abs(px - tp) <= SHIELD_STOP_TOLERANCE:
+                    tsz = self._safe_qty(t.get("sz", t.get("size", 0)))
+                    buckets[i].append({"order": t, "qty": tsz})
+                    break
+        return buckets
+
+    def _purge_shield_stop_orders(self, tier_prices=None):
+        tier_prices = tier_prices or self._shield_tier_prices()
+        if not tier_prices:
+            return 0
+        cancelled = 0
+        for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
+            px = self._trigger_order_price(t)
+            if px is None:
+                continue
+            if not any(abs(px - tp) <= SHIELD_STOP_TOLERANCE for tp in tier_prices):
+                continue
+            oid = t.get("ordId")
+            if oid:
+                deepcoin_client.cancel_trigger_order(self.symbol, oid)
+                cancelled += 1
+                time.sleep(0.15)
+        return cancelled
+
     def _split_shield_quantities(self, total_qty):
         return self._calculate_tp_quantities(self._safe_qty(total_qty), list(SHIELD_TIER_RATIOS))
 
     def _shield_orders_ok(self, live_qty, entry=None):
         tier_prices = self._shield_tier_prices(entry)
-        live_qty = self._safe_qty(live_qty)
+        live_qty = self._safe_qty(self._resolve_live_qty(live_qty))
         remaining = self._remaining_shield_tier_indices()
         if not remaining:
             return live_qty <= 0
         if live_qty <= 0:
             return False
         qty_map = self._shield_quantities_for_remaining(live_qty)
-        matched = 0
+        buckets = self._shield_orders_at_tiers(tier_prices)
         for idx in remaining:
             q = qty_map.get(idx, 0)
-            tp = tier_prices[idx]
             if q <= 0:
                 continue
-            found = False
-            for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
-                if not self._is_shield_trigger_order(t, tier_prices):
-                    continue
-                px = self._trigger_order_price(t)
-                if px is None or abs(px - tp) > SHIELD_STOP_TOLERANCE:
-                    continue
-                tsz = self._safe_qty(t.get("sz", t.get("size", 0)))
-                if abs(tsz - q) <= 0:
-                    found = True
-                    break
-            if found:
-                matched += 1
-        expected = sum(1 for idx in remaining if qty_map.get(idx, 0) > 0)
-        return matched >= expected
+            orders = buckets.get(idx, [])
+            if len(orders) != SHIELD_MAX_TIER_ORDERS:
+                return False
+            if abs(orders[0]["qty"] - q) > 0:
+                return False
+        for idx, orders in buckets.items():
+            if idx in remaining and orders:
+                continue
+            if orders:
+                return False
+        return True
 
     def _disarm_shield(self, reason=""):
         n = self._cancel_stop_orders(scope="shield")
@@ -1268,26 +1297,31 @@ class PositionSupervisor:
             self.shield_active = False
             self._save_state()
             return True
+
+        now = time.time()
+        if (
+            self._shield_orders_ok(live_qty, entry)
+            and now - getattr(self, "_last_shield_place_ts", 0) < SHIELD_PLACE_COOLDOWN_SEC
+        ):
+            return True
+
+        qty_map = self._shield_quantities_for_remaining(live_qty)
+        total_shield_qty = sum(qty_map.get(i, 0) for i in remaining)
+        purged = self._purge_shield_stop_orders(tier_prices)
+        if purged:
+            logger.warning(
+                f"🛡️ 撤净防护盾旧单 {purged} 笔 → 按实盘 {live_qty} 张 重挂 "
+                f"({total_shield_qty} 张 分 {len(remaining)} 档)"
+            )
+            time.sleep(0.6)
+
         close_side = "sell" if self.current_side == "LONG" else "buy"
         pos_side = "long" if self.current_side == "LONG" else "short"
-        qty_map = self._shield_quantities_for_remaining(live_qty)
         placed = 0
         for idx in remaining:
             q = qty_map.get(idx, 0)
             tp = tier_prices[idx]
             if q <= 0:
-                continue
-            already = False
-            for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
-                if not self._is_shield_trigger_order(t, tier_prices):
-                    continue
-                px = self._trigger_order_price(t)
-                if px is not None and abs(px - tp) <= SHIELD_STOP_TOLERANCE:
-                    tsz = self._safe_qty(t.get("sz", t.get("size", 0)))
-                    if abs(tsz - q) <= 0:
-                        already = True
-                        break
-            if already:
                 continue
             limit_px = tp * (0.9995 if close_side == "sell" else 1.0005)
             res = deepcoin_client.place_trigger_order(
@@ -1297,7 +1331,13 @@ class PositionSupervisor:
             )
             if res and str(res.get("code", "0")) in ("0", "00000", ""):
                 placed += 1
+                logger.info(
+                    f"🛡️ 防护盾 TP{idx + 1} -{SHIELD_TIER_PCTS[idx]:.0%}: "
+                    f"{q} 张 @ stop {tp:.2f} (实盘 {live_qty} 张)"
+                )
             time.sleep(0.35)
+
+        self._last_shield_place_ts = now
         ok = self._shield_orders_ok(live_qty, entry)
         if ok:
             was_new = not getattr(self, "shield_active", False)
@@ -1311,7 +1351,7 @@ class PositionSupervisor:
             logger.warning(
                 f"🛡️ [逆势防护盾] {'激活' if was_new else '维护'} | "
                 f"浮亏 {adverse:.1%} | 档位 {active_tiers} @ {tier_txt} | "
-                f"新挂 {placed} 笔"
+                f"新挂 {placed} 笔 | 实盘 {live_qty} 张"
             )
             if was_new and not getattr(self, "shield_tiers_consumed", []):
                 self._call_dingtalk(
@@ -1322,8 +1362,18 @@ class PositionSupervisor:
                     adverse_pct=adverse,
                     tier_prices=tier_prices,
                     tier_pcts=SHIELD_TIER_PCTS,
-                    verify_note=reason or f"浮亏达 {adverse:.1%}，VPS 分批止损已武装",
+                    verify_note=(
+                        (reason or f"浮亏达 {adverse:.1%}，VPS 分批止损已武装")
+                        + f" | 实盘 {live_qty} 张 分 {len(remaining)} 档共 {total_shield_qty} 张"
+                    ),
                 )
+        elif placed > 0:
+            dingtalk.report_system_alert(
+                "防护盾挂单未对齐",
+                f"已撤旧单 {purged} 笔、新挂 {placed} 笔，但核实未通过 | "
+                f"实盘 {live_qty} 张 | 请人工核查 Deepcoin 条件止损",
+                suggestion="可手动撤重复条件单，系统下轮哨兵会重试",
+            )
         return ok
 
     def _process_adverse_shield(self, real_amt, curr_px):
