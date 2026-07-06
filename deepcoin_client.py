@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 WS_PUBLIC_SWAP = "wss://stream.deepcoin.com/streamlet/trade/public/swap?platform=api&version=v2"
 WS_PRIVATE = "wss://stream.deepcoin.com/v1/private"
 
-CLIENT_VERSION = "v13.4.10-recover-dingtalk"
+CLIENT_VERSION = "v13.6.3-principal-snapshot"
 # 公开 instruments 接口失败时的硬编码兜底
 SYMBOL_TICK_FALLBACK = {
     "ETH-USDT-SWAP": "0.01",
@@ -146,22 +146,35 @@ class DeepcoinClient:
 
     # ── 账户与行情 ──────────────────────────────────────────────
 
-    def get_principal_wallet_balance(self, ccy="USDT"):
-        """
-        USDT 合约本金余额（cashBal）— 唯一合法的档位额度基数。
-        禁止用 availBal / eq(含浮盈) 参与开仓与超标核查。
-        """
+    def get_account_summary(self, ccy="USDT"):
+        """合约账户概览：用于本金锚点，禁止用 depleted availBal 算档位额度"""
+        out = {
+            "cash_bal": 0.0,
+            "eq": 0.0,
+            "avail_bal": 0.0,
+            "frozen_bal": 0.0,
+        }
         res = self._request("GET", "/account/balances", {"instType": "SWAP"})
         if isinstance(res, dict) and "data" in res:
             for item in res["data"]:
                 if item.get("ccy") != ccy:
                     continue
-                cash = float(item.get("cashBal", 0) or 0)
-                if cash > 0:
-                    return cash
-                eq = float(item.get("eq", 0) or 0)
-                if eq > 0:
-                    return eq
+                out["cash_bal"] = float(item.get("cashBal", 0) or 0)
+                out["eq"] = float(item.get("eq", 0) or 0)
+                out["avail_bal"] = float(item.get("availBal", 0) or 0)
+                out["frozen_bal"] = float(item.get("frozenBal", 0) or 0)
+                break
+        return out
+
+    def get_principal_wallet_balance(self, ccy="USDT"):
+        """
+        USDT 合约本金余额（cashBal）— 唯一合法的档位额度基数。
+        禁止用 availBal / eq(含浮盈) / 剩余保证金参与开仓与超标核查。
+        """
+        summary = self.get_account_summary(ccy)
+        cash = float(summary.get("cash_bal", 0) or 0)
+        if cash > 0:
+            return cash
         return 0.0
 
     def get_cap_equity_balance(self, ccy="USDT"):
@@ -173,13 +186,12 @@ class DeepcoinClient:
         return self.get_principal_wallet_balance(ccy)
 
     def get_available_balance(self, ccy="USDT"):
-        res = self._request("GET", "/account/balances", {"instType": "SWAP"})
-        if isinstance(res, dict) and "data" in res:
-            for item in res["data"]:
-                if item.get("ccy") == ccy:
-                    eq = float(item.get("eq", 0))
-                    return eq if eq > 0 else float(item.get("availBal", 0))
-        return 0.0
+        """仅诊断用，禁止用于开仓/档位额度计算"""
+        summary = self.get_account_summary(ccy)
+        eq = float(summary.get("eq", 0) or 0)
+        if eq > 0:
+            return eq
+        return float(summary.get("avail_bal", 0) or 0)
 
     def inst_id_to_ws_symbol(self, symbol="ETH-USDT-SWAP"):
         """ETH-USDT-SWAP → ETHUSDT（深币 WS v2 合约格式）"""

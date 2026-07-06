@@ -188,7 +188,15 @@ install_deps() {
     if echo "$SUPERVISOR_VER" | grep -qE 'DEEPCOIN_SUPERVISOR_VERSION.*"v13\.(4\.[6-9]|[5-9][0-9]*\.)'; then
         log_ok "position_supervisor_deepcoin.py 版本已就绪 (${SUPERVISOR_VER})"
     else
-        log_fail "position_supervisor_deepcoin.py 缺少 v13.4.6+ / v13.5+ 版本号，请同步最新代码"
+        log_fail "position_supervisor_deepcoin.py 缺少 v13.4.6+ / v13.5+ / v13.6+ 版本号，请同步最新代码"
+        return 1
+    fi
+
+    if grep -q "report_principal_snapshot" "$DIR/dingtalk.py" 2>/dev/null \
+        && grep -q "get_principal_wallet_balance" "$DIR/deepcoin_client.py" 2>/dev/null; then
+        log_ok "本金快照 + principal_wallet 口径已就绪 (v13.6.3+)"
+    elif echo "$SUPERVISOR_VER" | grep -qE 'v13\.6\.'; then
+        log_fail "v13.6+ 需 dingtalk.report_principal_snapshot + get_principal_wallet_balance"
         return 1
     fi
 
@@ -204,7 +212,7 @@ install_deps() {
         log_warn "dingtalk.py 可能缺少智能同向筛选推送"
     fi
 
-    if echo "$CLIENT_VER" | grep -qE 'CLIENT_VERSION.*v13\.4\.'; then
+    if echo "$CLIENT_VER" | grep -qE 'CLIENT_VERSION.*v13\.(4\.|6\.)'; then
         log_ok "deepcoin_client.py 版本已就绪 (${CLIENT_VER})"
     else
         log_warn "deepcoin_client.py 版本标识偏旧 (${CLIENT_VER:-未找到})，不阻断部署"

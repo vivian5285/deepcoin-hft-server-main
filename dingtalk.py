@@ -171,7 +171,7 @@ def report_principal_snapshot(reason, principal, regime=None, margin_pct=None, t
 
 
 def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime, tv_tps=None,
-                           verify_note="", tp_audit=None,
+                           verify_note="", tp_audit=None, verified=True,
                            principal_balance=None, margin_pct=None, margin_usdt=None, leverage=None):
     side_str = _p("🟣 开多 (LONG)", P_LIGHT) if side == "LONG" else _p("🟪 开空 (SHORT)", P_DEEP)
     slip_txt = (
@@ -190,7 +190,11 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
             P_LIGHT,
         ),
         "📏 波动参考": _p(f"ATR = {atr:.4f}", P_MUTED),
-        "📡 哨兵状态": _p(f"🟢 {VERIFY_TAG} | 限价 TP123 已挂，雷达待命", P_MAIN),
+        "📡 哨兵状态": _verify_line(
+            verify_note if not verified else "",
+            f"🟢 {VERIFY_TAG} | 限价 TP123 已挂，雷达待命",
+            "⏳ 开仓已提交，REST 同步略延迟 | 哨兵待确认",
+        ),
     }
     if principal_balance and margin_pct is not None:
         data["📐 仓位预算"] = _p(

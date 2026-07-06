@@ -574,15 +574,17 @@ class PositionSupervisor:
             new_sz = self._safe_qty(verified.get("size")) if verified else cur
             if new_sz <= target_qty + REGIME_CAP_TOLERANCE_CONTRACTS:
                 break
-        if new_sz < max(1, int(target_qty * 0.5)) and real > target_qty * 2:
+        if new_sz < target_qty * 0.5 and real > target_qty * 1.5:
             dingtalk.report_system_alert(
                 "档位裁减过度",
-                f"目标 {target_qty} 张，裁减后仅 {new_sz} 张（原 {real}），请人工核查",
+                f"目标 **{target_qty}** 张，裁减后仅 **{new_sz}** 张（原 **{real}** 张）",
+                suggestion="疑似额度基数错误，请核对本金快照与 TV 档位，必要时人工恢复仓位",
             )
-        elif new_sz > int(target_qty * OPEN_OVERSIZE_RATIO):
+        elif new_sz > target_qty * OPEN_OVERSIZE_RATIO:
             dingtalk.report_system_alert(
                 "叠仓裁减未达标",
-                f"目标 {target_qty} 张，裁减后仍 {new_sz} 张，请人工核查",
+                f"目标 **{target_qty}** 张，裁减后仍 **{new_sz}** 张",
+                suggestion="请人工核查 Deepcoin 盘口与挂单，雷达将继续尝试纠偏",
             )
         return new_sz
 
@@ -607,7 +609,7 @@ class PositionSupervisor:
             return None
 
         now = time.time()
-        severe = live_qty > int(target * 1.35)
+        severe = live_qty > target * 1.35
         if (
             not severe
             and now - getattr(self, "_last_regime_cap_ts", 0) < REGIME_CAP_COOLDOWN_SEC
@@ -1603,9 +1605,10 @@ class PositionSupervisor:
         )
         new_audit = result["audit"]
         if new_audit["matched_full"] < new_audit["expected"]:
-            dingtalk.report_system_alert(
-                "雷达守护：止盈仍未对齐",
-                (
+            self._call_dingtalk(
+                dingtalk.report_system_alert,
+                title="雷达守护：止盈仍未对齐",
+                detail=(
                     f"{self.current_side} {real_amt}张 | "
                     f"{self._format_audit_summary(new_audit)} | 请人工核查 Deepcoin 挂单"
                 ),
@@ -2364,7 +2367,8 @@ class PositionSupervisor:
         if not self._ensure_flat_before_open("空仓开仓"):
             dingtalk.report_system_alert(
                 "开仓中止 · 盘口非空",
-                f"收到 TV {action} 但实盘仍有残留持仓，已拒绝叠仓开仓",
+                f"收到 TV **{action}** 但实盘仍有残留持仓，已拒绝叠仓开仓",
+                suggestion="请人工核查盘口，待全平后再等下一 TV 信号",
             )
             return
         deepcoin_client.cancel_all_open_orders(self.symbol)
@@ -2398,7 +2402,8 @@ class PositionSupervisor:
                 logger.error("开仓中止：市价下单前盘口仍非空")
                 dingtalk.report_system_alert(
                     "开仓中止 · 下单前盘口非空",
-                    f"TV {action} 目标 {qty} 张，下单前 REST 仍显示持仓，已拒绝叠仓",
+                    f"TV **{action}** 目标 **{qty}** 张，下单前 REST 仍显示持仓，已拒绝叠仓",
+                    suggestion="系统将尝试强制清场，请核查是否有人工挂单或残仓",
                 )
                 return
 
@@ -2418,16 +2423,21 @@ class PositionSupervisor:
                 return
 
             real_qty = self._safe_qty(pos["size"])
-            if real_qty > int(qty * OPEN_OVERSIZE_RATIO):
+            if real_qty > qty * OPEN_OVERSIZE_RATIO:
                 logger.error(
-                    f"🚨 持仓超标: 目标 {qty} 张，实盘 {real_qty} 张，启动裁减"
+                    f"🚨 持仓超标: 目标 {qty} 张，实盘 {real_qty} 张 "
+                    f"(>{qty * OPEN_OVERSIZE_RATIO:.3f})，启动裁减"
                 )
                 dingtalk.report_system_alert(
                     "持仓超标 · 自动裁减",
-                    f"目标 {qty} 张 (保证金 {margin_usdt:.0f}U)，"
-                    f"实盘 {real_qty} 张 @ {pos['entry_price']:.2f}，正在 reduceOnly 裁减",
+                    f"本金快照 **{balance:.0f}** U · R{self.regime} **{margin_pct:.0%}** → 目标 **{qty}** 张\n"
+                    f"实盘 **{real_qty}** 张 @ **{pos['entry_price']:.2f}**，正在 reduceOnly 裁减至档位额度",
+                    suggestion="裁减基数=合约本金 cashBal × 档位% × 10x，非可用保证金",
                 )
                 real_qty = self._trim_position_to_target(qty, action)
+                pos = self._get_active_position()
+                if pos:
+                    pos["size"] = real_qty
 
             self.current_side = action
             self.open_regime = self.regime
@@ -2478,16 +2488,24 @@ class PositionSupervisor:
                 f"持仓 {vqty}张 @ {verified['entry_price']:.2f} | "
                 f"限价止盈 {matched}/{expected} 档 | {self._format_audit_summary(audit)}"
             )
-            if target_qty > 0 and vqty > int(target_qty * OPEN_OVERSIZE_RATIO):
+            if target_qty > 0 and vqty > target_qty * OPEN_OVERSIZE_RATIO:
                 verify_note += f" | ⚠️ 超标目标 {target_qty} 张"
             self._record_open_log(
                 self.current_side, vqty, verified["entry_price"], source="open",
             )
-            dingtalk.report_supervisor_open(
-                self.current_side, verified['entry_price'], self.tv_price,
-                vqty, tp_pxs, self.current_atr, self.regime, self.tv_tps,
+            self._call_dingtalk(
+                dingtalk.report_supervisor_open,
+                side=self.current_side,
+                entry_price=verified['entry_price'],
+                tv_price=self.tv_price,
+                qty=vqty,
+                tp_pxs=tp_pxs,
+                atr=self.current_atr,
+                regime=self.regime,
+                tv_tps=self.tv_tps,
                 verify_note=verify_note,
                 tp_audit=audit,
+                verified=(expected == 0 or matched >= expected),
                 principal_balance=self.sizing_principal or deepcoin_client.get_principal_wallet_balance(),
                 margin_pct=self.regime_settings.get(self.regime, {}).get("margin"),
                 margin_usdt=(self.sizing_principal or 0) * self.regime_settings.get(self.regime, {}).get("margin", 0),
@@ -2853,7 +2871,12 @@ class PositionSupervisor:
                 verify_note = "盘口无持仓 | 挂单已清空 | 智慧大脑复位待命"
                 if not flat:
                     verify_note += " | REST 同步略延迟"
-                dingtalk.report_force_align(real_side, expected_side, verify_note=verify_note)
+                self._call_dingtalk(
+                    dingtalk.report_force_align,
+                    real_side=real_side,
+                    expected_side=expected_side,
+                    verify_note=verify_note,
+                )
             else:
                 self._report_flat_close(reason)
 
