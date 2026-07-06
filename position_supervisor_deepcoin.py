@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.6.1-smart-defense"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.6.2-cap-safe"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -33,6 +33,9 @@ SIGNAL_DEDUP_SEC = 45
 DEFENSE_ALIGN_COOLDOWN_SEC = 60
 SENTINEL_GRACE_AFTER_RECOVER_SEC = 45
 REGIME_CAP_COOLDOWN_SEC = 90
+REGIME_CAP_TOLERANCE_CONTRACTS = 0
+CAP_MIN_RETAIN_RATIO = 0.25
+CAP_TRIM_MAX_ROUNDS = 4
 SHIELD_ACTIVATION_PCT = 0.02
 SHIELD_TIER_PCTS = (0.02, 0.03, 0.05)
 SHIELD_TIER_RATIOS = (0.33, 0.33, 0.34)
@@ -94,6 +97,7 @@ class PositionSupervisor:
         self._last_regime_cap_ts = 0.0
         self.shield_active = False
         self.shield_tiers_consumed = []
+        self.sizing_principal = 0.0
 
         self.state_file = 'deepcoin_vps_state.json'
         logger.info(
@@ -383,6 +387,7 @@ class PositionSupervisor:
                     "open_atr": self.open_atr,
                     "shield_active": getattr(self, "shield_active", False),
                     "shield_tiers_consumed": list(getattr(self, "shield_tiers_consumed", []) or []),
+                    "sizing_principal": float(getattr(self, "sizing_principal", 0) or 0),
                 }, f)
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
@@ -421,18 +426,51 @@ class PositionSupervisor:
             return self._wait_verify(self._verify_flat, retries=6, delay=0.5)
         return False
 
+    def _resolve_cap_sizing_base(self, equity_balance):
+        equity = max(0.0, float(equity_balance or 0))
+        principal = float(getattr(self, "sizing_principal", 0) or 0)
+        if principal > 0:
+            if equity > 0 and equity < principal:
+                return equity
+            return principal
+        return equity
+
     def _regime_cap_target_qty(self, curr_px, regime=None):
-        """按 TV 档位 regime 保证金比例 × 杠杆 × 本金，计算仓位上限张数"""
+        """按 TV 档位 regime 保证金比例 × 杠杆 × 本金锚点，计算仓位上限张数"""
         regime = int(regime if regime is not None else self.regime)
         if regime not in self.regime_settings:
             regime = 3
-        balance = deepcoin_client.get_sizing_balance()
+        equity = deepcoin_client.get_cap_equity_balance()
+        balance = self._resolve_cap_sizing_base(equity)
         margin_pct = self.regime_settings[regime]["margin"]
         margin_usdt = balance * margin_pct
         if curr_px <= 0:
             return 0, balance, margin_usdt, margin_pct, regime
         qty = max(int((margin_usdt * self.leverage) / (curr_px * self.face_value)), 1)
         return qty, balance, margin_usdt, margin_pct, regime
+
+    def _validate_cap_trim_plan(self, live_qty, target_qty, trim_qty):
+        live = self._safe_qty(live_qty)
+        target = int(target_qty or 0)
+        trim = int(trim_qty or 0)
+        if live <= 0 or target <= 0:
+            return "invalid_qty"
+        if trim <= 0:
+            return None
+        retain = target / live if live > 0 else 0
+        if retain < CAP_MIN_RETAIN_RATIO and live > target * 2:
+            return (
+                f"unsafe_retain_ratio={retain:.3f}: target {target} vs live {live} "
+                f"(sizing base likely skewed by depleted available)"
+            )
+        if trim > live * 0.85 and target < live * 0.15:
+            return (
+                f"unsafe_trim_ratio: would cut {trim} of {live}, retaining only {target}"
+            )
+        expected = live - target
+        if abs(trim - expected) > max(int(live * 0.05), 1):
+            return f"trim_mismatch: trim={trim} expected={expected}"
+        return None
 
     def _calc_target_open_qty(self, curr_px):
         qty, balance, margin_usdt, margin_pct, _ = self._regime_cap_target_qty(curr_px, self.regime)
@@ -443,38 +481,67 @@ class PositionSupervisor:
         live_qty = self._safe_qty(live_qty)
         if target <= 0 or live_qty <= 0:
             return False, target, margin_pct, reg
-        return live_qty > int(target * OPEN_OVERSIZE_RATIO), target, margin_pct, reg
+        return live_qty > int(target) + REGIME_CAP_TOLERANCE_CONTRACTS, target, margin_pct, reg
 
     def _trim_position_to_target(self, target_qty, action, reason_tag="叠仓Remediation"):
-        """叠仓Remediation：实盘超标时 reduceOnly 裁减至目标张数"""
+        """叠仓Remediation：仅裁减 excess=实盘-目标，带安全校验"""
+        target_qty = int(target_qty or 0)
         pos = self._get_active_position()
         real = self._safe_qty(pos.get("size")) if pos else 0
-        if not pos or real <= int(target_qty * OPEN_OVERSIZE_RATIO):
+        if not pos or target_qty <= 0:
             return real
-        excess = real - int(target_qty)
-        if excess <= 0:
+        if real <= target_qty + REGIME_CAP_TOLERANCE_CONTRACTS:
+            return real
+        trim_qty = real - target_qty
+        plan_err = self._validate_cap_trim_plan(real, target_qty, trim_qty)
+        if plan_err:
+            logger.error(f"✂️ {reason_tag} 中止: {plan_err} | live={real} target={target_qty}")
+            dingtalk.report_system_alert(
+                "档位裁减中止(安全校验)",
+                f"{reason_tag} | 实盘 {real} 张 | 目标 {target_qty} 张 | {plan_err}",
+            )
             return real
         close_side = "sell" if action == "LONG" else "buy"
         pos_side = "long" if action == "LONG" else "short"
         logger.warning(
-            f"✂️ {reason_tag}: 裁减 {excess} 张 "
+            f"✂️ {reason_tag}: 裁减 {trim_qty} 张 "
             f"(实盘 {real} → 目标 {target_qty})"
         )
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
         self._cancel_all_tp_limit_orders(max_rounds=3)
         time.sleep(0.3)
-        deepcoin_client.place_market_order(
-            self.symbol, close_side, pos_side, excess, reduce_only=True,
-        )
-        time.sleep(1.5)
-        verified = self._wait_verify(
-            lambda: self._get_active_position(),
-            retries=6,
-            delay=0.5,
-        )
-        new_sz = self._safe_qty(verified.get("size")) if verified else int(target_qty)
-        if new_sz > int(target_qty * OPEN_OVERSIZE_RATIO):
+        new_sz = real
+        for _ in range(CAP_TRIM_MAX_ROUNDS):
+            pos = self._get_active_position()
+            if not pos:
+                break
+            cur = self._safe_qty(pos.get("size"))
+            if cur <= target_qty + REGIME_CAP_TOLERANCE_CONTRACTS:
+                new_sz = cur
+                break
+            slice_trim = cur - target_qty
+            if slice_trim <= 0:
+                new_sz = cur
+                break
+            deepcoin_client.place_market_order(
+                self.symbol, close_side, pos_side, slice_trim, reduce_only=True,
+            )
+            time.sleep(1.0)
+            verified = self._wait_verify(
+                lambda: self._get_active_position(),
+                retries=6,
+                delay=0.5,
+            )
+            new_sz = self._safe_qty(verified.get("size")) if verified else cur
+            if new_sz <= target_qty + REGIME_CAP_TOLERANCE_CONTRACTS:
+                break
+        if new_sz < max(1, int(target_qty * 0.5)) and real > target_qty * 2:
+            dingtalk.report_system_alert(
+                "档位裁减过度",
+                f"目标 {target_qty} 张，裁减后仅 {new_sz} 张（原 {real}），请人工核查",
+            )
+        elif new_sz > int(target_qty * OPEN_OVERSIZE_RATIO):
             dingtalk.report_system_alert(
                 "叠仓裁减未达标",
                 f"目标 {target_qty} 张，裁减后仍 {new_sz} 张，请人工核查",
@@ -2270,6 +2337,9 @@ class PositionSupervisor:
             return
         self._open_in_progress = True
         try:
+            equity = deepcoin_client.get_cap_equity_balance()
+            if equity > 0:
+                self.sizing_principal = equity
             qty, balance, margin_usdt, margin_pct = self._calc_target_open_qty(curr_px)
             if qty <= 0:
                 logger.error(f"开仓跳过：目标张数无效 balance={balance:.2f} px={curr_px}")
@@ -2767,6 +2837,11 @@ class PositionSupervisor:
                     self.open_atr = float(s.get("open_atr", s.get("current_atr", 30.0)) or 30.0)
                     self.shield_active = bool(s.get("shield_active", False))
                     self.shield_tiers_consumed = list(s.get("shield_tiers_consumed", []) or [])
+                    self.sizing_principal = float(s.get("sizing_principal", 0) or 0)
+                    if self.sizing_principal <= 0:
+                        eq = deepcoin_client.get_cap_equity_balance()
+                        if eq > 0:
+                            self.sizing_principal = eq
 
             if self._scan_and_sweep_dust_on_startup(was_monitoring=saved_monitoring):
                 return
