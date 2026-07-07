@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 WS_PUBLIC_SWAP = "wss://stream.deepcoin.com/streamlet/trade/public/swap?platform=api&version=v2"
 WS_PRIVATE = "wss://stream.deepcoin.com/v1/private"
 
-CLIENT_VERSION = "v13.8.1-recover-smart"
+CLIENT_VERSION = "v13.8.2-lev15x"
 # 公开 instruments 接口失败时的硬编码兜底
 SYMBOL_TICK_FALLBACK = {
     "ETH-USDT-SWAP": "0.01",
@@ -413,7 +413,7 @@ class DeepcoinClient:
     def get_position_info(self, symbol="ETH-USDT-SWAP"):
         return self._request("GET", "/account/positions", {"instType": "SWAP", "instId": symbol})
 
-    def set_leverage(self, symbol="ETH-USDT-SWAP", leverage=10, mgn_mode="cross", mrg_position="merge"):
+    def set_leverage(self, symbol="ETH-USDT-SWAP", leverage=15, mgn_mode="cross", mrg_position="merge"):
         """POST /deepcoin/account/set-leverage"""
         res = self._request("POST", "/account/set-leverage", {
             "instId": symbol,

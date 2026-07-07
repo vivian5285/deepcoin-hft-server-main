@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# position_supervisor_deepcoin.py — 与币安 VPS 逻辑完全对齐（深币张数/10x 适配）
+# position_supervisor_deepcoin.py — 与币安 VPS 逻辑完全对齐（深币张数/15x 适配）
 import logging
 import time
 import threading
@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.8.1-recover-smart"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.8.2-lev15x"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -71,7 +71,7 @@ class PositionSupervisor:
             3: {"margin": 0.35, "ratios": [0.18, 0.32, 0.50], "activation": 0.60, "trail_offset": 0.90},
             4: {"margin": 0.50, "ratios": [0.05, 0.20, 0.75], "activation": 0.70, "trail_offset": 1.30},
         }
-        self.leverage = 10
+        self.leverage = 15
         self.face_value = 0.1
 
         self.regime = 3
@@ -119,7 +119,7 @@ class PositionSupervisor:
         self.state_file = 'deepcoin_vps_state.json'
         logger.info(
             f"🧠 深币 VPS [{DEEPCOIN_SUPERVISOR_VERSION}/{CLIENT_VERSION}] "
-            f"军师托管版已加载：双轨智慧雷达部署完毕！"
+            f"军师托管版已加载：双轨智慧雷达 · {self.leverage}x 杠杆"
         )
         self._start_signal_worker()
         self._start_idle_flat_patrol()
@@ -2917,7 +2917,7 @@ class PositionSupervisor:
                     "持仓超标 · 自动裁减",
                     f"本金快照 **{balance:.0f}** U · R{self.regime} **{margin_pct:.0%}** → 目标 **{qty}** 张\n"
                     f"实盘 **{real_qty}** 张 @ **{pos['entry_price']:.2f}**，正在 reduceOnly 裁减至档位额度",
-                    suggestion="裁减基数=合约本金 cashBal × 档位% × 10x，非可用保证金",
+                    suggestion="裁减基数=合约本金 cashBal × 档位% × 15x，非可用保证金",
                 )
                 real_qty = self._trim_position_to_target(qty, action)
                 pos = self._get_active_position()

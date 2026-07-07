@@ -20,7 +20,8 @@ DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK", "")
 DINGTALK_SECRET = os.getenv("DINGTALK_SECRET", "")
 
 EXCHANGE_LABEL = "深币 Deepcoin"
-LEVERAGE_LABEL = "10x"
+LEVERAGE_LABEL = "15x"
+DEFAULT_LEVERAGE = 15
 UNIT_LABEL = "张"
 
 # 深币专属紫色色板（与币安 #F3BA2F 金色完全区分）
@@ -178,7 +179,7 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
         f"{(entry_price - tv_price if side == 'LONG' else tv_price - entry_price):+.2f} 刀"
         if tv_price > 0 else "未知"
     )
-    lev = leverage or 10
+    lev = leverage or DEFAULT_LEVERAGE
 
     data = {
         "🎛️ 趋势方向": side_str,
@@ -461,7 +462,7 @@ def report_radar_regime_cap_trim(side, old_qty, new_qty, target_qty, regime, mar
                                  tp_audit=None, verify_note="",
                                  principal_balance=None, margin_usdt=None, leverage=None,
                                  trim_qty=None):
-    lev = leverage or 10
+    lev = leverage or DEFAULT_LEVERAGE
     excess = max(0.0, float(old_qty) - float(target_qty))
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
