@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.8.5-shield-closepos"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.8.6-recover-lock"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -1529,22 +1529,48 @@ class PositionSupervisor:
     def _shield_orders_ok(self, live_qty, entry=None):
         return self._shield_orders_adequate(self._audit_shield_orders(live_qty, entry))
 
+    @staticmethod
+    def _recover_lock_pid_alive(info):
+        if not info:
+            return False
+        for part in info.replace("\n", " ").split():
+            if part.startswith("pid="):
+                try:
+                    pid = int(part.split("=", 1)[1])
+                except (TypeError, ValueError):
+                    return False
+                if pid <= 0:
+                    return False
+                try:
+                    os.kill(pid, 0)
+                    return True
+                except OSError:
+                    return False
+                except Exception:
+                    return False
+        return False
+
     def _try_acquire_recover_singleton(self):
         """多 worker 导入时仅允许一个进程执行重启接管，避免双钉钉/双撤挂"""
         try:
             os.makedirs("logs", exist_ok=True)
             if os.path.exists(RECOVER_LOCK_FILE):
                 age = time.time() - os.path.getmtime(RECOVER_LOCK_FILE)
-                if age < RECOVER_LOCK_TTL_SEC:
-                    try:
-                        with open(RECOVER_LOCK_FILE, encoding="utf-8") as f:
-                            info = f.read().strip()
-                    except Exception:
-                        info = "?"
+                try:
+                    with open(RECOVER_LOCK_FILE, encoding="utf-8") as f:
+                        info = f.read().strip()
+                except Exception:
+                    info = "?"
+                holder_alive = self._recover_lock_pid_alive(info)
+                if age < RECOVER_LOCK_TTL_SEC and holder_alive:
                     logger.info(
-                        f"🔄 跳过重复重启接管 (另一进程 {age:.0f}s 前已执行: {info})"
+                        f"🔄 跳过重复重启接管 (进程 {info} 仍存活, {age:.0f}s 前)"
                     )
                     return False
+                if age < RECOVER_LOCK_TTL_SEC and not holder_alive:
+                    logger.info(
+                        f"🔄 旧接管锁已失效 (原 {info})，重新执行闪电接管"
+                    )
             with open(RECOVER_LOCK_FILE, "w", encoding="utf-8") as f:
                 f.write(f"pid={os.getpid()} ts={datetime.now().isoformat()}")
             return True

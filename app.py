@@ -32,7 +32,7 @@ def webhook():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "deepcoin_webhook", "version": "v13.8.5-shield-closepos", "leverage": 15}), 200
+    return jsonify({"status": "ok", "service": "deepcoin_webhook", "version": "v13.8.6-recover-lock", "leverage": 15}), 200
 
 if __name__ == '__main__':
     host_ip = os.getenv("FLASK_HOST", "0.0.0.0")

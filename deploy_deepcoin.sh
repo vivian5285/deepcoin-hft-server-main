@@ -147,6 +147,7 @@ force_cleanup() {
         sleep 1.2
         if ! port_in_use; then
             log_ok "端口 ${PORT} 已完全释放，清场成功"
+            rm -f "${DIR}/logs/.recover_singleton.lock" 2>/dev/null || true
             return 0
         fi
         round=$((round + 1))
