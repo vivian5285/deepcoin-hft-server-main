@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.8.0-shield-directional"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.8.1-recover-smart"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -1132,6 +1132,87 @@ class PositionSupervisor:
             logger.info(f"🧹 撤销 {cancelled} 张孤儿止盈单")
         return cancelled
 
+    def _pick_best_tp_order(self, orders, target_qty):
+        if not orders:
+            return None
+        return min(orders, key=lambda o: abs(o["qty"] - target_qty))
+
+    def _surgical_repair_tp_defenses(self, live_qty, entry, tolerance=1.0):
+        """重启智能修复：读实盘 → 去重 → 补缺/纠偏，避免核武毁掉正确盘口"""
+        live_qty = self._resolve_live_qty(live_qty)
+        if live_qty <= 0:
+            return self._audit_tp_levels(live_qty), 0
+
+        close_side = "sell" if self.current_side == "LONG" else "buy"
+        pos_side = "long" if self.current_side == "LONG" else "short"
+        actions = 0
+        audit = self._audit_tp_levels(live_qty, tolerance)
+
+        actions += self._cancel_orphan_tp_orders(live_qty, tolerance)
+        if actions:
+            time.sleep(0.4)
+            audit = self._audit_tp_levels(live_qty, tolerance)
+
+        for lv in self._expected_tp_levels(live_qty):
+            price = lv["price"]
+            target_q = lv["qty"]
+            if price <= 0 or target_q <= 0:
+                continue
+
+            at_px = [
+                o for o in self._collect_tp_limit_orders()
+                if abs(o["price"] - price) <= tolerance
+            ]
+
+            if len(at_px) > 1:
+                keep = self._pick_best_tp_order(at_px, target_q)
+                for o in at_px:
+                    if o["orderId"] == keep["orderId"]:
+                        continue
+                    deepcoin_client.cancel_order(self.symbol, ord_id=o["orderId"])
+                    actions += 1
+                    time.sleep(0.2)
+                logger.info(
+                    f"🔧 重启去重 TP{lv['level']} @{price:.2f}："
+                    f"撤 {len(at_px) - 1} 留 {keep['qty']} 张"
+                )
+                time.sleep(0.35)
+                at_px = [keep]
+
+            if len(at_px) == 1:
+                if at_px[0]["qty"] != target_q:
+                    deepcoin_client.cancel_order(self.symbol, ord_id=at_px[0]["orderId"])
+                    actions += 1
+                    time.sleep(0.3)
+                    res = deepcoin_client.place_limit_order(
+                        self.symbol, close_side, pos_side, price, target_q,
+                        reduce_only=True,
+                    )
+                    if res and deepcoin_client._is_success(res):
+                        actions += 1
+                        logger.info(
+                            f"🔧 重启纠偏 TP{lv['level']} @{price:.2f} → {target_q} 张"
+                        )
+                    time.sleep(0.35)
+                continue
+
+            res = deepcoin_client.place_limit_order(
+                self.symbol, close_side, pos_side, price, target_q, reduce_only=True,
+            )
+            if res and deepcoin_client._is_success(res):
+                actions += 1
+                logger.info(f"🔧 重启补挂 TP{lv['level']} @{price:.2f} qty={target_q} 张")
+            time.sleep(0.35)
+
+        final = self._audit_tp_levels(live_qty, tolerance)
+        if actions:
+            logger.info(
+                f"🔧 重启智能修复完成 {actions} 步 | "
+                f"{final['matched_full']}/{final['expected']} | "
+                f"{self._format_audit_summary(final)}"
+            )
+        return final, actions
+
     def _cancel_stop_orders(self, scope="all"):
         cancelled = 0
         for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
@@ -1840,6 +1921,48 @@ class PositionSupervisor:
         self._defense_align_in_progress = True
         try:
             audit = self._audit_tp_levels(live_qty)
+
+            if recover_mode and self._tp_audit_ok(audit):
+                logger.info(
+                    f"✅ 重启接管：盘口 TP 已齐，跳过核武撤挂 | "
+                    f"{self._format_audit_summary(audit)}"
+                )
+                if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
+                    self._ensure_radar_sl(live_qty, dynamic_sl)
+                self._mark_defense_align_ok()
+                return {
+                    "matched": audit["matched_full"],
+                    "expected": audit["expected"],
+                    "pending_prices": audit["pending_prices"],
+                    "rebuilt": False,
+                    "audit": audit,
+                    "nuclear": False,
+                }
+
+            if recover_mode and self._defense_needs_immediate_fix(audit):
+                repaired, n_actions = self._surgical_repair_tp_defenses(live_qty, entry)
+                audit = repaired
+                if self._tp_audit_ok(audit):
+                    logger.info(
+                        f"✅ 重启智能修复成功 ({n_actions} 步)，无需核武 | "
+                        f"{self._format_audit_summary(audit)}"
+                    )
+                    if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
+                        self._ensure_radar_sl(live_qty, dynamic_sl)
+                    self._mark_defense_align_ok()
+                    return {
+                        "matched": audit["matched_full"],
+                        "expected": audit["expected"],
+                        "pending_prices": audit["pending_prices"],
+                        "rebuilt": n_actions > 0,
+                        "audit": audit,
+                        "nuclear": False,
+                    }
+                logger.warning(
+                    f"⚠️ 重启智能修复后仍不齐 ({n_actions} 步) → 升级核武 | "
+                    f"{self._format_audit_summary(audit)}"
+                )
+
             if not recover_mode and self._tp_audit_ok(audit):
                 logger.info(f"✅ TP 已齐，跳过撤单: {self._format_audit_summary(audit)}")
                 if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
