@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.8.4-recover-guard"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.8.5-shield-closepos"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -1404,13 +1404,21 @@ class PositionSupervisor:
     def _split_shield_quantities(self, total_qty):
         return self._calculate_tp_quantities(self._safe_qty(total_qty), list(SHIELD_TIER_RATIOS))
 
-    def _can_maintain_shield_now(self, force=False):
+    def _can_maintain_shield_now(self, force=False, audit=None):
         if force:
             return True
         now = time.time()
+        audit = audit or {}
+        missing_shield = audit.get("status") == "missing"
         if now < getattr(self, "_sentinel_grace_until", 0):
+            if missing_shield:
+                if now - getattr(self, "_last_shield_maintain_ts", 0) < 12:
+                    return False
+                return True
             return False
         if now - getattr(self, "_last_shield_maintain_ts", 0) < SHIELD_MAINTAIN_COOLDOWN_SEC:
+            if missing_shield and now - getattr(self, "_last_shield_maintain_ts", 0) >= 12:
+                return True
             return False
         streak = getattr(self, "_shield_fail_streak", 0)
         if streak > 0:
@@ -1419,8 +1427,21 @@ class PositionSupervisor:
                 SHIELD_FAIL_BACKOFF_MAX_SEC,
             )
             if now - getattr(self, "_last_shield_fail_ts", 0) < backoff:
+                if missing_shield and now - getattr(self, "_last_shield_fail_ts", 0) >= 12:
+                    return True
                 return False
         return True
+
+    def _wait_shield_audit_ok(self, live_qty, entry=None, retries=10, delay=0.45):
+        entry = float(entry or self.watched_entry or 0)
+        live_qty = self._safe_qty(self._resolve_live_qty(live_qty))
+
+        def _probe():
+            audit = self._audit_shield_orders(live_qty, entry)
+            return audit if self._shield_orders_adequate(audit) else None
+
+        verified = self._wait_verify(_probe, retries=retries, delay=delay)
+        return verified or self._audit_shield_orders(live_qty, entry)
 
     def _record_shield_maintain(self, success):
         self._last_shield_maintain_ts = time.time()
@@ -1617,7 +1638,13 @@ class PositionSupervisor:
             elif sl:
                 actions.append(f"雷达止损已齐@{sl:.2f}")
         else:
-            ok = self._maintain_hard_shield(real_amt, curr_px, force=True)
+            ok = self._place_shield_stops(
+                real_amt,
+                reason=f"重启 {health.get('pnl_label', '')} → 补挂硬止损",
+                force=True,
+                recover_mode=True,
+                suppress_alert=True,
+            )
             stop_px = self._shield_stop_price()
             if ok:
                 actions.append(
@@ -1701,7 +1728,8 @@ class PositionSupervisor:
                 ),
             )
 
-    def _place_shield_stops(self, live_qty, entry=None, reason="", force=False):
+    def _place_shield_stops(self, live_qty, entry=None, reason="", force=False,
+                            recover_mode=False, suppress_alert=False):
         entry = float(entry or self.watched_entry or 0)
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0 or entry <= 0 or not self.current_side:
@@ -1728,7 +1756,7 @@ class PositionSupervisor:
             self._save_state()
             return True
 
-        if not self._can_maintain_shield_now(force=force):
+        if not self._can_maintain_shield_now(force=force, audit=audit):
             return getattr(self, "shield_active", False)
 
         if audit["status"] == "duplicate" and not force:
@@ -1740,7 +1768,6 @@ class PositionSupervisor:
             return False
 
         qty_map = self._shield_quantities_for_remaining(live_qty)
-        total_shield_qty = sum(qty_map.get(i, 0) for i in remaining)
         purged = self._purge_shield_stop_orders(tier_prices)
         if purged:
             logger.warning(
@@ -1770,7 +1797,11 @@ class PositionSupervisor:
                 )
             time.sleep(0.35)
 
-        post_audit = self._audit_shield_orders(live_qty, entry)
+        post_audit = self._wait_shield_audit_ok(
+            live_qty, entry,
+            retries=12 if recover_mode else 8,
+            delay=0.5,
+        )
         ok = self._shield_orders_adequate(post_audit)
         self._record_shield_maintain(success=ok)
         if ok:
@@ -1797,12 +1828,17 @@ class PositionSupervisor:
                         + f" | 实盘 {live_qty} 张 @ {stop_px:.2f} | 仅播报一次"
                     ),
                 )
-        elif placed > 0:
+        elif placed > 0 and not suppress_alert:
             dingtalk.report_system_alert(
                 "10%硬止损未对齐",
                 f"已撤旧单 {purged} 笔、新挂 {placed} 笔，但核实未通过 | "
                 f"实盘 {live_qty} 张 | {', '.join(post_audit.get('issues', []))}",
                 suggestion="系统已退避冷却，下轮自动重试；请勿手动重复挂",
+            )
+        elif placed > 0:
+            logger.warning(
+                f"🛡️ 硬止损核实延迟 | 新挂 {placed} 笔 | "
+                f"{', '.join(post_audit.get('issues', []))} | 哨兵将继续补核实"
             )
         return ok
 
@@ -1833,7 +1869,7 @@ class PositionSupervisor:
             self._save_state()
             return True
 
-        if not self._can_maintain_shield_now(force=force):
+        if not self._can_maintain_shield_now(force=force, audit=audit):
             return getattr(self, "shield_active", False)
 
         if audit["status"] == "duplicate" and not force:
