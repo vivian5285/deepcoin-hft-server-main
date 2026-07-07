@@ -318,15 +318,9 @@ def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=Fa
 
 def report_recover_takeover(side, qty, entry, tv_tps, regime, radar_active, sl_price,
                             verify_note="", tp_matched=0, tp_expected=0, tp_audit=None,
-                            last_tv_signal=None, radar_sl_ok=True):
-    radar_txt = (
-        _p(
-            f"已激活 (硬防线 `{sl_price:.2f}` | "
-            f"{'止损已挂/已确认' if radar_sl_ok else '止损待哨兵补挂'})",
-            P_LIGHT,
-        )
-        if radar_active else _p("待命 (未达 TP1 激活阈值)", P_MUTED)
-    )
+                            last_tv_signal=None, radar_sl_ok=True,
+                            pnl_label="", defense_plan="", shield_status="",
+                            radar_progress=0.0, tv_aligned=True, qty_aligned=True):
     expected = tp_expected or sum(1 for t in tv_tps if t > 0)
     if expected > 0 and tp_matched >= expected:
         action_txt = f"{VERIFY_TAG} | 头寸+TV对账 → 比例 TP123 已对齐 → 恢复哨兵"
@@ -341,6 +335,18 @@ def report_recover_takeover(side, qty, entry, tv_tps, regime, radar_active, sl_p
         action_txt = f"{VERIFY_TAG} | 已接管 → 恢复哨兵（无 TP 价格记录，请等 TV 信号）"
         action_color = P_MAIN
 
+    if radar_active:
+        sl_state = "止损已挂/已确认" if radar_sl_ok else "止损待哨兵补挂"
+        radar_txt = _p(
+            f"已激活 · 进度 {radar_progress:.0%} | 保本 `{sl_price:.2f}` | {sl_state}",
+            P_LIGHT,
+        )
+    else:
+        radar_txt = _p(
+            f"待命 (雷达进度 {radar_progress:.0%}，达 TP1 激活比后推升止损)",
+            P_MUTED,
+        )
+
     tv_ref = ""
     if last_tv_signal:
         tv_ref = (
@@ -348,17 +354,23 @@ def report_recover_takeover(side, qty, entry, tv_tps, regime, radar_active, sl_p
             f"R{last_tv_signal.get('regime', '?')} "
             f"@{last_tv_signal.get('ts', '')}"
         )
+    tv_align_txt = "一致" if tv_aligned else "⚠️ 与实盘方向有偏差(以实盘为准)"
+    qty_align_txt = "一致" if qty_aligned else "⚠️ 账本数量有偏差(已同步实盘)"
 
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "📦 核实头寸": _p(f"**{qty}** {UNIT_LABEL} @ `{entry:.2f}`", P_MAIN),
         "📊 恢复档位": get_regime_name(regime),
-        "📡 最新 TV 信号": _p(tv_ref or "无日志记录", P_MUTED),
+        "📡 最新 TV 信号": _p(f"{tv_ref or '无日志记录'} ({tv_align_txt})", P_MUTED),
+        "⚖️ 仓位核对": _p(qty_align_txt, P_MAIN if qty_aligned else P_ACCENT),
+        "📈 盈亏态势": _p(pnl_label or "核查中", P_ACCENT if "浮亏" in (pnl_label or "") else P_MAIN),
+        "🛡️ 10%硬止损": _p(shield_status or "核查中", P_MAIN),
         "🕸️ TP123 比例审计": _p(
             _format_tp_audit(tp_audit, tv_tps) if tp_audit else _format_tp_compare(tv_tps, tv_tps),
             P_ACCENT,
         ),
         "📡 雷达状态": radar_txt,
+        "🧭 防线路由": _p(defense_plan or "哨兵接力维护", P_LIGHT),
         "✅ 接管动作": _p(action_txt, action_color),
     }
     if verify_note:
@@ -498,44 +510,36 @@ def report_radar_regime_cap_trim(side, old_qty, new_qty, target_qty, regime, mar
 
 def report_adverse_shield_armed(side, entry, live_qty, adverse_pct, tier_prices, tier_pcts,
                                 verify_note=""):
-    tier_lines = []
-    for pct, px in zip(tier_pcts, tier_prices):
-        tier_lines.append(f"**-{pct:.0%}** → `{px:.2f}` USDT")
+    stop_px = tier_prices[0] if tier_prices else entry
+    pct = tier_pcts[0] if tier_pcts else adverse_pct
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "💰 开仓成本": _p(f"`{entry:.2f}` USDT", P_MUTED),
-        "📦 保护头寸": _p(f"**{live_qty}** {UNIT_LABEL}", P_MAIN),
-        "📉 当前浮亏": _p(f"**{adverse_pct:.1%}** (相对开仓价浮亏 ≥3% 激活)", P_ACCENT),
-        "🛡️ 分批止损线": _p(" · ".join(tier_lines), P_MAIN),
+        "📦 保护头寸": _p(f"**{live_qty}** {UNIT_LABEL} 全平", P_MAIN),
+        "🛡️ 硬止损线": _p(f"**-{pct:.0%}** → `{stop_px:.2f}` USDT", P_ACCENT),
         "✅ 风控动作": _p(
-            "VPS 逆势防护盾：以开仓价为基准 3%/4%/5% 条件止损已挂 · "
-            "最多承受 5% 波动 · 转有利后切换雷达保本 · 止损后若回 TP 方向仍走雷达",
+            "开单即挂：以开仓价为基准 ±10% 条件止损全平 · "
+            "价格达 TP1 激活比例后撤硬止损 → 切换雷达移动保本防回吐",
             P_MAIN,
         ),
     }
     if verify_note:
         data["🔍 核实明细"] = _p(verify_note, P_MUTED)
-    send_alert("🛡️ 逆势防护盾 · 分批止损已武装", data, P_TITLE)
+    send_alert("🛡️ 10%硬止损 · 已武装", data, P_TITLE)
 
 
 def report_shield_tier_fill(side, tier_pct, tier_price, filled_qty, remain_qty, entry_px,
                             remaining_tiers=None, verify_note=""):
-    remain_txt = "无"
-    if remaining_tiers:
-        remain_txt = "/".join(f"-{p:.0%}" for p in remaining_tiers)
-    elif remaining_tiers is not None and len(remaining_tiers) == 0:
-        remain_txt = "无（已全部触发或转雷达）"
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
-        "🛡️ 触发档位": _p(f"**-{tier_pct:.0%}** @ `{tier_price:.2f}` USDT", P_ACCENT),
-        "✂️ 本次止损": _p(f"`{filled_qty}` {UNIT_LABEL}", P_MAIN),
+        "🛡️ 触发止损": _p(f"**-{tier_pct:.0%}** 硬止损 @ `{tier_price:.2f}` USDT", P_ACCENT),
+        "✂️ 本次平仓": _p(f"`{filled_qty}` {UNIT_LABEL}", P_MAIN),
         "📊 剩余头寸": _p(f"`{remain_qty}` {UNIT_LABEL}", P_MAIN),
-        "📌 仍挂档位": _p(remain_txt, P_LIGHT),
-        "✅ 风控动作": _p("防护盾层级成交 → TP123 已重算 → 剩余档位继续守护", P_MAIN),
+        "✅ 风控动作": _p("10% 硬止损成交 → TP123 已重算", P_MAIN),
     }
     if verify_note:
         data["🔍 核实明细"] = _p(verify_note, P_MUTED)
-    send_alert("🛡️ 防护盾 · 分批止损成交", data, P_TITLE)
+    send_alert("🛡️ 10%硬止损 · 成交", data, P_TITLE)
 
 
 def report_shield_disarmed(side, live_qty, entry, cancelled_count, reason="",
@@ -544,18 +548,18 @@ def report_shield_disarmed(side, live_qty, entry, cancelled_count, reason="",
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "💰 开仓成本": _p(f"`{entry:.2f}` USDT", P_MUTED),
         "📦 剩余头寸": _p(f"**{live_qty}** {UNIT_LABEL}", P_MAIN),
-        "📈 价格方向": _p("转 **TP/盈利** 方向", P_LIGHT),
-        "🗑️ 撤销止损": _p(f"**{cancelled_count}** 笔防护盾分批止损", P_ACCENT),
+        "📈 价格方向": _p("达 **TP1 激活比例** → 转雷达", P_LIGHT),
+        "🗑️ 撤销止损": _p(f"**{cancelled_count}** 笔 10% 硬止损", P_ACCENT),
         "📡 雷达状态": _p(
             "已激活移动保本" if radar_progress >= 1.0
-            else f"预热 {radar_progress:.0%}，达 TP1 距离后自动推升止损",
+            else f"进度 {radar_progress:.0%}，专注雷达推升止损",
             P_MAIN,
         ),
         "✅ 风控动作": _p(
-            reason or "ETH 价格转 TP 方向 → 撤防护盾 → 交棒雷达动态保本",
+            reason or "雷达接管 → 撤 10% 硬止损 → 移动保本防利润回吐",
             P_MAIN,
         ),
     }
     if verify_note:
         data["🔍 核实明细"] = _p(verify_note, P_MUTED)
-    send_alert("🛡️ 防护盾 · 已撤销（转雷达）", data, P_TITLE)
+    send_alert("🛡️ 10%硬止损 · 已撤销（转雷达）", data, P_TITLE)
