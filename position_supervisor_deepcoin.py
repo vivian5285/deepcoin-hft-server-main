@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.8.6-recover-lock"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.8.7-radar-handoff"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -114,6 +114,7 @@ class PositionSupervisor:
         self.shield_sized_qty = 0.0
         self._last_radar_report_ts = 0.0
         self._last_radar_report_sl = 0.0
+        self._radar_activation_notified = False
         self.sizing_principal = 0.0
 
         self.state_file = 'deepcoin_vps_state.json'
@@ -1295,6 +1296,75 @@ class PositionSupervisor:
             return "FAVORABLE"
         return "SHIELD"
 
+    def _shield_present_on_exchange(self):
+        stop_px = self._shield_stop_price()
+        if stop_px and self._has_shield_stop_at_price(stop_px):
+            return True
+        audit = self._audit_shield_orders(self._resolve_live_qty(self.watched_qty or 0))
+        return audit.get("status") in ("ok", "duplicate", "qty_mismatch")
+
+    def _wait_shield_cleared(self, entry=None, retries=8, delay=0.4):
+        def _probe():
+            if self._shield_present_on_exchange():
+                return None
+            return True
+
+        return bool(self._wait_verify(_probe, retries=retries, delay=delay))
+
+    def _force_disarm_shield_before_radar(self, curr_px, reason="", notify=True):
+        """雷达接管前强制撤净 10% 硬止损，再挂移动保本触发止损"""
+        stop_px = self._shield_stop_price()
+        had_flag = getattr(self, "shield_active", False)
+        had_exchange = self._shield_present_on_exchange()
+        if not had_flag and not had_exchange:
+            return 0
+
+        n = self._cancel_stop_orders(scope="shield")
+        if self._shield_present_on_exchange():
+            n += self._purge_shield_stop_orders()
+            time.sleep(0.5)
+        if self._shield_present_on_exchange():
+            n += self._purge_shield_stop_orders()
+            time.sleep(0.5)
+        self._wait_shield_cleared(retries=6, delay=0.35)
+
+        self.shield_active = False
+        self.shield_tiers_consumed = []
+        self.shield_sized_qty = 0.0
+        self._shield_arm_notified = False
+        self._save_state()
+
+        still_there = self._shield_present_on_exchange()
+        if reason and (had_flag or had_exchange or n):
+            logger.info(
+                f"🛡️ [雷达交棒] {reason} | 撤 {n} 笔硬止损"
+                + (f" | ⚠️ 盘口仍检测到硬止损" if still_there else "")
+            )
+        if notify and (n > 0 or had_exchange):
+            progress = self._radar_activation_progress(curr_px) if curr_px > 0 else 0.0
+            verify_note = (
+                f"撤 {n} 笔 {SHIELD_HARD_STOP_PCT:.0%} 硬止损 @ {stop_px:.2f}"
+                if stop_px else f"撤 {n} 笔 {SHIELD_HARD_STOP_PCT:.0%} 硬止损"
+            )
+            if still_there:
+                verify_note += " | ⚠️ 盘口仍残留，哨兵将继续清理"
+            else:
+                verify_note += " | 硬止损已净，交棒雷达移动保本"
+            verify_note += (
+                f" | {'雷达已激活' if progress >= 1.0 else f'雷达进度 {progress:.0%}'}"
+            )
+            self._call_dingtalk(
+                dingtalk.report_shield_disarmed,
+                side=self.current_side,
+                live_qty=self._resolve_live_qty(self.watched_qty or 0),
+                entry=self.watched_entry,
+                cancelled_count=n,
+                reason=reason or "雷达激活前撤硬止损",
+                radar_progress=progress,
+                verify_note=verify_note,
+            )
+        return n
+
     def _should_disarm_shield_for_favorable(self, curr_px):
         """雷达达到 TP1 激活比例 → 撤 10% 硬止损，交棒移动保本"""
         stop_px = self._shield_stop_price()
@@ -1325,10 +1395,11 @@ class PositionSupervisor:
         否则 → 维护开单时挂的 10% 全平硬止损（只挂一次，先查实盘）。
         """
         if self._resolve_defense_regime(curr_px) == "FAVORABLE":
-            if self._should_disarm_shield_for_favorable(curr_px):
+            if self._should_radar_trail(curr_px) or self._is_radar_active():
                 progress = self._radar_activation_progress(curr_px)
-                self._disarm_shield(
-                    f"雷达激活(进度 {progress:.0%})，撤销 {SHIELD_HARD_STOP_PCT:.0%} 硬止损",
+                self._force_disarm_shield_before_radar(
+                    curr_px,
+                    reason=f"雷达激活(进度 {progress:.0%})，先撤 {SHIELD_HARD_STOP_PCT:.0%} 硬止损",
                     notify=True,
                 )
             self._process_radar_trailing(real_amt, curr_px)
@@ -1721,9 +1792,12 @@ class PositionSupervisor:
 
     def _disarm_shield(self, reason="", notify=False):
         n = self._cancel_stop_orders(scope="shield")
+        if self._shield_present_on_exchange():
+            n += self._purge_shield_stop_orders()
+            time.sleep(0.4)
         had = getattr(self, "shield_active", False) or bool(
             getattr(self, "shield_tiers_consumed", [])
-        )
+        ) or self._shield_present_on_exchange()
         live_qty = self._resolve_live_qty(self.watched_qty or 0)
         entry = self.watched_entry
         self.shield_active = False
@@ -1993,9 +2067,51 @@ class PositionSupervisor:
             return False
         if self._has_trigger_sl_near(sl_price):
             return True
+        if self._shield_present_on_exchange():
+            curr_px = deepcoin_client.get_current_price(self.symbol) or 0
+            self._force_disarm_shield_before_radar(
+                curr_px,
+                reason="挂雷达保本前撤硬止损(兜底)",
+                notify=False,
+            )
         self._place_radar_sl(live_qty, sl_price)
         time.sleep(0.35)
         return self._has_trigger_sl_near(sl_price)
+
+    def _report_radar_first_activation(self, real_amt, curr_px, new_sl, sl_placed):
+        """雷达首次激活：核实实盘后推送（硬止损已撤 + 保本止损已挂）"""
+        if getattr(self, "_radar_activation_notified", False):
+            return
+        verified = self._wait_verify(
+            lambda: self._has_trigger_sl_near(new_sl),
+            retries=10,
+            delay=0.45,
+        )
+        progress = self._radar_activation_progress(curr_px) if curr_px > 0 else 1.0
+        shield_clear = not self._shield_present_on_exchange()
+        verify_note = (
+            f"雷达进度 {progress:.0%} | 保本止损 @ {new_sl:.2f} | "
+            f"持仓 {real_amt} 张 @ {self.watched_entry:.2f} | "
+            f"硬止损已撤: {'是' if shield_clear else '否(哨兵清理中)'}"
+        )
+        if not verified and not sl_placed:
+            logger.warning(f"雷达首次激活钉钉跳过：止损 @ {new_sl:.2f} 未核实")
+            return
+        if not verified:
+            verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
+        self._call_dingtalk(
+            dingtalk.report_radar_activated,
+            side=self.current_side,
+            qty=real_amt,
+            entry=self.watched_entry,
+            new_sl=new_sl,
+            radar_progress=progress,
+            regime=self.regime,
+            shield_cleared=shield_clear,
+            verify_note=verify_note,
+            verified=verified,
+        )
+        self._radar_activation_notified = True
 
     def _refresh_radar_state_on_recover(self, curr_px, entry):
         """重启：按现价恢复 best_price / 雷达激活 / 追踪止损位"""
@@ -3107,6 +3223,7 @@ class PositionSupervisor:
         self.best_price = entry_price
         self.shield_active = False
         self.shield_tiers_consumed = []
+        self._radar_activation_notified = False
         self.watched_qty, self.watched_entry, self.monitoring = qty, entry_price, True
         self._save_state()
 
@@ -3315,12 +3432,16 @@ class PositionSupervisor:
                 if boot_sl < self.current_sl or self.current_sl >= self.watched_entry:
                     self.current_sl = boot_sl
             self._save_state()
+            sl_placed = False
             if not self._has_trigger_sl_near(self.current_sl):
-                self._ensure_radar_sl(real_amt, self.current_sl)
-                logger.info(
-                    f"📡 雷达首次激活：保本止损 @ {self.current_sl:.2f} | best={self.best_price:.2f}"
-                )
-                return True
+                sl_placed = self._ensure_radar_sl(real_amt, self.current_sl)
+            logger.info(
+                f"📡 雷达首次激活：保本止损 @ {self.current_sl:.2f} | best={self.best_price:.2f}"
+            )
+            self._report_radar_first_activation(
+                real_amt, curr_px, self.current_sl, sl_placed,
+            )
+            return True
 
         if self.current_side == "LONG":
             if new_sl > self.current_sl + 1.0:

@@ -563,3 +563,27 @@ def report_shield_disarmed(side, live_qty, entry, cancelled_count, reason="",
     if verify_note:
         data["🔍 核实明细"] = _p(verify_note, P_MUTED)
     send_alert("🛡️ 10%硬止损 · 已撤销（转雷达）", data, P_TITLE)
+
+
+def report_radar_activated(side, qty, entry, new_sl, radar_progress=1.0, regime=3,
+                           shield_cleared=True, verify_note="", verified=True):
+    data = {
+        "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
+        "📦 利润头寸": _p(f"**{qty}** {UNIT_LABEL} @ `{entry:.2f}`", P_MAIN),
+        "📊 恢复档位": get_regime_name(regime),
+        "📡 雷达进度": _p(f"**{radar_progress:.0%}** (达 TP1 激活比)", P_ACCENT),
+        "🗑️ 硬止损": _p("已撤销" if shield_cleared else "清理中", P_MAIN),
+        "🔒 保本止损": _p(f"**{new_sl:.2f}** USDT (触发止损)", P_LIGHT),
+        "✅ 风控动作": _p(
+            "先撤 10% 硬止损 → 挂雷达移动保本 → 专注推升止损防利润回吐",
+            P_MAIN,
+        ),
+        "📡 实盘核查": _verify_line(
+            verify_note if not verified else "",
+            f"{VERIFY_TAG} | 雷达移动保本已启动",
+            f"⏳ 止损已提交，{VERIFY_DELAY_MARK} | 雷达已启动",
+        ),
+    }
+    if verify_note:
+        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
+    send_alert("📡 雷达 · 移动保本已激活", data, P_DEEP)
