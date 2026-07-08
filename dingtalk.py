@@ -276,7 +276,8 @@ def report_force_align(real_side, expected_side, verify_note=""):
     send_alert("🚨 严重警告：方向强行物理对齐", data, P_TITLE)
 
 
-def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=False):
+def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=False,
+                            tv_pnl_pct=None, tv_side="", tv_price=None, close_action=""):
     r = reason or ""
     note = verify_note or ""
     is_dust_ctx = swept_dust or "蚂蚁仓" in note or "蚂蚁仓" in r or "重启扫描" in r or "扫尾" in r
@@ -289,6 +290,9 @@ def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=Fa
             + ("（重启对账补发）" if "重启对账" in note else ""),
             P_LIGHT,
         )
+    elif "被动止损" in r or "STOPLOSS" in r or "保本线" in r or "硬止损" in r:
+        title = "🛑 被动止损：硬止损或追踪保本触发"
+        status = _p("策略被动离场，多空网格全撤，账本复位待命。", P_ACCENT)
     elif "保护" in r:
         title = "🛡️ 战术防守：保护平仓机制触发"
         status = _p("趋势警报解除，多空网格全撤，打扫战场空仓待命。", P_ACCENT)
@@ -311,6 +315,15 @@ def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=Fa
         "✅ 账本状态": status,
         "📡 实盘核查": verify_line,
     }
+    if close_action:
+        data["📡 TV动作"] = _p(close_action, P_MUTED)
+    if tv_side:
+        data["🎛️ TV方向"] = _p(tv_side, P_LIGHT if tv_side == "LONG" else P_DEEP)
+    if tv_price is not None and float(tv_price or 0) > 0:
+        data["💹 TV价格"] = _p(f"`{float(tv_price):.2f}`", P_MUTED)
+    if tv_pnl_pct is not None and tv_pnl_pct != "":
+        pnl = float(tv_pnl_pct)
+        data["📈 TV盈亏"] = _p(f"**{pnl:+.2f}%**", P_ACCENT if pnl >= 0 else P_DEEP)
     if verify_note:
         data["🔍 核查明细"] = _p(verify_note, P_MUTED)
     send_alert(title, data)
