@@ -46,7 +46,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "deepcoin_webhook",
-        "version": "v13.9.0-webhook-v6975",
+        "version": "v13.9.1-tv-full-payload",
         "tv_strategy": TV_STRATEGY_VERSION,
         "leverage": 15,
     }), 200

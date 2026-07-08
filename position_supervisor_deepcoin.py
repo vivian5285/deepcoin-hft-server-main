@@ -11,7 +11,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from deepcoin_client import deepcoin_client, CLIENT_VERSION
 import dingtalk
-from webhook_parser import enrich_entry_tp_prices, fetch_eth_atr_14_public
+from webhook_parser import enrich_signal_fields, format_tv_field_sources, fetch_eth_atr_14_public
 
 if not os.path.exists('logs'):
     os.makedirs('logs')
@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.9.0-webhook-v6975"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.9.1-tv-full-payload"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -797,6 +797,13 @@ class PositionSupervisor:
             base_note += f" | TV盈亏 {self._safe_float(meta.get('pnl_pct')):+.2f}%"
         if meta.get("side"):
             base_note += f" | TV方向 {meta.get('side')}"
+        if meta.get("regime"):
+            base_note += f" | TV档位 R{int(meta.get('regime'))}"
+        if meta.get("atr") and float(meta.get("atr") or 0) > 0:
+            base_note += f" | TV ATR {float(meta.get('atr')):.2f}"
+        src_note = format_tv_field_sources(meta.get("field_sources") or {})
+        if src_note and "TV透传" not in src_note:
+            base_note += f" | {src_note}"
         if flat:
             verify_note = base_note
         else:
@@ -819,6 +826,9 @@ class PositionSupervisor:
             tv_side=meta.get("side"),
             tv_price=meta.get("tv_price"),
             close_action=meta.get("action"),
+            tv_regime=meta.get("regime"),
+            tv_atr=meta.get("atr"),
+            tv_field_sources=meta.get("field_sources"),
         )
 
     def _sweep_dust_and_finalize(self, reason):
@@ -3153,32 +3163,29 @@ class PositionSupervisor:
         self.enqueue_signal(payload)
 
     def _enrich_tv_payload(self, payload):
-        """v6.9.75 精简 webhook：补全 price/ATR/regime/TP。"""
+        """v6.9.75：TV 全量 regime/atr/tp 优先，仅缺失项本地补全。"""
         action = str(payload.get("action", "")).strip().upper()
-        if not payload.get("price"):
-            live_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
-            if live_px > 0:
-                payload["price"] = live_px
+        live_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price or 0.0
+        return enrich_signal_fields(
+            payload,
+            action,
+            fetch_atr=fetch_eth_atr_14_public,
+            fallback_regime=self.regime or 3,
+            fallback_atr=self.current_atr or 30.0,
+            fallback_price=live_px,
+        )
 
-        if action in ("LONG", "SHORT"):
-            if not payload.get("atr"):
-                atr = fetch_eth_atr_14_public()
-                payload["atr"] = atr or self.current_atr or 30.0
-            if not payload.get("regime"):
-                payload["regime"] = self.regime or 3
-            payload = enrich_entry_tp_prices(
-                action,
-                payload.get("price"),
-                payload.get("atr"),
-                payload.get("regime"),
-                payload,
-            )
-        return payload
+    def _tv_field_source_note(self, payload):
+        return format_tv_field_sources(payload or {})
 
-    def _format_close_extra(self, close_side, pnl_pct, tv_price):
+    def _format_close_extra(self, close_side, pnl_pct, tv_price, regime=None, atr=None):
         parts = []
         if close_side:
             parts.append(f"TV方向 {close_side}")
+        if regime:
+            parts.append(f"TV档位 R{int(regime)}")
+        if atr and float(atr) > 0:
+            parts.append(f"TV ATR {float(atr):.2f}")
         if tv_price and float(tv_price) > 0:
             parts.append(f"TV价 {float(tv_price):.2f}")
         if pnl_pct is not None and pnl_pct != "":
@@ -3191,6 +3198,9 @@ class PositionSupervisor:
             "side": close_side or self.current_side,
             "pnl_pct": pnl_pct,
             "tv_price": self.tv_price,
+            "regime": self.regime,
+            "atr": self.current_atr,
+            "field_sources": getattr(self, "_last_tv_field_sources", {}),
         }
 
     def _safe_float(self, val, default=0.0):
@@ -3222,11 +3232,19 @@ class PositionSupervisor:
             self._safe_float(payload.get("tv_tp2"), 0),
             self._safe_float(payload.get("tv_tp3"), 0),
         ])
+        self._last_tv_field_sources = {
+            "regime": payload.get("_regime_source", "tv"),
+            "atr": payload.get("_atr_source", "tv"),
+            "tp": payload.get("_tp_source", "tv"),
+            "price": payload.get("_price_source", "tv"),
+        }
         close_reason = str(payload.get("reason") or "策略指标反转/波动率安全退出").strip()
         close_side = str(payload.get("side") or "").strip().upper()
         pnl_pct = payload.get("pnl_pct")
         close_meta = self._build_close_meta(raw_action, close_side, pnl_pct)
-        close_extra = self._format_close_extra(close_side, pnl_pct, self.tv_price)
+        close_extra = self._format_close_extra(
+            close_side, pnl_pct, self.tv_price, self.regime, self.current_atr,
+        )
 
         if not raw_action:
             logger.warning("TV 信号缺少 action，已忽略")
@@ -3665,7 +3683,8 @@ class PositionSupervisor:
                 f"{budget_note} | " if budget_note else ""
             ) + (
                 f"持仓 {vqty}张 @ {verified['entry_price']:.2f} | "
-                f"限价止盈 {matched}/{expected} 档 | {self._format_audit_summary(audit)}"
+                f"限价止盈 {matched}/{expected} 档 | {self._format_audit_summary(audit)} | "
+                f"{self._tv_field_source_note(getattr(self, '_last_tv_field_sources', {}))}"
             )
             if target_qty > 0 and vqty > target_qty * OPEN_OVERSIZE_RATIO:
                 verify_note += f" | ⚠️ 超标目标 {target_qty} 张"
@@ -3689,6 +3708,7 @@ class PositionSupervisor:
                 margin_pct=self.regime_settings.get(self.regime, {}).get("margin"),
                 margin_usdt=(self.sizing_principal or 0) * self.regime_settings.get(self.regime, {}).get("margin", 0),
                 leverage=self.leverage,
+                tv_field_sources=getattr(self, "_last_tv_field_sources", {}),
             )
             if expected > 0 and matched < expected:
                 self._open_tp_unconfirmed = True

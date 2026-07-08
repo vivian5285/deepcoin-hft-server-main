@@ -245,9 +245,24 @@ def fetch_eth_atr_14_public(period=14):
         return 0.0
 
 
+def _field_present(val):
+    return val is not None and val != ""
+
+
+def _has_positive_float(val):
+    f = _to_float(val)
+    return f is not None and f > 0
+
+
 def enrich_entry_tp_prices(action, price, atr, regime, payload=None):
-    payload = payload or {}
-    if any(_to_float(payload.get(k)) for k in ("tv_tp1", "tv_tp2", "tv_tp3")):
+    payload = dict(payload or {})
+    tps = {
+        1: _to_float(payload.get("tv_tp1")),
+        2: _to_float(payload.get("tv_tp2")),
+        3: _to_float(payload.get("tv_tp3")),
+    }
+    if all(tps[i] and tps[i] > 0 for i in (1, 2, 3)):
+        payload["_tp_source"] = "tv"
         return payload
 
     regime = int(regime or 3)
@@ -260,12 +275,95 @@ def enrich_entry_tp_prices(action, price, atr, regime, payload=None):
     if px <= 0 or a <= 0:
         return payload
 
-    payload = dict(payload)
-    payload["tv_tp1"] = round(px + sign * a * mults[0], 2)
-    payload["tv_tp2"] = round(px + sign * a * mults[1], 2)
-    payload["tv_tp3"] = round(px + sign * a * mults[2], 2)
-    payload["_tp_enriched"] = True
+    filled = 0
+    for i, mult in enumerate(mults, start=1):
+        key = f"tv_tp{i}"
+        if not _has_positive_float(payload.get(key)):
+            payload[key] = round(px + sign * a * mult, 2)
+            filled += 1
+
+    if filled == 3:
+        payload["_tp_source"] = "local"
+    elif filled > 0:
+        payload["_tp_source"] = "tv+local"
+    else:
+        payload["_tp_source"] = "tv"
     return payload
+
+
+def enrich_signal_fields(payload, action, fetch_atr=None, fallback_regime=3, fallback_atr=30.0,
+                         fallback_price=0.0):
+    out = dict(payload or {})
+    action = str(action or "").strip().upper()
+
+    if not _has_positive_float(out.get("price")) and fallback_price > 0:
+        out["price"] = fallback_price
+        out["_price_source"] = "local"
+    elif _has_positive_float(out.get("price")):
+        out["_price_source"] = "tv"
+
+    is_entry = action in ("LONG", "SHORT")
+    is_close = action.startswith("CLOSE") or action in (VALID_ACTIONS - {"LONG", "SHORT"})
+
+    if is_entry or is_close:
+        if not _field_present(out.get("regime")):
+            out["regime"] = int(fallback_regime or 3)
+            out["_regime_source"] = "local"
+        else:
+            out["regime"] = _to_int(out.get("regime"), fallback_regime)
+            out["_regime_source"] = "tv"
+
+        if not _has_positive_float(out.get("atr")):
+            atr = 0.0
+            if callable(fetch_atr):
+                atr = float(fetch_atr() or 0)
+            out["atr"] = atr or float(fallback_atr or 30.0)
+            out["_atr_source"] = "local"
+        else:
+            out["_atr_source"] = "tv"
+
+    if is_entry:
+        out = enrich_entry_tp_prices(
+            action, out.get("price"), out.get("atr"), out.get("regime"), out,
+        )
+    return out
+
+
+def format_tv_field_sources(data):
+    if not data:
+        return "TV透传"
+
+    label_map = {"regime": "档位", "atr": "ATR", "tp": "TP", "price": "价格"}
+    source_vals = {"tv", "local", "tv+local"}
+
+    def _tag(src):
+        if src == "tv":
+            return "TV透传"
+        if src == "local":
+            return "本地补全"
+        if src == "tv+local":
+            return "TV+补全"
+        return str(src)
+
+    if any(k in data for k in label_map) and all(
+        (not data.get(k)) or str(data.get(k)) in source_vals for k in label_map
+    ):
+        parts = []
+        for key, label in label_map.items():
+            src = data.get(key)
+            if src:
+                parts.append(f"{label}={_tag(src)}")
+        return " · ".join(parts) if parts else "TV透传"
+
+    parts = []
+    for key, label in (("regime", "档位"), ("atr", "ATR"), ("price", "价格")):
+        src = data.get(f"_{key}_source")
+        if src:
+            parts.append(f"{label}={_tag(src)}")
+    tp_src = data.get("_tp_source")
+    if tp_src:
+        parts.append(f"TP={_tag(tp_src)}")
+    return " · ".join(parts) if parts else "TV透传"
 
 
 def format_webhook_log(data):
@@ -274,13 +372,24 @@ def format_webhook_log(data):
     if data.get("side"):
         parts.append(f"side={data['side']}")
     if data.get("price"):
-        parts.append(f"price={float(data['price']):.2f}")
+        px_src = data.get("_price_source", "tv")
+        parts.append(f"price={float(data['price']):.2f}({px_src})")
     if data.get("pnl_pct") is not None:
         parts.append(f"pnl={float(data['pnl_pct']):+.2f}%")
     if data.get("reason"):
         parts.append(f"reason={str(data['reason'])[:48]}")
-    if data.get("regime"):
-        parts.append(f"R{data['regime']}")
-    if data.get("_tp_enriched"):
-        parts.append("TP=本地推算")
+    if data.get("regime") is not None:
+        r_src = data.get("_regime_source", "tv")
+        parts.append(f"R{data['regime']}({r_src})")
+    if data.get("atr"):
+        a_src = data.get("_atr_source", "tv")
+        parts.append(f"ATR={float(data['atr']):.2f}({a_src})")
+    tps = [data.get(f"tv_tp{i}") for i in (1, 2, 3)]
+    if any(_has_positive_float(t) for t in tps):
+        tp_txt = "/".join(
+            f"{float(t):.0f}" if _has_positive_float(t) else "-"
+            for t in tps
+        )
+        tp_src = data.get("_tp_source", "tv")
+        parts.append(f"TP={tp_txt}({tp_src})")
     return " | ".join(parts)
