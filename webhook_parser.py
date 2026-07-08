@@ -11,6 +11,7 @@ TV_STRATEGY_VERSION = "v6.9.75"
 
 VALID_ACTIONS = frozenset({
     "LONG", "SHORT", "CLOSE", "CLOSE_PROTECT", "CLOSE_TP3", "CLOSE_STOPLOSS",
+    "PING",
 })
 
 ACTION_ALIASES = {
@@ -27,6 +28,65 @@ ACTION_ALIASES = {
     "STOP": "CLOSE_STOPLOSS",
     "CLOSE_STOP": "CLOSE_STOPLOSS",
 }
+
+CLOSE_TYPE_TP3 = "tp3"
+CLOSE_TYPE_PROTECT = "protect"
+CLOSE_TYPE_BREAKEVEN = "breakeven"
+CLOSE_TYPE_HARD_SL = "hard_sl"
+CLOSE_TYPE_VPS_SHIELD = "vps_shield"
+CLOSE_TYPE_GENERIC = "generic"
+
+CLOSE_TYPE_LABELS = {
+    CLOSE_TYPE_TP3: "TP3止盈",
+    CLOSE_TYPE_PROTECT: "风控拦截",
+    CLOSE_TYPE_BREAKEVEN: "防回吐保本",
+    CLOSE_TYPE_HARD_SL: "硬止损",
+    CLOSE_TYPE_VPS_SHIELD: "VPS 10%硬止损",
+    CLOSE_TYPE_GENERIC: "常规清场",
+}
+
+
+def classify_tv_close(action="", reason="", pnl_pct=None):
+    action = str(action or "").strip().upper()
+    reason = str(reason or "").strip()
+
+    if action == "CLOSE_TP3" or ("TP3" in reason and ("完美" in reason or "收网" in reason)):
+        return CLOSE_TYPE_TP3
+    if action in ("CLOSE_PROTECT",) or action.startswith("CLOSE_PROTECT"):
+        return CLOSE_TYPE_PROTECT
+    if action == "CLOSE_STOPLOSS" or action.startswith("CLOSE_STOP"):
+        if "防回吐" in reason:
+            return CLOSE_TYPE_BREAKEVEN
+        if "触碰硬止损" in reason or reason == "硬止损":
+            return CLOSE_TYPE_HARD_SL
+        if "VPS" in reason or "10%" in reason:
+            return CLOSE_TYPE_VPS_SHIELD
+        if "保本" in reason and "硬止损" not in reason:
+            return CLOSE_TYPE_BREAKEVEN
+        pnl = _to_float(pnl_pct, None)
+        if pnl is not None and pnl > -0.1:
+            return CLOSE_TYPE_BREAKEVEN
+        if pnl is not None:
+            return CLOSE_TYPE_HARD_SL
+        return CLOSE_TYPE_HARD_SL
+    if "防回吐" in reason or ("保本" in reason and "雷达" in reason):
+        return CLOSE_TYPE_BREAKEVEN
+    if "VPS" in reason and "硬止损" in reason:
+        return CLOSE_TYPE_VPS_SHIELD
+    if "触碰硬止损" in reason or ("硬止损" in reason and "10%" not in reason):
+        return CLOSE_TYPE_HARD_SL
+    if "保护" in reason or "拦截" in reason or "风控" in reason:
+        return CLOSE_TYPE_PROTECT
+    if "TP3" in reason or "完美胜利" in reason or "完美收网" in reason:
+        return CLOSE_TYPE_TP3
+    return CLOSE_TYPE_GENERIC
+
+
+def close_type_display_label(close_type, fallback_reason=""):
+    label = CLOSE_TYPE_LABELS.get(close_type or CLOSE_TYPE_GENERIC, "常规清场")
+    if close_type == CLOSE_TYPE_GENERIC and fallback_reason:
+        return fallback_reason[:48]
+    return label
 
 TV_REGIME_TP_MULT = {
     1: (0.75, 1.4, 2.0),
@@ -369,6 +429,8 @@ def format_tv_field_sources(data):
 def format_webhook_log(data):
     action = data.get("action", "?")
     parts = [f"📥 TV {TV_STRATEGY_VERSION} → 【{action}】"]
+    if action.startswith("CLOSE") and data.get("reason"):
+        parts.append(f"reason={str(data['reason'])[:56]}")
     if data.get("side"):
         parts.append(f"side={data['side']}")
     if data.get("price"):

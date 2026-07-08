@@ -31,6 +31,13 @@ def webhook():
         return jsonify({"status": "error", "message": "Missing or invalid action"}), 400
 
     raw_action = data.get("action", "UNKNOWN")
+    if raw_action == "PING":
+        return jsonify({
+            "status": "success",
+            "message": "pong",
+            "action": "PING",
+            "schema": TV_STRATEGY_VERSION,
+        }), 200
     logger.info(f"[Webhook] {format_webhook_log(data)}")
 
     threading.Thread(target=position_supervisor.handle_signal, args=(data,), daemon=True).start()
@@ -46,7 +53,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "deepcoin_webhook",
-        "version": "v13.9.1-tv-full-payload",
+        "version": "v13.9.5-tv-close-alerts",
         "tv_strategy": TV_STRATEGY_VERSION,
         "leverage": 15,
     }), 200

@@ -11,7 +11,15 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from deepcoin_client import deepcoin_client, CLIENT_VERSION
 import dingtalk
-from webhook_parser import enrich_signal_fields, format_tv_field_sources, fetch_eth_atr_14_public
+from webhook_parser import (
+    enrich_signal_fields,
+    format_tv_field_sources,
+    fetch_eth_atr_14_public,
+    classify_tv_close,
+    CLOSE_TYPE_TP3,
+    CLOSE_TYPE_BREAKEVEN,
+    CLOSE_TYPE_VPS_SHIELD,
+)
 
 if not os.path.exists('logs'):
     os.makedirs('logs')
@@ -23,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.9.1-tv-full-payload"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.9.5-tv-close-alerts"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -260,6 +268,7 @@ class PositionSupervisor:
             "reason": payload.get("reason", ""),
             "side": payload.get("side", ""),
             "pnl_pct": payload.get("pnl_pct"),
+            "ts": time.time(),
         }
         self.last_tv_signal = entry
         self._append_journal(TV_JOURNAL, entry)
@@ -786,21 +795,27 @@ class PositionSupervisor:
             return None
         return pos
 
-    def _report_flat_close(self, reason, swept_dust=False, close_meta=None):
-        """平仓/止盈收网钉钉：REST 核查重试"""
+    def _report_flat_close(self, reason, swept_dust=False, close_meta=None, curr_px=0.0):
+        """平仓/止盈收网钉钉：REST 核查重试，与 Pine 四标签对齐"""
+        meta = self._enrich_close_meta_live(close_meta, curr_px)
         flat = self._wait_verify(self._verify_flat, retries=6, delay=0.5)
         base_note = "盘口无持仓 | 挂单已清空 | 智慧大脑复位待命"
         if swept_dust:
             base_note = f"蚂蚁仓已市价扫尾 | {base_note}"
-        meta = close_meta or {}
         if meta.get("pnl_pct") is not None:
-            base_note += f" | TV盈亏 {self._safe_float(meta.get('pnl_pct')):+.2f}%"
+            base_note += f" | 盈亏 {self._safe_float(meta.get('pnl_pct')):+.2f}%"
         if meta.get("side"):
-            base_note += f" | TV方向 {meta.get('side')}"
+            base_note += f" | 方向 {meta.get('side')}"
+        if meta.get("entry_px") and float(meta.get("entry_px") or 0) > 0:
+            base_note += f" | 开仓 {float(meta['entry_px']):.2f}"
+        if meta.get("closed_qty") and float(meta.get("closed_qty") or 0) > 0:
+            base_note += f" | 平仓 {float(meta['closed_qty']):.0f}张"
+        if meta.get("live_exit_px") and float(meta.get("live_exit_px") or 0) > 0:
+            base_note += f" | 现价 {float(meta['live_exit_px']):.2f}"
         if meta.get("regime"):
             base_note += f" | TV档位 R{int(meta.get('regime'))}"
         if meta.get("atr") and float(meta.get("atr") or 0) > 0:
-            base_note += f" | TV ATR {float(meta.get('atr')):.2f}"
+            base_note += f" | TV ATR {float(meta['atr']):.2f}"
         src_note = format_tv_field_sources(meta.get("field_sources") or {})
         if src_note and "TV透传" not in src_note:
             base_note += f" | {src_note}"
@@ -816,9 +831,10 @@ class PositionSupervisor:
                 return
             verify_note = f"{base_note} | REST 同步略延迟"
             logger.info(f"平仓钉钉：REST 延迟，仍推送收网播报 | reason={reason}")
+        display_reason = meta.get("tv_reason") or reason or "仓位归零"
         self._call_dingtalk(
             dingtalk.report_supervisor_close,
-            reason=reason or "仓位归零 (人工全平 / 止盈吃满)",
+            reason=display_reason,
             verify_note=verify_note,
             verified=flat,
             swept_dust=swept_dust,
@@ -829,6 +845,11 @@ class PositionSupervisor:
             tv_regime=meta.get("regime"),
             tv_atr=meta.get("atr"),
             tv_field_sources=meta.get("field_sources"),
+            close_type=meta.get("close_type"),
+            tv_reason=meta.get("tv_reason") or display_reason,
+            entry_px=meta.get("entry_px"),
+            closed_qty=meta.get("closed_qty"),
+            live_exit_px=meta.get("live_exit_px"),
         )
 
     def _sweep_dust_and_finalize(self, reason):
@@ -954,12 +975,22 @@ class PositionSupervisor:
             f"重启对账补发 | 原账本 {prev_watched}张 {prev_side or ''} | "
             f"盘口无持仓 | 挂单已清空 | 智慧大脑复位待命"
         )
+        recover_meta = self._infer_flat_close_meta(hint_reason="重启对账补发收网")
         self._call_dingtalk(
             dingtalk.report_supervisor_close,
-            reason="仓位归零 (止盈吃单 / 人工全平 / TV 强制平仓)",
+            reason=recover_meta.get("tv_reason", "仓位归零 (重启对账补发)"),
             verify_note=verify_note,
             verified=True,
             swept_dust=False,
+            tv_pnl_pct=recover_meta.get("pnl_pct"),
+            tv_side=recover_meta.get("side") or prev_side,
+            close_action=recover_meta.get("action"),
+            tv_regime=recover_meta.get("regime"),
+            tv_atr=recover_meta.get("atr"),
+            close_type=recover_meta.get("close_type"),
+            tv_reason=recover_meta.get("tv_reason"),
+            entry_px=recover_meta.get("entry_px"),
+            closed_qty=prev_watched,
         )
         return True
 
@@ -2914,6 +2945,22 @@ class PositionSupervisor:
                 f"🛡️ [智慧大脑] {SHIELD_HARD_STOP_PCT:.0%}硬止损成交 "
                 f"{old_qty} ➔ {new_qty} @ {f['price']:.2f}"
             )
+            if new_qty <= 0 or self._is_dust_qty(new_qty):
+                flat_meta = self._build_close_meta(
+                    "CLOSE_STOPLOSS",
+                    self.current_side,
+                    self._estimate_pnl_pct(curr_px),
+                    "触碰硬止损平仓（VPS 10%硬止损）",
+                )
+                flat_meta["close_type"] = CLOSE_TYPE_VPS_SHIELD
+                self._disarm_shield("10%硬止损全平", notify=False)
+                self._handle_manual_flat_detected(
+                    flat_meta["tv_reason"],
+                    close_meta=flat_meta,
+                    curr_px=curr_px,
+                )
+                self._save_state()
+                return change, None
             self._disarm_shield("10%硬止损成交", notify=True)
             self.shield_tiers_consumed = []
             result = self._smart_realign_defenses(
@@ -3192,16 +3239,87 @@ class PositionSupervisor:
             parts.append(f"TV盈亏 {self._safe_float(pnl_pct):+.2f}%")
         return (" | " + " | ".join(parts)) if parts else ""
 
-    def _build_close_meta(self, raw_action, close_side, pnl_pct):
+    def _estimate_pnl_pct(self, curr_px):
+        entry = float(self.watched_entry or 0)
+        px = float(curr_px or 0)
+        if entry <= 0 or px <= 0 or not self.current_side:
+            return None
+        if self.current_side == "LONG":
+            return (px - entry) / entry * 100.0
+        return (entry - px) / entry * 100.0
+
+    def _build_close_meta(self, raw_action, close_side, pnl_pct, tv_reason=""):
+        reason = str(tv_reason or "").strip()
+        close_type = classify_tv_close(raw_action, reason, pnl_pct)
         return {
             "action": raw_action,
+            "close_type": close_type,
             "side": close_side or self.current_side,
             "pnl_pct": pnl_pct,
+            "tv_reason": reason,
             "tv_price": self.tv_price,
             "regime": self.regime,
             "atr": self.current_atr,
             "field_sources": getattr(self, "_last_tv_field_sources", {}),
+            "entry_px": self.watched_entry,
+            "closed_qty": self._safe_qty(self.watched_qty or self.initial_qty),
         }
+
+    def _infer_flat_close_meta(self, curr_px=0.0, hint_reason=""):
+        last = self.last_tv_signal or {}
+        if (
+            last.get("action") in ("CLOSE_TP3", "CLOSE_PROTECT", "CLOSE_STOPLOSS")
+            and time.time() - float(last.get("ts", 0) or 0) < 180
+        ):
+            return self._build_close_meta(
+                last.get("action"),
+                last.get("side") or self.current_side,
+                last.get("pnl_pct"),
+                last.get("reason") or hint_reason,
+            )
+        consumed = set(getattr(self, "tp_levels_consumed", []) or [])
+        if consumed >= {1, 2, 3}:
+            return self._build_close_meta(
+                "CLOSE_TP3", self.current_side,
+                self._estimate_pnl_pct(curr_px), "TP3完美收网",
+            )
+        if getattr(self, "_radar_activation_notified", False) or self._is_radar_active():
+            return self._build_close_meta(
+                "CLOSE_STOPLOSS", self.current_side,
+                self._estimate_pnl_pct(curr_px), "防回吐保本平仓",
+            )
+        if getattr(self, "shield_active", False):
+            return self._build_close_meta(
+                "CLOSE_STOPLOSS", self.current_side,
+                self._estimate_pnl_pct(curr_px),
+                "触碰硬止损平仓（VPS 10%硬止损）",
+            )
+        return self._build_close_meta("CLOSE", self.current_side, None, hint_reason or "仓位归零")
+
+    def _enrich_close_meta_live(self, meta, curr_px=0.0):
+        out = dict(meta or {})
+        if not out.get("entry_px"):
+            out["entry_px"] = self.watched_entry
+        if not out.get("closed_qty"):
+            out["closed_qty"] = self._safe_qty(self.watched_qty or self.initial_qty)
+        if not out.get("side"):
+            out["side"] = self.current_side
+        px = float(curr_px or 0) or deepcoin_client.get_current_price(self.symbol) or 0.0
+        if px > 0:
+            out["live_exit_px"] = px
+            if out.get("pnl_pct") is None:
+                saved_side = out.get("side") or self.current_side
+                entry = float(out.get("entry_px") or 0)
+                if entry > 0 and saved_side:
+                    if saved_side == "LONG":
+                        out["pnl_pct"] = (px - entry) / entry * 100.0
+                    else:
+                        out["pnl_pct"] = (entry - px) / entry * 100.0
+        if not out.get("close_type"):
+            out["close_type"] = classify_tv_close(
+                out.get("action", ""), out.get("tv_reason", ""), out.get("pnl_pct"),
+            )
+        return out
 
     def _safe_float(self, val, default=0.0):
         try:
@@ -3241,7 +3359,7 @@ class PositionSupervisor:
         close_reason = str(payload.get("reason") or "策略指标反转/波动率安全退出").strip()
         close_side = str(payload.get("side") or "").strip().upper()
         pnl_pct = payload.get("pnl_pct")
-        close_meta = self._build_close_meta(raw_action, close_side, pnl_pct)
+        close_meta = self._build_close_meta(raw_action, close_side, pnl_pct, close_reason)
         close_extra = self._format_close_extra(
             close_side, pnl_pct, self.tv_price, self.regime, self.current_atr,
         )
@@ -3267,39 +3385,50 @@ class PositionSupervisor:
                 self.monitoring = False
             if raw_action == "CLOSE_PROTECT" or raw_action.startswith("CLOSE_PROTECT"):
                 pos = self._get_active_position()
+                tv_reason = close_reason or "保护性全平"
                 if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
-                    logger.info(f"🛡️ 保护性全平到达但盘口已空仓 → 撤单复位 | {close_reason}{close_extra}")
+                    logger.info(f"🛡️ 保护性全平到达但盘口已空仓 → 撤单复位 | {tv_reason}{close_extra}")
                     self._handle_manual_flat_detected(
-                        f"🛡️ TV保护性全平（盘口已空）: {close_reason}{close_extra}",
+                        tv_reason,
                         close_meta=close_meta,
+                        curr_px=self.tv_price,
                     )
                 else:
                     self._close_all(
-                        f"🛡️ 保护性全平：{close_reason}{close_extra}",
+                        f"🛡️ 风控拦截：{tv_reason}{close_extra}",
                         close_meta=close_meta,
                     )
             elif raw_action == "CLOSE_TP3":
                 pos = self._get_active_position()
+                tv_reason = close_reason or "TP3完美收网"
                 if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
                     self._handle_manual_flat_detected(
-                        f"🎯 TV TP3 收网（盘口已空）{close_extra}",
+                        tv_reason,
                         close_meta=close_meta,
+                        curr_px=self.tv_price,
                     )
                 else:
                     self._close_all(
-                        f"🎯 完美胜利：TP3 终极收网{close_extra}",
+                        f"🏆 TP3止盈：{tv_reason}{close_extra}",
                         close_meta=close_meta,
                     )
             elif raw_action == "CLOSE_STOPLOSS":
                 pos = self._get_active_position()
+                tv_reason = close_reason or "被动止损/保本"
                 if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
                     self._handle_manual_flat_detected(
-                        f"🛑 TV被动止损/保本（盘口已空）: {close_reason}{close_extra}",
+                        tv_reason,
                         close_meta=close_meta,
+                        curr_px=self.tv_price,
                     )
                 else:
+                    tag = (
+                        "防回吐保本"
+                        if close_meta.get("close_type") == CLOSE_TYPE_BREAKEVEN
+                        else "硬止损"
+                    )
                     self._close_all(
-                        f"🛑 被动止损/保本：{close_reason}{close_extra}",
+                        f"🛑 {tag}：{tv_reason}{close_extra}",
                         close_meta=close_meta,
                     )
             elif raw_action == "CLOSE":
@@ -3488,9 +3617,13 @@ class PositionSupervisor:
         if curr_px > 0:
             self._open_position(action, curr_px)
 
-    def _handle_manual_flat_detected(self, reason, close_meta=None):
-        """人工全平 / 止盈吃满：智能复位账本"""
-        logger.info(f"📭 感知空仓: {reason}")
+    def _handle_manual_flat_detected(self, reason, close_meta=None, curr_px=0.0):
+        """人工全平 / 止盈吃满 / 止损触发：智能复位账本 + 四标签收网钉钉"""
+        meta = self._enrich_close_meta_live(
+            close_meta or self._infer_flat_close_meta(curr_px, hint_reason=reason),
+            curr_px,
+        )
+        logger.info(f"📭 感知空仓: {meta.get('tv_reason') or reason}")
         self.monitoring = False
         self.watched_qty = 0
         self.initial_qty = 0
@@ -3498,8 +3631,9 @@ class PositionSupervisor:
         deepcoin_client.cancel_all_open_orders(self.symbol)
         self._save_state()
         self._report_flat_close(
-            reason or "仓位归零 (人工全平 / 止盈吃满)",
-            close_meta=close_meta,
+            meta.get("tv_reason") or reason or "仓位归零",
+            close_meta=meta,
+            curr_px=curr_px,
         )
 
     def _handle_smart_entry(self, action):
@@ -3918,8 +4052,14 @@ class PositionSupervisor:
 
                         if real_amt == 0:
                             if self.watched_qty > 0:
+                                flat_meta = self._infer_flat_close_meta(
+                                    curr_px=last_px,
+                                    hint_reason="仓位归零 (止盈吃单 / 人工全平 / 止损触发)",
+                                )
                                 self._handle_manual_flat_detected(
-                                    "仓位归零 (止盈吃单 / 人工全平 / TV 强制平仓)"
+                                    flat_meta.get("tv_reason", "仓位归零"),
+                                    close_meta=flat_meta,
+                                    curr_px=last_px,
                                 )
                             break
 
