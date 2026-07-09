@@ -770,10 +770,10 @@ def report_adverse_shield_armed(side, entry, live_qty, adverse_pct, tier_prices,
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "💰 开仓成本": _p(f"`{entry:.2f}` USDT", P_MUTED),
         "📦 保护头寸": _p(f"**{live_qty}** {UNIT_LABEL} 全平", P_MAIN),
-        "🛡️ 硬止损线": _p(f"**-{pct:.0%}** → `{stop_px:.2f}` USDT", P_ACCENT),
+        "🛡️ TV硬止损": _p(f"`{stop_px:.2f}` USDT", P_ACCENT),
         "✅ 风控动作": _p(
-            "开单即挂：以开仓价为基准 ±10% 条件止损全平 · "
-            "价格达 TP1 激活比例后撤硬止损 → 切换雷达移动保本防回吐",
+            "开单即挂：TV 透传 tv_sl 条件止损全平 · "
+            "价格达 TP1 激活比例后撤 TV 硬止损 → 切换雷达移动保本防回吐",
             P_MAIN,
         ),
     }
