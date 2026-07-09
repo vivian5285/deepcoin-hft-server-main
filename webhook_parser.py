@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""TradingView webhook parser — v6.9.75 终极强化版 compatible."""
+"""TradingView webhook parser — v6.9.85 比例传递版 compatible."""
 import json
 import logging
+import math
 import re
 
 logger = logging.getLogger(__name__)
 
-TV_STRATEGY_VERSION = "v6.9.75"
+TV_STRATEGY_VERSION = "v6.9.85"
+
+ENTRY_TYPE_OPEN = "OPEN"
+ENTRY_TYPE_PYRAMID = "PYRAMID"
+ENTRY_TYPE_PROFIT_ADD = "PROFIT_ADD"
+VALID_ENTRY_TYPES = frozenset({
+    ENTRY_TYPE_OPEN, ENTRY_TYPE_PYRAMID, ENTRY_TYPE_PROFIT_ADD,
+})
 
 VALID_ACTIONS = frozenset({
     "LONG", "SHORT", "CLOSE", "CLOSE_PROTECT", "CLOSE_TP3", "CLOSE_STOPLOSS",
@@ -121,6 +129,90 @@ def _to_int(val, default=None):
         return int(f)
     except (TypeError, ValueError):
         return default
+
+
+def normalize_entry_type(val, default=ENTRY_TYPE_OPEN):
+    raw = str(val or default).strip().upper()
+    aliases = {
+        "ADD": ENTRY_TYPE_PYRAMID,
+        "PYRAMID_ADD": ENTRY_TYPE_PYRAMID,
+        "RECHARGE": ENTRY_TYPE_PYRAMID,
+        "PROFIT": ENTRY_TYPE_PROFIT_ADD,
+        "PROFITADD": ENTRY_TYPE_PROFIT_ADD,
+        "PROFIT_ADD": ENTRY_TYPE_PROFIT_ADD,
+    }
+    if raw in aliases:
+        return aliases[raw]
+    if raw in VALID_ENTRY_TYPES:
+        return raw
+    return default
+
+
+def compute_tv_order_qty(principal, risk_pct, leverage, qty_ratio, price, tv_sl,
+                         qty_step=0.001, min_qty=0.001, face_value=None):
+    principal = float(principal or 0)
+    risk_pct = float(risk_pct or 0)
+    leverage = float(leverage or 1)
+    qty_ratio = float(qty_ratio if qty_ratio is not None else 1.0)
+    price = float(price or 0)
+    tv_sl = float(tv_sl or 0)
+
+    meta = {
+        "principal": principal,
+        "risk_pct": risk_pct,
+        "leverage": leverage,
+        "qty_ratio": qty_ratio,
+        "price": price,
+        "tv_sl": tv_sl,
+    }
+    if principal <= 0 or price <= 0 or risk_pct <= 0 or leverage <= 0:
+        meta["error"] = "invalid_inputs"
+        return 0.0, meta
+
+    stop_dist = abs(price - tv_sl)
+    if stop_dist <= 0:
+        stop_dist = max(price * 0.001, 0.01)
+    elif stop_dist < price * 0.0005:
+        stop_dist = max(price * 0.001, 0.01)
+
+    risk_factor = risk_pct / 100.0 if risk_pct > 1 else risk_pct
+    numerator = principal * risk_factor * leverage * max(qty_ratio, 0.01)
+    meta["numerator_usdt"] = round(numerator, 2)
+    meta["stop_dist"] = round(stop_dist, 2)
+
+    if face_value and float(face_value) > 0:
+        fv = float(face_value)
+        raw_qty = numerator / stop_dist / fv
+        max_qty = (principal * leverage) / (fv * price)
+        qty = max(1, int(raw_qty))
+        qty = min(qty, max(1, int(max_qty)))
+        meta["max_qty"] = int(max_qty)
+        meta["capped"] = qty >= int(max_qty)
+        return float(qty), meta
+
+    raw_qty = numerator / stop_dist
+    max_qty = (principal * leverage) / price
+    qty = math.floor(raw_qty / qty_step) * qty_step
+    qty = max(min_qty, qty)
+    qty = min(qty, math.floor(max_qty / qty_step) * qty_step)
+    qty = round(qty, 3)
+    meta["max_qty"] = round(max_qty, 3)
+    meta["raw_qty"] = round(raw_qty, 4)
+    meta["capped"] = qty >= round(max_qty, 3) - qty_step
+    return qty, meta
+
+
+def format_tv_sizing_note(risk_pct, leverage, qty_ratio, principal=None, qty=None):
+    parts = [
+        f"risk={float(risk_pct):.2f}%",
+        f"lev={int(round(float(leverage or 1)))}x",
+        f"ratio={float(qty_ratio or 1):.2f}",
+    ]
+    if principal and principal > 0:
+        parts.append(f"本金={float(principal):.0f}U")
+    if qty is not None and float(qty) > 0:
+        parts.append(f"qty={float(qty)}")
+    return " · ".join(parts)
 
 
 def _unwrap_payload(obj):
@@ -243,6 +335,10 @@ def normalize_tv_payload(data):
 
     secret = str(src.get("secret") or src.get("token") or src.get("key") or "").strip()
     tv_sl = _to_float(src.get("tv_sl") or src.get("stop") or src.get("sl"))
+    entry_type = normalize_entry_type(src.get("entry_type") or src.get("entryType"))
+    risk_pct = _to_float(src.get("risk_pct") or src.get("riskPct") or src.get("risk"))
+    leverage = _to_float(src.get("leverage") or src.get("lev"))
+    qty_ratio = _to_float(src.get("qty_ratio") or src.get("qtyRatio"))
 
     out["action"] = action
     out["side"] = side
@@ -266,6 +362,16 @@ def normalize_tv_payload(data):
         out["secret"] = secret
     if tv_sl is not None and tv_sl > 0:
         out["tv_sl"] = round(tv_sl, 2)
+    if action in ("LONG", "SHORT"):
+        out["entry_type"] = entry_type
+        if risk_pct is not None and risk_pct > 0:
+            out["risk_pct"] = round(risk_pct, 4)
+        if leverage is not None and leverage > 0:
+            out["leverage"] = round(leverage, 2)
+        if qty_ratio is not None and qty_ratio > 0:
+            out["qty_ratio"] = round(qty_ratio, 4)
+        elif entry_type == ENTRY_TYPE_OPEN:
+            out["qty_ratio"] = 1.0
 
     out["_normalized"] = True
     out["_schema"] = TV_STRATEGY_VERSION
@@ -459,4 +565,12 @@ def format_webhook_log(data):
         parts.append(f"TP={tp_txt}({tp_src})")
     if data.get("tv_sl"):
         parts.append(f"tv_sl={float(data['tv_sl']):.2f}")
+    if data.get("entry_type"):
+        parts.append(f"type={data['entry_type']}")
+    if data.get("risk_pct"):
+        parts.append(f"risk={float(data['risk_pct']):.2f}%")
+    if data.get("leverage"):
+        parts.append(f"lev={float(data['leverage']):.0f}x")
+    if data.get("qty_ratio") is not None:
+        parts.append(f"ratio={float(data['qty_ratio']):.2f}")
     return " | ".join(parts)

@@ -15,6 +15,9 @@ from webhook_parser import (
     format_tv_field_sources,
     classify_tv_close,
     close_type_display_label,
+    format_tv_sizing_note,
+    ENTRY_TYPE_PYRAMID,
+    ENTRY_TYPE_PROFIT_ADD,
     CLOSE_TYPE_TP3,
     CLOSE_TYPE_PROTECT,
     CLOSE_TYPE_BREAKEVEN,
@@ -677,6 +680,44 @@ def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
     if verify_note:
         data["🔍 核实明细"] = _p(verify_note, P_MUTED)
     send_alert("📡 TV硬止损 · UPDATE_SL 已同步", data, P_TITLE)
+
+
+def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entry, new_entry,
+                           tv_sl=0, risk_pct=0, leverage=None, qty_ratio=1.0,
+                           verify_note="", verified=True):
+    """v6.9.85 PYRAMID / PROFIT_ADD 加仓核实成功"""
+    type_label = {
+        ENTRY_TYPE_PYRAMID: "金字塔加仓 PYRAMID",
+        ENTRY_TYPE_PROFIT_ADD: "浮盈加仓 PROFIT_ADD",
+    }.get(str(entry_type or "").upper(), str(entry_type or "ADD"))
+    lev = leverage or DEFAULT_LEVERAGE
+    data = {
+        "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
+        "📡 加仓类型": _p(type_label, P_ACCENT),
+        "➕ 追加数量": _p(f"**+{add_qty}** {UNIT_LABEL}", P_MAIN),
+        "📦 持仓变化": _p(
+            f"`{old_qty}` → **`{new_qty}`** {UNIT_LABEL}",
+            P_LIGHT,
+        ),
+        "💰 均价变化": _p(
+            f"`{old_entry:.2f}` → **`{new_entry:.2f}`** USDT",
+            P_MUTED,
+        ),
+        "📡 TV底线 tv_sl": _p(f"**{float(tv_sl or 0):.2f}** USDT", P_ACCENT),
+        "📐 比例参数": _p(
+            format_tv_sizing_note(risk_pct, lev, qty_ratio),
+            P_MUTED,
+        ),
+        "✅ 风控动作": _p("只追加仓位 + 更新硬止损 · TP123 保持不变", P_MAIN),
+        "📡 实盘核查": _verify_line(
+            verify_note if not verified else "",
+            f"{VERIFY_TAG} | 加仓成交 + 止损已同步",
+            f"⏳ 加仓已提交，{VERIFY_DELAY_MARK} | 哨兵继续核实",
+        ),
+    }
+    if verify_note:
+        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
+    send_alert(f"➕ TV加仓 · {type_label}", data, P_TITLE)
 
 
 def report_adverse_shield_armed(side, entry, live_qty, adverse_pct, tier_prices, tier_pcts,
