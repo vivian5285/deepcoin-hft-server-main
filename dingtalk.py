@@ -628,6 +628,57 @@ def report_radar_regime_cap_trim(side, old_qty, new_qty, target_qty, regime, mar
     send_alert("📡 雷达守护 · 档位限额强制对齐", data, P_TITLE)
 
 
+def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
+                         radar_active=False, radar_sl=None, regime=3,
+                         verify_note="", verified=True):
+    """TV UPDATE_SL 核实成功后播报（TV底线 + 交易所止损，不动状态机）"""
+    tv_sl = float(tv_sl or 0)
+    exchange_stop = float(exchange_stop or tv_sl or 0)
+    merged = (
+        radar_active
+        and radar_sl
+        and abs(float(exchange_stop) - tv_sl) > 0.01
+    )
+    if merged:
+        action_txt = (
+            f"TV UPDATE_SL → 交易所止损 @ `{exchange_stop:.2f}` "
+            f"(TV底线 `{tv_sl:.2f}` · 雷达 `{float(radar_sl):.2f}` 分层)"
+        )
+    elif radar_active:
+        action_txt = (
+            f"TV UPDATE_SL → TV底线 @ `{tv_sl:.2f}` · "
+            f"雷达 @ `{float(radar_sl or exchange_stop):.2f}` 独立运行"
+        )
+    else:
+        action_txt = f"TV UPDATE_SL → 硬止损触发 @ `{tv_sl:.2f}`"
+
+    data = {
+        "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
+        "📦 保护头寸": _p(f"**{live_qty}** {UNIT_LABEL}", P_MAIN),
+        "💰 开仓成本": _p(f"`{entry:.2f}` USDT", P_MUTED),
+        "📊 档位": get_regime_name(regime),
+        "📡 TV底线 tv_sl": _p(f"**{tv_sl:.2f}** USDT", P_ACCENT),
+        "🔒 交易所止损": _p(f"**{exchange_stop:.2f}** USDT", P_LIGHT),
+        "📡 雷达状态": _p(
+            f"已激活 @ `{float(radar_sl):.2f}`" if radar_active and radar_sl
+            else ("已激活" if radar_active else "待命监控中"),
+            P_MAIN,
+        ),
+        "✅ 风控动作": _p(
+            action_txt + " · 雷达与 TV 底线分层运行",
+            P_MAIN,
+        ),
+        "📡 实盘核查": _verify_line(
+            verify_note if not verified else "",
+            f"{VERIFY_TAG} | UPDATE_SL 止损已在盘口对齐",
+            f"⏳ 止损已提交，{VERIFY_DELAY_MARK} | 哨兵将继续核实",
+        ),
+    }
+    if verify_note:
+        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
+    send_alert("📡 TV硬止损 · UPDATE_SL 已同步", data, P_TITLE)
+
+
 def report_adverse_shield_armed(side, entry, live_qty, adverse_pct, tier_prices, tier_pcts,
                                 verify_note=""):
     stop_px = tier_prices[0] if tier_prices else entry
