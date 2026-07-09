@@ -6,6 +6,10 @@
 
 set -uo pipefail
 
+DEPLOY_SCRIPT_VERSION="v13.3-deploy-audit"
+# 接受 v13.4.6+、v13.5~9、v13.10+（含 -tv-pure-sl 等后缀标签）
+MIN_SUPERVISOR_VERSION_RE='v13\.(4\.[6-9]|(?:[5-9]|[1-9][0-9]+)\.)'
+
 WORKERS=1
 THREADS=10
 BIND_HOST="0.0.0.0"
@@ -186,10 +190,19 @@ install_deps() {
     CLIENT_VER="$(grep 'CLIENT_VERSION' "$DIR/deepcoin_client.py" 2>/dev/null | head -1 || true)"
     SUPERVISOR_VER="$(grep 'DEEPCOIN_SUPERVISOR_VERSION' "$DIR/position_supervisor_deepcoin.py" 2>/dev/null | head -1 || true)"
 
-    if echo "$SUPERVISOR_VER" | grep -qE 'DEEPCOIN_SUPERVISOR_VERSION.*"v13\.(4\.[6-9]|[5-9][0-9]*\.)'; then
+    if echo "$SUPERVISOR_VER" | grep -qE "DEEPCOIN_SUPERVISOR_VERSION.*\"${MIN_SUPERVISOR_VERSION_RE}"; then
         log_ok "position_supervisor_deepcoin.py 版本已就绪 (${SUPERVISOR_VER})"
     else
-        log_fail "position_supervisor_deepcoin.py 缺少 v13.4.6+ / v13.5+ / v13.6+ 版本号，请同步最新代码"
+        log_fail "position_supervisor_deepcoin.py 缺少 v13.4.6+ / v13.10+ 版本号，请同步最新代码（当前: ${SUPERVISOR_VER:-未找到}）"
+        return 1
+    fi
+
+    if grep -q "report_tv_signal_received" "$DIR/dingtalk.py" 2>/dev/null \
+        && grep -q "report_tv_position_add" "$DIR/dingtalk.py" 2>/dev/null \
+        && grep -q "EXCHANGE_LEVERAGE" "$DIR/position_supervisor_deepcoin.py" 2>/dev/null; then
+        log_ok "v13.10+ TV比例/纯tv_sl/信号接收钉钉 已就绪"
+    elif echo "$SUPERVISOR_VER" | grep -qE 'v13\.(10|11)\.'; then
+        log_fail "v13.10+ 需 report_tv_signal_received + report_tv_position_add + EXCHANGE_LEVERAGE"
         return 1
     fi
 
@@ -301,8 +314,8 @@ health_check() {
 
     # 6d. 大脑加载日志（大脑写入 deepcoin_brain.log，非 gunicorn error log）
     sleep 2
-    if grep -qE "v13\.(4\.[6-9]|[5-9])" "$BRAIN_LOG" 2>/dev/null; then
-        log_ok "VPS 大脑 v13.4.6+ / v13.5+ 已成功加载"
+    if grep -qE 'v13\.(4\.[6-9]|(?:[5-9]|[1-9][0-9]+))' "$BRAIN_LOG" 2>/dev/null; then
+        log_ok "VPS 大脑 v13.4.6+ / v13.10+ 已成功加载"
     elif grep -q "深币 VPS" "$BRAIN_LOG" 2>/dev/null || grep -q "军师托管版" "$BRAIN_LOG" 2>/dev/null; then
         log_warn "大脑已加载但版本可能过旧（日志中无 v13.4.x，请确认代码已更新）"
     elif grep -q "深币 VPS" "$LOG_DIR/gunicorn_error.log" 2>/dev/null; then
@@ -337,7 +350,7 @@ print_summary() {
 }
 
 # ── 主流程 ──
-echo -e "\n${CYAN}=== 深币系统 · 干净重部署开始 ===${NC}"
+echo -e "\n${CYAN}=== 深币系统 · 干净重部署开始 [${DEPLOY_SCRIPT_VERSION}] ===${NC}"
 echo -e "  工作目录: ${DIR}"
 echo -e "  目标端口: ${PORT}"
 echo ""
