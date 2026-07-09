@@ -49,7 +49,7 @@ CLOSE_TYPE_LABELS = {
     CLOSE_TYPE_PROTECT: "风控拦截",
     CLOSE_TYPE_BREAKEVEN: "防回吐保本",
     CLOSE_TYPE_HARD_SL: "硬止损",
-    CLOSE_TYPE_VPS_SHIELD: "VPS 10%硬止损",
+    CLOSE_TYPE_VPS_SHIELD: "TV硬止损",
     CLOSE_TYPE_GENERIC: "常规清场",
 }
 

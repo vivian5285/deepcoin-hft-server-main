@@ -53,9 +53,9 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "deepcoin_webhook",
-        "version": "v13.10.0-tv-proportional",
+        "version": "v13.11.0-tv-pure-sl",
         "tv_strategy": TV_STRATEGY_VERSION,
-        "leverage": 15,
+        "leverage": 5,
     }), 200
 
 if __name__ == '__main__':
