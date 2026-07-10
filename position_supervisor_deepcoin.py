@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.18.0-aggressive-live-watch"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.18.1-manual-same-dir-recover"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -642,6 +642,70 @@ class PositionSupervisor:
             "last_tv_side": self.last_tv_side,
         })
 
+    def _load_active_tv_direction_from_journal(self):
+        """从 TV 日志末尾向前：跳过尾部 CLOSE，取当前活跃周期的 LONG/SHORT"""
+        if not os.path.exists(TV_JOURNAL):
+            return None
+        entries = []
+        with open(TV_JOURNAL, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        for entry in reversed(entries):
+            action = (entry.get("action") or "").upper()
+            if action.startswith("CLOSE"):
+                continue
+            if action in ("LONG", "SHORT"):
+                return action
+            side = (entry.get("side") or "").upper()
+            if side in ("LONG", "SHORT"):
+                return side
+        return None
+
+    def _collect_credible_tv_directions(self):
+        """可信 TV 方向集合：state 最新信号 > 日志末条 > 活跃周期"""
+        sides = []
+        seen = set()
+
+        def add(raw):
+            s = (raw or "").upper()
+            if s in ("LONG", "SHORT") and s not in seen:
+                seen.add(s)
+                sides.append(s)
+
+        if self.last_tv_signal:
+            add(self.last_tv_signal.get("action"))
+            add(self.last_tv_signal.get("side"))
+        last_tv = self._load_last_journal_entry(TV_JOURNAL)
+        if last_tv:
+            add(last_tv.get("action"))
+            add(last_tv.get("side"))
+        add(self._load_active_tv_direction_from_journal())
+        add(getattr(self, "last_tv_side", None))
+        return sides
+
+    def _live_aligns_with_credible_tv(self, live_side):
+        """人工同向开仓：任一可信 TV 信源与实盘一致 → 应接管，禁止误杀"""
+        return live_side in self._collect_credible_tv_directions()
+
+    def _strict_tv_opposite_side(self, live_side):
+        """仅当「最新 TV 指令」与实盘明确反向时才强平（不用陈旧全量扫描）"""
+        for src in (self.last_tv_signal, self._load_last_journal_entry(TV_JOURNAL)):
+            if not src:
+                continue
+            action = (src.get("action") or "").upper()
+            if action in ("LONG", "SHORT") and action != live_side:
+                return action
+            side = (src.get("side") or "").upper()
+            if side in ("LONG", "SHORT") and side != live_side:
+                return side
+        return None
+
     def _load_last_tv_open_signal(self):
         """TV 日志中最近一条 LONG/SHORT（CLOSE 之后仍可用于方向对账）"""
         if not os.path.exists(TV_JOURNAL):
@@ -662,20 +726,37 @@ class PositionSupervisor:
         return last_open
 
     def _resolve_tv_authoritative_side(self):
-        """TV 战略方向：仅信 TV 日志/开仓信号，不以实盘为准"""
-        last_open_tv = self._load_last_tv_open_signal()
-        if last_open_tv:
-            tv_open = (last_open_tv.get("action") or "").upper()
-            if tv_open in ("LONG", "SHORT"):
-                return tv_open
+        """TV 战略方向：优先最新信源，避免陈旧全量扫描误杀同向人工单"""
+        if self.last_tv_signal:
+            action = (self.last_tv_signal.get("action") or "").upper()
+            if action in ("LONG", "SHORT"):
+                return action
+            side = (self.last_tv_signal.get("side") or "").upper()
+            if side in ("LONG", "SHORT"):
+                return side
         last_tv = self._load_last_journal_entry(TV_JOURNAL)
         if last_tv:
             tv_action = (last_tv.get("action") or "").upper()
             if tv_action in ("LONG", "SHORT"):
                 return tv_action
+            side = (last_tv.get("side") or "").upper()
+            if side in ("LONG", "SHORT"):
+                return side
+            if tv_action.startswith("CLOSE"):
+                active = self._load_active_tv_direction_from_journal()
+                if active:
+                    return active
+        active = self._load_active_tv_direction_from_journal()
+        if active:
+            return active
         side = getattr(self, "last_tv_side", None)
         if side in ("LONG", "SHORT"):
             return side
+        last_open_tv = self._load_last_tv_open_signal()
+        if last_open_tv:
+            tv_open = (last_open_tv.get("action") or "").upper()
+            if tv_open in ("LONG", "SHORT"):
+                return tv_open
         return None
 
     def _live_position_side(self, pos):
@@ -691,22 +772,29 @@ class PositionSupervisor:
         return None
 
     def _enforce_tv_direction_or_flat(self, pos, source="sentinel"):
-        """实盘与 TV 方向相反 → 核武全平，强制对齐 TV（拒绝人工反向手单）"""
+        """实盘与 TV 明确反向 → 核武全平；同向或信源不明 → 交给接管"""
         if not pos or self._safe_qty(pos.get("size")) <= 0:
             return False
         live_side = self._live_position_side(pos)
-        tv_side = self._resolve_tv_authoritative_side()
-        if not tv_side or not live_side or live_side == tv_side:
+        if self._live_aligns_with_credible_tv(live_side):
+            logger.info(
+                f"✅ [{source}] 实盘 {live_side} 与可信 TV 信源同向 → 跳过强平，进入接管"
+            )
             return False
-        reason = f"人工反向手单 vs TV：实盘({live_side}) ≠ TV({tv_side}) [{source}]"
+        tv_opposite = self._strict_tv_opposite_side(live_side)
+        if not tv_opposite or not live_side:
+            return False
+        reason = (
+            f"人工反向手单 vs TV：实盘({live_side}) ≠ 最新TV({tv_opposite}) [{source}]"
+        )
         logger.error(f"🚨 {reason} → 核武全平强制对齐 TV")
         verify_note = (
-            f"触发源: {source} | TV战略 {tv_side} | 实盘反向 {live_side} | "
+            f"触发源: {source} | 最新TV {tv_opposite} | 实盘反向 {live_side} | "
             "已核武全平，账本归零待命"
         )
         self._close_all(
             reason,
-            force_align=(live_side, tv_side),
+            force_align=(live_side, tv_opposite),
             force_verify_note=verify_note,
         )
         return True
@@ -895,9 +983,16 @@ class PositionSupervisor:
             if not reconcile["direction_mismatch"]:
                 self.last_tv_side = side
         elif side != self.last_tv_side and not reconcile["tv_close"]:
-            reconcile["direction_mismatch"] = True
-            if not any("方向背离" in n for n in notes):
-                notes.append(f"方向背离: 实盘{side} vs TV指令{self.last_tv_side}")
+            if self._live_aligns_with_credible_tv(side):
+                notes.append(
+                    f"陈旧TV方向{self.last_tv_side}与实盘{side}不一致，"
+                    f"但最新TV信源同向 → 以接管为准"
+                )
+                self.last_tv_side = side
+            else:
+                reconcile["direction_mismatch"] = True
+                if not any("方向背离" in n for n in notes):
+                    notes.append(f"方向背离: 实盘{side} vs TV指令{self.last_tv_side}")
 
         for n in notes:
             logger.warning(f"🔎 重启对账: {n}")
@@ -4989,17 +5084,23 @@ class PositionSupervisor:
                             )
                             break
 
-                        tv_side = self._resolve_tv_authoritative_side()
-                        if tv_side and actual_side and actual_side != tv_side:
+                        tv_opposite = self._strict_tv_opposite_side(actual_side)
+                        if (
+                            tv_opposite
+                            and actual_side
+                            and not self._live_aligns_with_credible_tv(actual_side)
+                        ):
                             reason = (
-                                f"致命方向背离：实盘({actual_side}) vs TV({tv_side}) [实盘监督]"
+                                f"致命方向背离：实盘({actual_side}) vs "
+                                f"最新TV({tv_opposite}) [实盘监督]"
                             )
                             verify_note = (
-                                f"触发源: 实盘监督 | TV战略 {tv_side} | 实盘反向 {actual_side}"
+                                f"触发源: 实盘监督 | 最新TV {tv_opposite} | "
+                                f"实盘反向 {actual_side}"
                             )
                             self._close_all(
                                 reason,
-                                force_align=(actual_side, tv_side),
+                                force_align=(actual_side, tv_opposite),
                                 force_verify_note=verify_note,
                             )
                             break
@@ -5283,11 +5384,36 @@ class PositionSupervisor:
                 try:
                     reconcile = self._reconcile_context_on_recover(pos)
                     reconcile_notes = reconcile["notes"]
-                    if self._enforce_tv_direction_or_flat(pos, source="VPS重启"):
+                    side = "LONG" if pos.get("posSide") == "long" else "SHORT"
+
+                    if self._live_aligns_with_credible_tv(side):
+                        if reconcile.get("direction_mismatch"):
+                            logger.warning(
+                                f"🔄 [重启] 陈旧对账报方向背离，但实盘 {side} "
+                                f"与最新TV信源同向 → 闪电接管"
+                            )
+                            self.last_tv_side = side
+                            reconcile["direction_mismatch"] = False
+                    elif self._enforce_tv_direction_or_flat(pos, source="VPS重启"):
                         self._recover_in_progress = False
                         return
+
+                    if reconcile.get("manual_open") or self._safe_qty(self.watched_qty) <= 0:
+                        logger.info(
+                            f"🔄 [重启] 人工/孤儿同向仓 {side} "
+                            f"{self._safe_qty(pos.get('size'))}张 → 闪电接管 TP123+止损+雷达"
+                        )
+                        self._perform_live_takeover(
+                            pos,
+                            source="VPS重启",
+                            manual_open=bool(reconcile.get("manual_open")),
+                            qty_change=reconcile.get("qty_manual_change"),
+                        )
+                        recover_ok = True
+                        self._recover_in_progress = False
+                        return
+
                     real_amt = self._safe_qty(pos["size"])
-                    side = "LONG" if pos.get("posSide") == "long" else "SHORT"
                     self.current_side = side
 
                     hydrate_notes = self._hydrate_tv_defense_context(pos)
