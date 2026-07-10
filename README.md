@@ -1,6 +1,6 @@
 # 深币 Deepcoin · ETH 永续 Webhook 交易系统
 
-**当前版本：`v13.24.0-radar-handoff-safe`**
+**当前版本：`v13.25.0-dynamic-add`**
 
 与币安 VPS **同一套军师大脑逻辑**（`position_supervisor_deepcoin.py` 镜像 `position_supervisor_binance.py`）。本文档侧重深币部署差异；**完整统一逻辑见币安仓库 README**（两仓库 README 同步维护）。
 
@@ -11,13 +11,13 @@
 | 端口 | **5004** |
 | 单位 | **张**（0.1 ETH/张） |
 | 杠杆 | **15x** cross |
-| 健康检查 | `GET /health` → `"version":"v13.24.0-radar-handoff-safe"` |
+| 健康检查 | `GET /health` → `"version":"v13.25.0-dynamic-add"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
 
 ---
 
-## 与币安统一的核心逻辑（v13.24）
+## 与币安统一的核心逻辑（v13.25）
 
 以下两工厂 **完全一致**，详见 [`eth-webhook-server` README](https://github.com/vivian5285/eth-webhook-server)：
 
@@ -28,8 +28,20 @@
 - **mark gap** `RADAR_STOP_MIN_GAP`：防刚激活就 closePosition 全平  
 - **同向智能筛选** ATR → Regime → 价差 0.15%  
 - **空闲巡检 12s** orphan 同向接管 / 反向强平  
+- **动态加仓 v6.9.93**：OPEN 由 VPS sizing；PYRAMID/PROFIT_ADD = `base_qty × TV qty_ratio`  
 - **Regime activation** 92%/95%（对齐 TV v6.9.86）  
 - **trailTight** TP1 后 0.20 ATR / TP2 后 0.30 ATR  
+
+### 动态加仓档位（与币安同号）
+
+| 档位 | TV 加仓比例 | 最多次数 |
+|------|-------------|----------|
+| R1 | 0%（跳过） | 1 |
+| R2 | 30% | 2 |
+| R3 | 50% | 2 |
+| R4 | 70% | 3 |
+
+加仓单位：**张**（`base_qty` 为首仓张数，追加量 `int(base × ratio)` 至少 1 张）。
 
 ---
 
@@ -100,7 +112,8 @@ FLASK_PORT=5004
 | v13.17~18 | TV 反向强平 + 空闲 orphan 接管 |
 | v13.19~23 | 全链防线 + TP1 门控 + 伪 TP 解除 |
 | **v13.24** | 安全雷达交棒 + README 统一 |
+| **v13.25** | 动态加仓：首仓 VPS sizing，加仓 base×TV qty_ratio + 档位次数上限 |
 
 ---
 
-*GEMINI Quant · 深币紫金引擎 · v13.24.0-radar-handoff-safe*
+*GEMINI Quant · 深币紫金引擎 · v13.25.0-dynamic-add*

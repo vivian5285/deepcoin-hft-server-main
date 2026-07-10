@@ -766,8 +766,8 @@ def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
 def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entry, new_entry,
                            tv_sl=0, risk_pct=0, leverage=None, qty_ratio=1.0,
                            verify_note="", verified=True, base_qty=0, vps_sizing_meta=None,
-                           add_count=0, max_add_times=2):
-    """PYRAMID / PROFIT_ADD 加仓核实 — base_qty × 固定 ADD_QTY_RATIO"""
+                           add_count=0, max_add_times=2, regime=3):
+    """PYRAMID / PROFIT_ADD 加仓核实 — 首仓 base_qty × TV qty_ratio（v6.9.93 动态加仓）"""
     type_label = {
         ENTRY_TYPE_PYRAMID: "金字塔加仓 PYRAMID",
         ENTRY_TYPE_PROFIT_ADD: "浮盈加仓 PROFIT_ADD",
@@ -776,6 +776,7 @@ def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entr
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "📡 加仓类型": _p(type_label, P_ACCENT),
+        "📊 档位": get_regime_name(regime),
         "➕ 追加数量": _p(f"**+{add_qty}** {UNIT_LABEL}", P_MAIN),
         "📦 持仓变化": _p(
             f"`{old_qty}` → **`{new_qty}`** {UNIT_LABEL}",
@@ -788,12 +789,19 @@ def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entr
         "📡 TV底线 tv_sl": _p(f"**{float(tv_sl or 0):.2f}** USDT", P_ACCENT),
         "📐 加仓公式": _p(
             format_vps_sizing_note(
-                vps_sizing_meta or {"base_qty": base_qty, "qty_ratio": qty_ratio, "sizing_mode": "VPS_ADD"},
+                vps_sizing_meta or {
+                    "base_qty": base_qty,
+                    "qty_ratio": qty_ratio,
+                    "regime": regime,
+                    "max_add_times": max_add_times,
+                    "sizing_mode": "VPS_ADD",
+                },
                 qty=add_qty,
                 entry_type=entry_type,
             ),
             P_MUTED,
         ),
+        "📡 TV加仓比例": _p(f"**{float(qty_ratio):.2f}** × 首仓", P_LIGHT),
         "🔢 加仓次数": _p(f"**{add_count}/{max_add_times}**", P_LIGHT),
         "✅ 风控动作": _p("只追加仓位 + 更新硬止损 · TP123 保持不变", P_MAIN),
         "📡 实盘核查": _verify_line(

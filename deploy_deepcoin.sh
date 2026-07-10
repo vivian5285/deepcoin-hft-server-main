@@ -6,7 +6,7 @@
 
 set -uo pipefail
 
-DEPLOY_SCRIPT_VERSION="v13.24-deploy-audit"
+DEPLOY_SCRIPT_VERSION="v13.25-deploy-dynamic-add"
 # 接受 v13.4.6+、v13.5~9、v13.10+（含 -tv-pure-sl 等后缀标签）
 MIN_SUPERVISOR_VERSION_RE='v13\.(4\.[6-9]|(?:[5-9]|[1-9][0-9]+)\.)'
 
