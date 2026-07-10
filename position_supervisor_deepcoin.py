@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.20.0-full-defense-chain"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.21.0-false-flat-guard"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -55,6 +55,10 @@ OPEN_OVERSIZE_RATIO = 1.10
 SIGNAL_DEDUP_SEC = 45
 DEFENSE_ALIGN_COOLDOWN_SEC = 60
 SENTINEL_GRACE_AFTER_RECOVER_SEC = 45
+FLAT_CONFIRM_RETRIES = 6
+FLAT_CONFIRM_DELAY_SEC = 0.85
+STARTUP_FLAT_CONFIRM_RETRIES = 10
+STARTUP_FLAT_CONFIRM_DELAY_SEC = 1.0
 RECOVER_LOCK_FILE = "logs/.recover_singleton.lock"
 RECOVER_LOCK_TTL_SEC = 180
 REGIME_CAP_COOLDOWN_SEC = 90
@@ -191,6 +195,49 @@ class PositionSupervisor:
             self._safe_qty(self.watched_qty) > 0
             or self.current_side in ("LONG", "SHORT")
         )
+
+    def _live_position_qty(self):
+        pos = self._get_active_position()
+        if not pos:
+            return 0
+        return self._safe_qty(pos.get("size"))
+
+    def _confirm_position_flat(self, retries=None, delay=None):
+        """REST 延迟/重启抖动时多次复核，避免误报空仓触发常规清场"""
+        retries = retries if retries is not None else FLAT_CONFIRM_RETRIES
+        delay = delay if delay is not None else FLAT_CONFIRM_DELAY_SEC
+        for i in range(max(1, int(retries))):
+            qty = self._live_position_qty()
+            if qty > DUST_ORPHAN_CONTRACTS:
+                return False
+            if i + 1 < retries:
+                time.sleep(delay)
+        return self._live_position_qty() <= DUST_ORPHAN_CONTRACTS
+
+    def _reconcile_stale_tp_consumed(self, initial_qty, live_qty, curr_px=0.0):
+        initial_qty = self._safe_qty(initial_qty)
+        live_qty = self._safe_qty(live_qty)
+        consumed = list(getattr(self, "tp_levels_consumed", []) or [])
+        if not consumed:
+            return False
+        inferred = self._infer_tp_consumed_sequential(initial_qty, live_qty, curr_px)
+        if initial_qty <= live_qty and not inferred:
+            logger.warning(
+                f"⚠️ 清除陈旧 tp_levels_consumed={consumed} "
+                f"(开单 {initial_qty}≈现仓 {live_qty}张，无减仓证据)"
+            )
+            self.tp_levels_consumed = []
+            self._save_state()
+            return True
+        if 1 in consumed and self.tv_tps and self.tv_tps[0] > 0:
+            if 1 not in inferred and not self._has_tp_limit_at_price(self.tv_tps[0]):
+                logger.warning(
+                    f"⚠️ TP1 已标记成交但无减仓/无 TP1 挂单 → 重置 {consumed}"
+                )
+                self.tp_levels_consumed = []
+                self._save_state()
+                return True
+        return False
 
     def _live_defenses_need_repair(self, live_qty):
         audit = self._audit_tp_levels(live_qty)
@@ -369,8 +416,13 @@ class PositionSupervisor:
 
         if live_qty <= 0:
             if self._book_thinks_active():
+                if not self._confirm_position_flat():
+                    logger.warning(
+                        "📭 [空闲巡检] 首次无仓但复核仍有持仓 → 跳过误清场"
+                    )
+                    return
                 curr_px = deepcoin_client.get_current_price(self.symbol)
-                logger.warning("📭 [空闲巡检] 账本有仓但盘口已全平 → 补发收网钉钉")
+                logger.warning("📭 [空闲巡检] 账本有仓且复核空仓 → 补发收网钉钉")
                 self._handle_manual_flat_detected(
                     "仓位归零 (人工强平 / 止盈吃单 / 止损触发)",
                     curr_px=curr_px,
@@ -924,6 +976,9 @@ class PositionSupervisor:
         if manual_fresh:
             self._reset_fresh_takeover_state()
 
+        self._reconcile_stale_tp_consumed(
+            self.initial_qty or live_qty, live_qty, curr_px,
+        )
         self._sanitize_tp_consumed(self.initial_qty or live_qty, live_qty, curr_px)
         if not self._ensure_tp123_prices_from_tv(entry):
             notes.append("TP123补全失败")
@@ -1767,6 +1822,15 @@ class PositionSupervisor:
         if not had_active_book:
             return False
 
+        if not self._confirm_position_flat(
+            retries=STARTUP_FLAT_CONFIRM_RETRIES,
+            delay=STARTUP_FLAT_CONFIRM_DELAY_SEC,
+        ):
+            logger.info(
+                "📭 [重启对账] 首次无仓但多次复核仍有持仓 → 跳过误补发收网"
+            )
+            return False
+
         logger.warning(
             f"📭 [重启对账] 账本/日志曾有仓 (watched={prev_watched}, side={prev_side}, "
             f"monitoring={was_monitoring}) 但盘口已全平 → 补发收网播报"
@@ -1914,6 +1978,17 @@ class PositionSupervisor:
 
         saved = self._sequential_tp_prefix(getattr(self, "tp_levels_consumed", []) or [])
         inferred = self._infer_tp_consumed_sequential(initial_qty, live_qty, curr_px)
+
+        if initial_qty <= live_qty and saved and not inferred:
+            logger.warning(
+                f"⚠️ 无减仓但 tp_levels_consumed={saved} → 清空（避免漏挂 TP1）"
+            )
+            saved = []
+        elif initial_qty <= live_qty and saved and inferred and saved != inferred:
+            logger.info(
+                f"🎯 无减仓以推断为准: TP{saved} → TP{inferred or '无'}"
+            )
+            saved = inferred
 
         if len(saved) >= 3 and live_qty > DUST_ORPHAN_CONTRACTS:
             logger.warning(
@@ -3788,6 +3863,17 @@ class PositionSupervisor:
         actions = []
 
         self._sanitize_tp_consumed(initial_qty, live_qty, curr_px)
+        consumed = getattr(self, "tp_levels_consumed", []) or []
+        if consumed and initial_qty <= live_qty:
+            inferred = self._infer_tp_consumed_sequential(initial_qty, live_qty, curr_px)
+            if not inferred:
+                logger.warning(
+                    f"跳过部分止盈修复：无减仓证据，清除 TP{consumed}"
+                )
+                self.tp_levels_consumed = []
+                self._save_state()
+                return {"repaired": False, "actions": actions, "result": None, "consumed": []}
+
         stale_levels = self._detect_stale_consumed_tp_levels(
             initial_qty, live_qty, curr_px,
         )
@@ -5233,7 +5319,17 @@ class PositionSupervisor:
                         actual_side = "LONG" if pos and pos.get('posSide') == "long" else "SHORT"
 
                         if real_amt == 0:
+                            if time.time() < getattr(self, "_sentinel_grace_until", 0):
+                                logger.debug(
+                                    "哨兵宽限期：跳过空仓判定（防重启误清场）"
+                                )
+                                continue
                             if self.watched_qty > 0:
+                                if not self._confirm_position_flat():
+                                    logger.warning(
+                                        "⚠️ [哨兵] 首次无仓但复核仍有持仓 → 跳过误清场"
+                                    )
+                                    continue
                                 flat_meta = self._infer_flat_close_meta(
                                     curr_px=last_px,
                                     hint_reason="仓位归零 (止盈吃单 / 人工全平 / 止损触发)",
