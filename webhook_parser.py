@@ -10,6 +10,15 @@ logger = logging.getLogger(__name__)
 
 TV_STRATEGY_VERSION = "v6.9.85"
 
+# VPS 档位风险系数：最终 risk = min(TV risk_pct × 系数, MAX_RISK_PCT_LIMIT)
+VPS_REGIME_RISK_MULTIPLIERS = {
+    1: 1.0,   # 极弱
+    2: 1.0,   # 弱
+    3: 1.1,   # 中势
+    4: 1.25,  # 强势
+}
+MAX_RISK_PCT_LIMIT = 4.0
+
 ENTRY_TYPE_OPEN = "OPEN"
 ENTRY_TYPE_PYRAMID = "PYRAMID"
 ENTRY_TYPE_PROFIT_ADD = "PROFIT_ADD"
@@ -148,14 +157,43 @@ def normalize_entry_type(val, default=ENTRY_TYPE_OPEN):
     return default
 
 
+def apply_vps_regime_risk(risk_pct, regime):
+    """TV risk_pct × VPS 档位系数，上限 MAX_RISK_PCT_LIMIT"""
+    regime = int(regime or 3)
+    if regime not in VPS_REGIME_RISK_MULTIPLIERS:
+        regime = 3
+    tv_risk = float(risk_pct or 0)
+    mult = VPS_REGIME_RISK_MULTIPLIERS[regime]
+    adjusted = tv_risk * mult
+    capped = adjusted > MAX_RISK_PCT_LIMIT
+    final = min(adjusted, MAX_RISK_PCT_LIMIT)
+    return final, {
+        "tv_risk_pct_raw": tv_risk,
+        "regime": regime,
+        "vps_regime_multiplier": mult,
+        "adjusted_risk_pct": round(adjusted, 4),
+        "final_risk_pct": round(final, 4),
+        "risk_capped": capped,
+    }
+
+
 def compute_tv_order_qty(principal, risk_pct, leverage, qty_ratio, price, tv_sl,
-                         qty_step=0.001, min_qty=0.001, face_value=None):
+                         qty_step=0.001, min_qty=0.001, face_value=None, regime=None):
+    """
+    v6.9.85 比例下单（VPS 档位系数调控）：
+    effective_risk = min(TV risk_pct × VPS系数[regime], MAX_RISK_PCT_LIMIT)
+    qty = (本金 × effective_risk% × leverage × qty_ratio) / |price - tv_sl|
+    """
     principal = float(principal or 0)
     risk_pct = float(risk_pct or 0)
     leverage = float(leverage or 1)
     qty_ratio = float(qty_ratio if qty_ratio is not None else 1.0)
     price = float(price or 0)
     tv_sl = float(tv_sl or 0)
+
+    risk_meta = {}
+    if regime is not None and int(regime or 0) > 0:
+        risk_pct, risk_meta = apply_vps_regime_risk(risk_pct, regime)
 
     meta = {
         "principal": principal,
@@ -164,6 +202,7 @@ def compute_tv_order_qty(principal, risk_pct, leverage, qty_ratio, price, tv_sl,
         "qty_ratio": qty_ratio,
         "price": price,
         "tv_sl": tv_sl,
+        **risk_meta,
     }
     if principal <= 0 or price <= 0 or risk_pct <= 0 or leverage <= 0:
         meta["error"] = "invalid_inputs"
@@ -202,12 +241,24 @@ def compute_tv_order_qty(principal, risk_pct, leverage, qty_ratio, price, tv_sl,
     return qty, meta
 
 
-def format_tv_sizing_note(risk_pct, leverage, qty_ratio, principal=None, qty=None):
-    parts = [
-        f"risk={float(risk_pct):.2f}%",
-        f"lev={int(round(float(leverage or 1)))}x",
-        f"ratio={float(qty_ratio or 1):.2f}",
-    ]
+def format_tv_sizing_note(risk_pct, leverage, qty_ratio, principal=None, qty=None,
+                          regime=None, final_risk_pct=None):
+    tv_raw = float(risk_pct or 0)
+    if final_risk_pct is None and regime is not None and int(regime or 0) > 0:
+        final_risk_pct, _ = apply_vps_regime_risk(tv_raw, regime)
+    eff = float(final_risk_pct if final_risk_pct is not None else tv_raw)
+    if final_risk_pct is not None and abs(eff - tv_raw) > 0.0005:
+        parts = [
+            f"risk={eff:.3f}% (TV {tv_raw:.2f}%×R{int(regime or 0)})",
+            f"lev={int(round(float(leverage or 1)))}x",
+            f"ratio={float(qty_ratio or 1):.2f}",
+        ]
+    else:
+        parts = [
+            f"risk={eff:.2f}%",
+            f"lev={int(round(float(leverage or 1)))}x",
+            f"ratio={float(qty_ratio or 1):.2f}",
+        ]
     if principal and principal > 0:
         parts.append(f"本金={float(principal):.0f}U")
     if qty is not None and float(qty) > 0:

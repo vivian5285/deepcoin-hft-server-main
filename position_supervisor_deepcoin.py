@@ -37,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.11.0-tv-pure-sl"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.12.0-regime-risk"
 EXCHANGE_LEVERAGE = 5  # 交易所实盘固定 5x；TV payload leverage 仅用于比例 sizing
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
@@ -672,7 +672,7 @@ class PositionSupervisor:
         self.leverage = EXCHANGE_LEVERAGE
         self._save_state()
         logger.info(
-            f"📐 TV比例参数: {format_tv_sizing_note(self.tv_risk_pct, self.tv_sizing_leverage, self.tv_qty_ratio)} "
+            f"📐 TV比例参数: {format_tv_sizing_note(self.tv_risk_pct, self.tv_sizing_leverage, self.tv_qty_ratio, regime=self.regime)} "
             f"| type={self.tv_entry_type} | 交易所杠杆={EXCHANGE_LEVERAGE}x"
         )
 
@@ -692,15 +692,28 @@ class PositionSupervisor:
             px,
             sl,
             face_value=self.face_value,
+            regime=self.regime,
         )
         meta["principal"] = principal
         return int(qty), principal, meta
+
+    def _tv_sizing_note(self, balance, qty, meta=None):
+        meta = meta or {}
+        return format_tv_sizing_note(
+            getattr(self, "tv_risk_pct", 0),
+            getattr(self, "tv_sizing_leverage", EXCHANGE_LEVERAGE),
+            getattr(self, "tv_qty_ratio", 1.0),
+            balance,
+            qty,
+            regime=meta.get("regime", self.regime),
+            final_risk_pct=meta.get("final_risk_pct"),
+        )
 
     def _calc_target_open_qty(self, curr_px, payload=None):
         if self._uses_tv_proportional_sizing(payload):
             qty, principal, meta = self._calc_tv_target_qty(curr_px)
             margin_usdt = meta.get("numerator_usdt", 0)
-            margin_pct = float(getattr(self, "tv_risk_pct", 0) or 0) / 100.0
+            margin_pct = float(meta.get("final_risk_pct") or getattr(self, "tv_risk_pct", 0) or 0) / 100.0
             return qty, principal, margin_usdt, margin_pct
         return self._calc_regime_margin_qty(curr_px)
 
@@ -3868,14 +3881,14 @@ class PositionSupervisor:
             logger.error(f"{entry_type} 跳过：计算加仓量无效 {meta}")
             dingtalk.report_system_alert(
                 f"{entry_type} 数量无效",
-                f"比例计算失败: {format_tv_sizing_note(self.tv_risk_pct, self.tv_sizing_leverage, self.tv_qty_ratio, balance)}",
+                f"比例计算失败: {self._tv_sizing_note(balance, 0, meta)}",
             )
             return
 
         deepcoin_client.set_leverage(self.symbol, leverage=EXCHANGE_LEVERAGE)
         logger.info(
             f"➕ [{entry_type}] {action} 追加 {add_qty} 张 | "
-            f"{format_tv_sizing_note(self.tv_risk_pct, self.tv_sizing_leverage, self.tv_qty_ratio, balance, add_qty)}"
+            f"{self._tv_sizing_note(balance, add_qty, meta)}"
         )
         open_side = "buy" if action == "LONG" else "sell"
         pos_side = "long" if action == "LONG" else "short"
@@ -3908,7 +3921,7 @@ class PositionSupervisor:
         sl_ok = self._maintain_hard_shield(new_qty, curr_px, force=True)
         type_label = "浮盈加仓" if entry_type == ENTRY_TYPE_PROFIT_ADD else "金字塔加仓"
         verify_note = (
-            f"{type_label} | {format_tv_sizing_note(self.tv_risk_pct, self.tv_sizing_leverage, self.tv_qty_ratio, balance, add_qty)} "
+            f"{type_label} | {self._tv_sizing_note(balance, add_qty, meta)} "
             f"| 持仓 {old_qty}→{new_qty} 张 @ {new_entry:.2f} "
             f"| tv_sl={getattr(self, 'tv_sl', 0):.2f} "
             f"| {'止损已核实' if sl_ok else '止损待核实'}"
@@ -4057,7 +4070,7 @@ class PositionSupervisor:
             notional = qty * self.face_value * curr_px
             if self._uses_tv_proportional_sizing(payload):
                 budget_txt = (
-                    f"TV比例 {format_tv_sizing_note(self.tv_risk_pct, self.tv_sizing_leverage, self.tv_qty_ratio, balance, qty)} "
+                    f"TV比例 {format_tv_sizing_note(self.tv_risk_pct, self.tv_sizing_leverage, self.tv_qty_ratio, balance, qty, regime=self.regime)} "
                     f"| stop_dist→qty"
                 )
             else:
