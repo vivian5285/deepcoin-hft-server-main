@@ -8,9 +8,9 @@ import re
 
 logger = logging.getLogger(__name__)
 
-TV_STRATEGY_VERSION = "v6.9.85"
+TV_STRATEGY_VERSION = "v6.9.86"
 
-# VPS 自主风控（与 TV risk_pct 完全脱钩）
+# VPS 自主风控（与 TV risk_pct / qty_ratio 完全脱钩）
 VPS_RISK_PCT = 3.0
 VPS_GLOBAL_SCALE = 1.0
 VPS_REGIME_SCALE = {
@@ -23,6 +23,10 @@ MAX_RISK_PCT = 4.0
 MIN_RISK_PCT = 0.5
 MAX_POSITION_SIZE = 9999.0
 MIN_QTY_DEFAULT = 0.001
+
+# 加仓：固定首仓 50%，最多 2 次（PYRAMID / PROFIT_ADD 一视同仁）
+ADD_QTY_RATIO = 0.5
+MAX_ADD_TIMES = 2
 
 # 兼容旧引用
 MAX_RISK_PCT_LIMIT = MAX_RISK_PCT
@@ -254,16 +258,17 @@ def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=5,
     return qty, meta
 
 
-def compute_vps_add_qty(base_qty, qty_ratio, qty_step=0.001, min_qty=None,
+def compute_vps_add_qty(base_qty, qty_ratio=None, qty_step=0.001, min_qty=None,
                         face_value=None, max_position=None):
-    """加仓 PYRAMID/PROFIT_ADD：add_qty = base_qty × qty_ratio"""
+    """加仓 PYRAMID/PROFIT_ADD：add_qty = base_qty × ADD_QTY_RATIO（固定，忽略 TV qty_ratio）"""
     base_qty = float(base_qty or 0)
-    qty_ratio = float(qty_ratio if qty_ratio is not None else 0.5)
+    qty_ratio = float(ADD_QTY_RATIO if qty_ratio is None else qty_ratio)
     min_qty = float(min_qty if min_qty is not None else MIN_QTY_DEFAULT)
     max_position = float(max_position if max_position is not None else MAX_POSITION_SIZE)
     meta = {
         "base_qty": base_qty,
         "qty_ratio": qty_ratio,
+        "add_qty_ratio_fixed": ADD_QTY_RATIO,
         "sizing_mode": "VPS_ADD",
     }
     if base_qty <= 0 or qty_ratio <= 0:

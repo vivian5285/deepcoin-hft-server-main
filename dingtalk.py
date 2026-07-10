@@ -764,8 +764,9 @@ def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
 
 def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entry, new_entry,
                            tv_sl=0, risk_pct=0, leverage=None, qty_ratio=1.0,
-                           verify_note="", verified=True, base_qty=0, vps_sizing_meta=None):
-    """PYRAMID / PROFIT_ADD 加仓核实成功 — base_qty × qty_ratio"""
+                           verify_note="", verified=True, base_qty=0, vps_sizing_meta=None,
+                           add_count=0, max_add_times=2):
+    """PYRAMID / PROFIT_ADD 加仓核实 — base_qty × 固定 ADD_QTY_RATIO"""
     type_label = {
         ENTRY_TYPE_PYRAMID: "金字塔加仓 PYRAMID",
         ENTRY_TYPE_PROFIT_ADD: "浮盈加仓 PROFIT_ADD",
@@ -792,6 +793,7 @@ def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entr
             ),
             P_MUTED,
         ),
+        "🔢 加仓次数": _p(f"**{add_count}/{max_add_times}**", P_LIGHT),
         "✅ 风控动作": _p("只追加仓位 + 更新硬止损 · TP123 保持不变", P_MAIN),
         "📡 实盘核查": _verify_line(
             verify_note if not verified else "",
