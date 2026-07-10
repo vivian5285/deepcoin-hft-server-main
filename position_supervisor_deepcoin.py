@@ -43,10 +43,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.17.0-tv-direction-guard"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.18.0-aggressive-live-watch"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
+IDLE_PATROL_INTERVAL_SEC = 12
+IDLE_TAKEOVER_COOLDOWN_SEC = 30
 DUST_ORPHAN_CONTRACTS = 1
 TP_COMPLETE_RESIDUAL_RATIO = 0.12
 OPEN_OVERSIZE_RATIO = 1.10
@@ -147,6 +149,7 @@ class PositionSupervisor:
         self.tv_entry_type = ENTRY_TYPE_OPEN
         self.base_qty = 0
         self.add_count = 0
+        self._last_idle_takeover_ts = 0.0
 
         self.state_file = 'deepcoin_vps_state.json'
         logger.info(
@@ -157,10 +160,10 @@ class PositionSupervisor:
         self._start_idle_flat_patrol()
 
     def _start_idle_flat_patrol(self):
-        """空仓待命时后台巡检：发现孤立残张 → 自动扫尾 + 钉钉"""
+        """空仓待命时激进实盘巡检：反向强平 / 同向接管 / 人工异动 / 漏报全平 / 蚂蚁扫尾"""
         def loop():
             while True:
-                time.sleep(30)
+                time.sleep(IDLE_PATROL_INTERVAL_SEC)
                 if self.monitoring:
                     continue
                 if not self._lock.acquire(timeout=2.0):
@@ -168,26 +171,310 @@ class PositionSupervisor:
                 try:
                     if self.monitoring:
                         continue
-                    pos = self._get_active_position()
-                    if not pos or self._safe_qty(pos.get("size")) <= 0:
-                        continue
-                    if self._enforce_tv_direction_or_flat(pos, source="空闲巡检"):
-                        continue
-                    real_amt = self._safe_qty(pos["size"])
-                    if not self._is_dust_qty(real_amt) and not self._should_finalize_tp_victory(real_amt):
-                        continue
-                    if not self.current_side:
-                        self.current_side = "LONG" if pos.get("posSide") == "long" else "SHORT"
-                    logger.warning(
-                        f"🐜 [空闲巡检] 发现残量 {self.current_side} {real_amt}张 → 扫尾"
-                    )
-                    self._sweep_dust_and_finalize("重启扫描：盘口蚂蚁仓自动扫平")
+                    self._run_idle_live_reconcile()
                 except Exception as e:
                     logger.error(f"空闲巡检异常: {e}")
                 finally:
                     self._lock.release()
 
-        threading.Thread(target=loop, daemon=True, name="idle-flat-patrol").start()
+        threading.Thread(target=loop, daemon=True, name="idle-live-watch").start()
+
+    def _book_thinks_active(self):
+        return (
+            self._safe_qty(self.watched_qty) > 0
+            or self.current_side in ("LONG", "SHORT")
+        )
+
+    def _live_defenses_need_repair(self, live_qty):
+        audit = self._audit_tp_levels(live_qty)
+        expected = audit.get("expected", 0)
+        matched = audit.get("matched_full", 0)
+        if expected > 0 and matched < expected:
+            return True, audit
+        sl = self._radar_sl_to_pass() or float(getattr(self, "tv_sl", 0) or 0)
+        if sl > 0 and not self._has_stop_sl_near(sl):
+            return True, audit
+        return False, audit
+
+    def _resume_live_monitoring(self, pos, source="空闲巡检"):
+        """账本与实盘一致但 monitoring=False → 恢复哨兵与雷达跟踪"""
+        curr_px = deepcoin_client.get_current_price(self.symbol) or 0
+        entry = float(pos.get("entry_price", 0) or self.watched_entry or 0)
+        self._refresh_radar_state_on_recover(curr_px, entry)
+        self.monitoring = True
+        self._save_state()
+        self._ensure_price_ws()
+        self._ensure_sentinel_running()
+        self._sentinel_grace_until = time.time() + SENTINEL_GRACE_AFTER_RECOVER_SEC
+        side = "LONG" if pos.get("posSide") == "long" else "SHORT"
+        qty = self._safe_qty(pos.get("size"))
+        logger.info(
+            f"📡 [{source}] 恢复实盘监督 {side} {qty}张 "
+            f"| 雷达={'已激活' if self._is_radar_active() else '待命'}"
+        )
+
+    def _perform_live_takeover(self, pos, source="巡检", manual_open=False, qty_change=None):
+        """
+        实盘有仓但 VPS 未监控 / 防线缺失 → 补挂 TP123+硬止损，启动雷达哨兵。
+        """
+        real_amt = self._safe_qty(pos.get("size"))
+        side = "LONG" if pos.get("posSide") == "long" else "SHORT"
+        tv_side = self._resolve_tv_authoritative_side()
+        if tv_side and side != tv_side:
+            return False
+
+        self.current_side = side
+        if not self.last_tv_side:
+            self.last_tv_side = tv_side or side
+
+        pos_ctx = {"side": side, "size": real_amt, "entry_price": float(pos.get("entry_price", 0))}
+        reconcile_notes = self._hydrate_tv_defense_context(pos_ctx)
+        saved_initial = self._resolve_open_initial_qty(real_amt)
+        if saved_initial <= 0:
+            saved_initial = real_amt
+        if self.base_qty <= 0:
+            self.base_qty = int(saved_initial or real_amt)
+        self.watched_qty = real_amt
+        self.initial_qty = saved_initial
+        self.watched_entry = float(pos.get("entry_price", 0))
+        if not getattr(self, "open_regime", None):
+            self.open_regime = self.regime
+        if not getattr(self, "open_atr", None):
+            self.open_atr = self.current_atr
+
+        curr_px = deepcoin_client.get_current_price(self.symbol)
+        tp_repair = {"repaired": False}
+        try:
+            tp_repair = self._repair_partial_tp_on_recover(
+                real_amt, self.watched_entry, saved_initial, curr_px or 0,
+            )
+        except Exception as e:
+            logger.error(f"接管TP修复跳过: {e}")
+            reconcile_notes.append(f"TP修复跳过:{e}")
+
+        self._refresh_radar_state_on_recover(curr_px, self.watched_entry)
+        radar_active = self._is_radar_active()
+        saved_sl = self.current_sl if radar_active else None
+
+        try:
+            cap = self._radar_enforce_regime_cap(real_amt, curr_px, force=True)
+            if cap:
+                real_amt = cap["new_qty"]
+                pos = self._get_active_position() or pos
+                if pos:
+                    self.watched_qty = real_amt
+                    if self._safe_qty(self.initial_qty) <= real_amt + 1:
+                        self.initial_qty = real_amt
+        except Exception as e:
+            logger.warning(f"接管档位限额跳过: {e}")
+
+        sl_ok = True
+        if tp_repair.get("repaired") and tp_repair.get("result"):
+            sl = self._radar_sl_to_pass()
+            if sl and not self._has_stop_sl_near(sl):
+                sl_ok = self._ensure_radar_sl(sl, real_amt)
+            elif saved_sl and radar_active:
+                sl_ok = self._ensure_radar_sl(saved_sl, real_amt)
+        else:
+            result = self._smart_recover_defenses(
+                real_amt, self.watched_entry,
+                dynamic_sl=self._radar_sl_to_pass(),
+            )
+            if saved_sl and radar_active and not self._has_stop_sl_near(saved_sl):
+                sl_ok = self._ensure_radar_sl(saved_sl, real_amt)
+            elif float(getattr(self, "tv_sl", 0) or 0) > 0:
+                sl_ok = self._maintain_hard_shield(real_amt, curr_px, force=True)
+
+        audit = self._wait_defense_settled(
+            real_amt, saved_sl if radar_active else None,
+        )
+        matched = audit.get("matched_full", 0)
+        expected = audit.get("expected", 0)
+
+        bootstrap = self._bootstrap_live_defenses_after_recover(
+            real_amt, curr_px, audit=audit,
+        )
+        audit = bootstrap.get("audit") or audit
+        health = bootstrap.get("health") or self._build_recover_health_report(
+            {"side": side, "size": real_amt, "entry_price": self.watched_entry},
+            curr_px, audit,
+        )
+        radar_active = (
+            health.get("radar_active")
+            or health.get("should_radar")
+            or self._is_radar_active()
+        )
+        sl_ok = not radar_active or self._has_stop_sl_near(self.current_sl)
+
+        self.monitoring = True
+        self._save_state()
+        self._ensure_price_ws()
+        log_source = source.split("·")[0].replace(" ", "")
+        self._record_open_log(side, real_amt, self.watched_entry, source=log_source)
+        self._ensure_sentinel_running()
+        self._sentinel_grace_until = time.time() + SENTINEL_GRACE_AFTER_RECOVER_SEC
+        self._last_idle_takeover_ts = time.time()
+
+        verified = self._wait_verify(
+            lambda: self._verify_position_qty(real_amt, side),
+            retries=6,
+            delay=0.5,
+        )
+        entry_px = float((verified or pos_ctx)["entry_price"])
+
+        reconcile_txt = (" | " + " ; ".join(reconcile_notes)) if reconcile_notes else ""
+        tp_repair_note = ""
+        if tp_repair.get("repaired"):
+            tp_repair_note = " | TP修复: " + " · ".join(tp_repair.get("actions") or [])
+        verify_note = (
+            f"[{source}] 接管 {real_amt}张 @ {entry_px:.2f} | "
+            f"开单 {saved_initial}张 | TV {self.last_tv_side} | "
+            f"止盈 {matched}/{expected} 档 | "
+            f"{self._format_audit_summary(audit)}{tp_repair_note}{reconcile_txt}"
+        )
+        if not verified:
+            verify_note += " | REST 同步略延迟"
+
+        if manual_open:
+            self._call_dingtalk(
+                dingtalk.report_manual_position_change,
+                action_type=f"人工开仓 · {source}",
+                old_qty=0,
+                new_qty=real_amt,
+                new_entry_price=entry_px,
+                verify_note=verify_note,
+                tp_audit=audit,
+                verified=bool(verified),
+            )
+        elif qty_change:
+            old_q, new_q, action_msg = qty_change
+            self._call_dingtalk(
+                dingtalk.report_manual_position_change,
+                action_type=action_msg,
+                old_qty=old_q,
+                new_qty=new_q,
+                new_entry_price=entry_px,
+                verify_note=f"{source} | {verify_note}",
+                tp_audit=audit,
+                verified=bool(verified),
+            )
+        else:
+            self._call_dingtalk(
+                dingtalk.report_recover_takeover,
+                side=side,
+                qty=real_amt,
+                entry=entry_px,
+                tv_tps=self.tv_tps,
+                regime=self.regime,
+                radar_active=radar_active,
+                sl_price=self.current_sl,
+                verify_note=verify_note,
+                tp_matched=matched,
+                tp_expected=expected,
+                tp_audit=audit,
+                last_tv_signal=self.last_tv_signal,
+                radar_sl_ok=sl_ok,
+                pnl_label=health.get("pnl_label", ""),
+                defense_plan=health.get("defense_plan", ""),
+                shield_status=health.get("shield_status", ""),
+                initial_qty=saved_initial,
+                tp_consumed_levels=getattr(self, "tp_levels_consumed", []) or [],
+            )
+
+        if expected > 0 and matched < expected:
+            dingtalk.report_system_alert(
+                f"{source} · 止盈未完全对齐",
+                f"{side} {real_amt}张 @ {entry_px:.2f} | "
+                f"仅 {matched}/{expected} 档 | 哨兵将接力纠偏",
+            )
+        else:
+            self._mark_defense_align_ok()
+
+        logger.info(f"✅ [{source}] 实盘接管完成 {side} {real_amt}张 @ {entry_px:.2f}")
+        return True
+
+    def _run_idle_live_reconcile(self):
+        """VPS 空仓/待命时周期性对账实盘：全场景生产级应对"""
+        if self.monitoring or getattr(self, "_recover_in_progress", False):
+            return
+        if getattr(self, "_open_in_progress", False):
+            return
+
+        pos = self._get_active_position()
+        live_qty = self._safe_qty(pos.get("size")) if pos else 0
+
+        if live_qty <= 0:
+            if self._book_thinks_active():
+                curr_px = deepcoin_client.get_current_price(self.symbol)
+                logger.warning("📭 [空闲巡检] 账本有仓但盘口已全平 → 补发收网钉钉")
+                self._handle_manual_flat_detected(
+                    "仓位归零 (人工强平 / 止盈吃单 / 止损触发)",
+                    curr_px=curr_px,
+                )
+            return
+
+        if self._enforce_tv_direction_or_flat(pos, source="空闲巡检"):
+            return
+
+        if self._is_dust_qty(live_qty) or self._should_finalize_tp_victory(live_qty):
+            if not self.current_side:
+                self.current_side = "LONG" if pos.get("posSide") == "long" else "SHORT"
+            logger.warning(
+                f"🐜 [空闲巡检] 发现残量 {self.current_side} {live_qty}张 → 扫尾"
+            )
+            self._sweep_dust_and_finalize("空闲巡检：盘口蚂蚁仓自动扫平")
+            return
+
+        live_side = "LONG" if pos.get("posSide") == "long" else "SHORT"
+        tv_side = self._resolve_tv_authoritative_side()
+        if not tv_side or live_side != tv_side:
+            return
+
+        now = time.time()
+        watched = self._safe_qty(self.watched_qty)
+
+        if watched <= 0:
+            if now - getattr(self, "_last_idle_takeover_ts", 0) < IDLE_TAKEOVER_COOLDOWN_SEC:
+                return
+            logger.warning(
+                f"🔍 [空闲巡检] VPS空仓但实盘同向持仓 {live_side} {live_qty}张 "
+                f"(TV={tv_side}) → 闪电接管+挂TP123"
+            )
+            self._perform_live_takeover(pos, source="空闲巡检", manual_open=True)
+            return
+
+        if self._is_material_qty_change(watched, live_qty):
+            logger.warning(
+                f"🔍 [空闲巡检] 人工异动 {watched} → {live_qty}张 → 重算TP123+止损"
+            )
+            curr_px = deepcoin_client.get_current_price(self.symbol)
+            old_qty = watched
+            self.watched_qty = live_qty
+            self.watched_entry = float(pos.get("entry_price", 0))
+            self.current_side = live_side
+            change, result = self._handle_smart_qty_change(old_qty, live_qty, curr_px)
+            if result:
+                self._report_qty_change_dingtalk(old_qty, live_qty, result, change=change)
+            self.monitoring = True
+            self._save_state()
+            self._ensure_sentinel_running()
+            self._ensure_price_ws()
+            self._last_idle_takeover_ts = now
+            return
+
+        need_repair, audit = self._live_defenses_need_repair(live_qty)
+        if need_repair:
+            if now - getattr(self, "_last_idle_takeover_ts", 0) < IDLE_TAKEOVER_COOLDOWN_SEC:
+                return
+            logger.warning(
+                f"🔍 [空闲巡检] 防线不齐 ({audit.get('matched_full', 0)}/"
+                f"{audit.get('expected', 0)} 档) → 续挂TP123+止损"
+            )
+            self._perform_live_takeover(pos, source="空闲巡检·防线续挂")
+            return
+
+        if not self.monitoring:
+            self._resume_live_monitoring(pos, source="空闲巡检")
 
     @staticmethod
     def _call_dingtalk(fn, **kwargs):
