@@ -3,7 +3,8 @@
 import os, threading, logging
 from flask import Flask, request, jsonify
 from position_supervisor_deepcoin import position_supervisor
-from webhook_parser import parse_webhook_request, normalize_tv_payload, format_webhook_log, TV_STRATEGY_VERSION
+from webhook_parser import parse_webhook_request, normalize_tv_payload, format_webhook_log, TV_STRATEGY_VERSION, EXCHANGE_LEVERAGE
+from position_supervisor_deepcoin import DEEPCOIN_SUPERVISOR_VERSION
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] Flask: %(message)s')
 logger = logging.getLogger(__name__)
@@ -53,9 +54,9 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "deepcoin_webhook",
-        "version": "v13.12.0-regime-risk",
+        "version": DEEPCOIN_SUPERVISOR_VERSION,
         "tv_strategy": TV_STRATEGY_VERSION,
-        "leverage": 5,
+        "leverage": EXCHANGE_LEVERAGE,
     }), 200
 
 if __name__ == '__main__':

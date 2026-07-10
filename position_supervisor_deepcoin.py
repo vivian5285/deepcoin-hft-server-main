@@ -23,6 +23,7 @@ from webhook_parser import (
     VPS_RISK_PCT,
     ADD_QTY_RATIO,
     MAX_ADD_TIMES,
+    EXCHANGE_LEVERAGE,
     normalize_entry_type,
     ENTRY_TYPE_OPEN,
     ENTRY_TYPE_PYRAMID,
@@ -42,8 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.15.0-manual-recover-smart"
-EXCHANGE_LEVERAGE = 5  # 交易所实盘固定 5x；TV payload leverage 仅用于比例 sizing
+DEEPCOIN_SUPERVISOR_VERSION = "v13.16.0-leverage-15x"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2

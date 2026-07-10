@@ -19,6 +19,7 @@ from webhook_parser import (
     format_tv_sizing_note,
     VPS_RISK_PCT,
     VPS_REGIME_SCALE,
+    EXCHANGE_LEVERAGE,
     normalize_entry_type,
     ENTRY_TYPE_OPEN,
     ENTRY_TYPE_PYRAMID,
@@ -39,8 +40,8 @@ DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK", "")
 DINGTALK_SECRET = os.getenv("DINGTALK_SECRET", "")
 
 EXCHANGE_LABEL = "深币 Deepcoin"
-LEVERAGE_LABEL = "5x"
-DEFAULT_LEVERAGE = 5
+LEVERAGE_LABEL = "15x"
+DEFAULT_LEVERAGE = EXCHANGE_LEVERAGE
 UNIT_LABEL = "张"
 
 # 深币专属紫色色板（与币安 #F3BA2F 金色完全区分）
