@@ -17,7 +17,7 @@ VPS_REGIME_SCALE = {
     1: 0.55,   # 极弱
     2: 0.75,   # 弱
     3: 0.95,   # 中势
-    4: 1.30,   # 强势
+    4: 1.33,   # 强势（开发清单最终版）
 }
 MAX_RISK_PCT = 4.0
 MIN_RISK_PCT = 0.5
@@ -204,9 +204,11 @@ def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=5,
                          global_scale=None, qty_step=0.001, min_qty=None,
                          face_value=None, max_position=None):
     """
-    首次开仓 OPEN：
-    下单金额 = 本金 × VPS_RISK_PCT% × REGIME_SCALE × GLOBAL_SCALE × leverage
-    基准数量 = 下单金额 / |price - tv_sl|
+    首次开仓 OPEN（开发清单最终版）：
+    保证金 = 本金 × VPS_RISK_PCT% × LEVERAGE × REGIME_SCALE
+    头寸价值 = 保证金 × LEVERAGE
+    张数 = 头寸价值 / price / face_value
+    tv_sl 仅用于挂止损，不参与张数计算。
     """
     principal = float(principal or 0)
     price = float(price or 0)
@@ -215,6 +217,7 @@ def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=5,
     max_position = float(max_position if max_position is not None else MAX_POSITION_SIZE)
 
     effective_risk, risk_meta = compute_vps_effective_risk(regime, global_scale)
+    regime_scale = float(risk_meta.get("regime_scale", 1.0))
     meta = {
         "principal": principal,
         "price": price,
@@ -227,15 +230,18 @@ def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=5,
         meta["error"] = "invalid_inputs"
         return 0.0, meta
 
-    stop_dist = _normalize_stop_dist(price, tv_sl)
-    order_amount = principal * (effective_risk / 100.0) * leverage
-    meta["order_amount"] = round(order_amount, 2)
-    meta["stop_dist"] = round(stop_dist, 2)
-    meta["numerator_usdt"] = round(order_amount, 2)
+    margin = principal * (VPS_RISK_PCT / 100.0) * leverage * regime_scale
+    position_value = margin * leverage
+    meta["margin"] = round(margin, 2)
+    meta["order_amount"] = round(position_value, 2)
+    meta["position_value"] = round(position_value, 2)
+    meta["numerator_usdt"] = round(position_value, 2)
+    if tv_sl and price:
+        meta["stop_dist"] = round(_normalize_stop_dist(price, tv_sl), 2)
 
     if face_value and float(face_value) > 0:
         fv = float(face_value)
-        raw_qty = order_amount / stop_dist / fv
+        raw_qty = position_value / price / fv
         max_qty = (principal * leverage) / (fv * price)
         qty = max(1, int(raw_qty))
         qty = min(qty, max(1, int(max_qty)), int(max_position))
@@ -245,7 +251,7 @@ def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=5,
         meta["capped"] = qty >= int(max_qty)
         return float(qty), meta
 
-    raw_qty = order_amount / stop_dist
+    raw_qty = position_value / price
     max_qty = min((principal * leverage) / price, max_position)
     qty = math.floor(raw_qty / qty_step) * qty_step
     qty = max(min_qty, qty)
@@ -297,7 +303,7 @@ def apply_vps_regime_risk(risk_pct, regime):
 
 def compute_tv_order_qty(principal, risk_pct, leverage, qty_ratio, price, tv_sl,
                          qty_step=0.001, min_qty=0.001, face_value=None, regime=None):
-    """兼容别名 → VPS OPEN（忽略 TV risk_pct）"""
+    """兼容别名 → VPS OPEN（忽略 TV risk_pct / qty_ratio≠1 时仍走 OPEN 公式）"""
     return compute_vps_open_qty(
         principal, price, tv_sl, regime, leverage=leverage,
         qty_step=qty_step, min_qty=min_qty, face_value=face_value,
@@ -318,8 +324,12 @@ def format_vps_sizing_note(meta=None, qty=None, entry_type="OPEN"):
         f"VPS风险={eff:.3f}%",
         f"R{int(meta.get('regime', 3))}×{float(meta.get('regime_scale', 1)):.2f}",
         f"lev={int(round(float(meta.get('leverage', 5))))}x",
-        f"下单额={float(meta.get('order_amount', 0)):.1f}U",
     ]
+    if meta.get("margin"):
+        parts.append(f"保证金={float(meta['margin']):.1f}U")
+    if meta.get("position_value") or meta.get("order_amount"):
+        pv = float(meta.get("position_value") or meta.get("order_amount") or 0)
+        parts.append(f"头寸={pv:.1f}U")
     if qty is not None and float(qty) > 0:
         parts.append(f"qty={float(qty)}")
     if meta.get("base_qty"):
