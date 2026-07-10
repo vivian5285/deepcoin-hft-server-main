@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.18.1-manual-same-dir-recover"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.19.0-radar-breathe"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -73,6 +73,12 @@ SHIELD_FAIL_BACKOFF_MAX_SEC = 300
 SHIELD_QTY_TOLERANCE_PCT = 0.04
 SHIELD_MAX_TIER_ORDERS = 1
 RADAR_DINGTALK_COOLDOWN_SEC = 120
+# TV v6.9.86 雷达呼吸空间（对齐 trailTight / TP2·TP3 trailing，避免 TP1 前被震荡扫出）
+TV_TRAIL_TIGHT = 0.62
+TV_TRAIL_TP2_ATR = TV_TRAIL_TIGHT * 0.32   # ≈0.20 ATR — TP1 成交后
+TV_TRAIL_TP3_ATR = TV_TRAIL_TIGHT * 0.48   # ≈0.30 ATR — TP2 成交后
+TV_BOOT_SL_ATR = 0.40                      # strongBull 保本底线 entry ± 0.4 ATR
+RADAR_FEE_BUFFER_PCT = 0.0015
 # 同向 TV 智能筛选：① ATR 变化 → 先平后开；② 价差低于该百分比 → 不重复开仓，仅刷新 TP123
 SAME_DIR_MIN_SPREAD_PCT = 0.15
 SAME_DIR_DEDUP_SEC = 300
@@ -87,12 +93,12 @@ class PositionSupervisor:
         self.monitoring = False
         self._lock = threading.Lock()
 
-        # 与币安完全一致的四档矩阵：activation=启动雷达的 TP1 距离比例，trail_offset=ATR 追踪倍数
+        # 与币安一致：activation=TP1 后参考进度；trail 距离见 TV_TRAIL_* 常量
         self.regime_settings = {
-            1: {"margin": 0.15, "ratios": [0.25, 0.35, 0.40], "activation": 0.40, "trail_offset": 0.40},
-            2: {"margin": 0.25, "ratios": [0.20, 0.35, 0.45], "activation": 0.50, "trail_offset": 0.60},
-            3: {"margin": 0.35, "ratios": [0.18, 0.32, 0.50], "activation": 0.60, "trail_offset": 0.90},
-            4: {"margin": 0.50, "ratios": [0.05, 0.20, 0.75], "activation": 0.70, "trail_offset": 1.30},
+            1: {"margin": 0.15, "ratios": [0.25, 0.35, 0.40], "activation": 0.92, "trail_offset": TV_TRAIL_TP2_ATR},
+            2: {"margin": 0.25, "ratios": [0.20, 0.35, 0.45], "activation": 0.92, "trail_offset": TV_TRAIL_TP2_ATR},
+            3: {"margin": 0.35, "ratios": [0.18, 0.32, 0.50], "activation": 0.95, "trail_offset": TV_TRAIL_TP3_ATR},
+            4: {"margin": 0.50, "ratios": [0.05, 0.20, 0.75], "activation": 0.95, "trail_offset": TV_TRAIL_TP3_ATR},
         }
         self.leverage = EXCHANGE_LEVERAGE
         self.tv_sizing_leverage = EXCHANGE_LEVERAGE
@@ -2352,7 +2358,9 @@ class PositionSupervisor:
         return n
 
     def _should_disarm_shield_for_favorable(self, curr_px):
-        """雷达达到 TP1 激活比例 → 撤 TV硬止损，交棒移动保本"""
+        """TP1 成交且雷达已激活 → 才撤 tv_sl 交棒移动保本（TP1 前保留宽硬止损）"""
+        if not self._tp_level_consumed(1):
+            return False
         stop_px = self._shield_stop_price()
         has_shield = bool(
             getattr(self, "shield_active", False)
@@ -3110,12 +3118,35 @@ class PositionSupervisor:
         )
         self._radar_activation_notified = True
 
+    def _tp_level_consumed(self, level):
+        return level in (getattr(self, "tp_levels_consumed", []) or [])
+
+    def _radar_tv_trail_atr_mult(self):
+        if self._tp_level_consumed(2):
+            return TV_TRAIL_TP3_ATR
+        if self._tp_level_consumed(1):
+            return TV_TRAIL_TP2_ATR
+        return TV_TRAIL_TP2_ATR
+
+    def _radar_breakeven_floor(self):
+        entry = float(self.watched_entry or 0)
+        if entry <= 0:
+            return 0.0
+        atr = float(self.current_atr or 30.0)
+        cushion = max(atr * TV_BOOT_SL_ATR, entry * RADAR_FEE_BUFFER_PCT)
+        if self.current_side == "LONG":
+            return round(entry + cushion, 2)
+        if self.current_side == "SHORT":
+            return round(entry - cushion, 2)
+        return entry
+
+    def _radar_trail_offset_price(self):
+        return float(self.current_atr or 30.0) * self._radar_tv_trail_atr_mult()
+
     def _refresh_radar_state_on_recover(self, curr_px, entry):
-        """重启：按现价恢复 best_price / 雷达激活 / 追踪止损位"""
+        """重启：按现价恢复 best_price；仅 TP1 已成交才恢复雷达追踪位"""
         if curr_px <= 0 or not entry:
             return
-        fee_buffer = entry * 0.0015
-        trail_offset = self.current_atr * self.regime_settings[self.regime]["trail_offset"]
 
         if self.best_price == 0.0:
             self.best_price = entry
@@ -3124,24 +3155,33 @@ class PositionSupervisor:
         else:
             self.best_price = min(self.best_price, curr_px)
 
+        if not self._tp_level_consumed(1):
+            if self.current_sl == 0.0 and float(getattr(self, "tv_sl", 0) or 0) > 0:
+                self.current_sl = float(self.tv_sl)
+            logger.info(
+                f"📡 重启雷达待命: TP1 未成交，保留 tv_sl 宽止损 "
+                f"(进度 {self._radar_activation_progress(curr_px):.0%})"
+            )
+            return
+
         progress = self._radar_activation_progress(curr_px)
-        if progress >= 1.0:
+        trail_offset = self._radar_trail_offset_price()
+        floor_px = self._radar_breakeven_floor()
+        if progress >= self.regime_settings[self.regime]["activation"]:
             if self.current_side == "LONG":
-                breakeven_floor = entry + fee_buffer
-                trail_sl = max(round(self.best_price - trail_offset, 2), breakeven_floor)
+                trail_sl = max(round(self.best_price - trail_offset, 2), floor_px)
                 if not self._is_radar_active() or trail_sl > self.current_sl:
                     self.current_sl = max(self.current_sl or entry, trail_sl)
             else:
-                breakeven_floor = entry - fee_buffer
-                trail_sl = min(round(self.best_price + trail_offset, 2), breakeven_floor)
+                trail_sl = min(round(self.best_price + trail_offset, 2), floor_px)
                 if not self._is_radar_active() or trail_sl < self.current_sl:
                     self.current_sl = min(self.current_sl or entry, trail_sl)
             logger.info(
-                f"📡 重启雷达恢复: 进度 {progress:.0%} | best={self.best_price:.2f} | "
-                f"SL={self.current_sl:.2f}"
+                f"📡 重启雷达恢复: TP1已成交 进度 {progress:.0%} | best={self.best_price:.2f} | "
+                f"SL={self.current_sl:.2f} | 追踪 {self._radar_tv_trail_atr_mult():.2f}ATR"
             )
         elif self.current_sl == 0.0:
-            self.current_sl = entry
+            self.current_sl = floor_px
 
     def _nuclear_realign_tp(self, live_qty, entry, dynamic_sl=None, rounds=3):
         sl_preserve = dynamic_sl is not None
@@ -3733,22 +3773,14 @@ class PositionSupervisor:
         max_level = max(f["level"] for f in tp_fills)
         tp3 = self.tv_tps[2] if len(self.tv_tps) > 2 else 0.0
         new_sl = self._compute_radar_sl()
-        fee_buffer = self.watched_entry * 0.0015
+        floor_px = self._radar_breakeven_floor()
         if new_sl is not None:
             if self.current_side == "LONG":
-                floor = self.watched_entry + fee_buffer
-                self.current_sl = max(self.current_sl or floor, new_sl, floor)
+                self.current_sl = max(self.current_sl or floor_px, new_sl, floor_px)
             else:
-                ceiling = self.watched_entry - fee_buffer
-                self.current_sl = min(self.current_sl or ceiling, new_sl, ceiling)
+                self.current_sl = min(self.current_sl or floor_px, new_sl, floor_px)
         elif max_level >= 1:
-            if self.current_side == "LONG":
-                self.current_sl = max(self.current_sl or 0, self.watched_entry + fee_buffer)
-            else:
-                self.current_sl = min(
-                    self.current_sl or self.watched_entry,
-                    self.watched_entry - fee_buffer,
-                )
+            self.current_sl = floor_px
         note = f"TP{max_level}成交"
         if max_level >= 2 and tp3 > 0:
             note += f" → 雷达止损向 TP3({tp3:.2f}) 动态收紧"
@@ -4891,10 +4923,12 @@ class PositionSupervisor:
         return self.watched_entry - tp1_dist * activation_ratio
 
     def _should_radar_trail(self, curr_px):
-        """已激活后不再要求现价回到激活线以上，否则回撤时会停止推止损"""
+        """已激活后持续追踪；TP1 未成交前不做移动保本"""
         if self._is_radar_active():
             return True
         if curr_px <= 0 or not self.watched_entry:
+            return False
+        if not self._tp_level_consumed(1):
             return False
         if self.current_side == "LONG":
             return curr_px >= self._radar_activation_price()
@@ -4903,12 +4937,12 @@ class PositionSupervisor:
     def _compute_radar_sl(self):
         if not self.watched_entry or self.best_price <= 0:
             return None
-        trail_offset = self.current_atr * self.regime_settings[self.regime]["trail_offset"]
-        fee_buffer = self.watched_entry * 0.0015
+        trail_offset = self._radar_trail_offset_price()
+        floor_px = self._radar_breakeven_floor()
         if self.current_side == "LONG":
-            return max(round(self.best_price - trail_offset, 2), self.watched_entry + fee_buffer)
+            return max(round(self.best_price - trail_offset, 2), floor_px)
         if self.current_side == "SHORT":
-            return min(round(self.best_price + trail_offset, 2), self.watched_entry - fee_buffer)
+            return min(round(self.best_price + trail_offset, 2), floor_px)
         return None
 
     def _sync_radar_sl_from_best(self, curr_px):
@@ -5000,17 +5034,13 @@ class PositionSupervisor:
             return False
 
         if not self._is_radar_active():
-            fee_buffer = self.watched_entry * 0.0015
+            boot_sl = self._radar_breakeven_floor()
             if self.current_side == "LONG":
-                boot_sl = self._clamp_radar_to_tv_floor(
-                    max(new_sl, self.watched_entry + fee_buffer)
-                )
+                boot_sl = self._clamp_radar_to_tv_floor(max(new_sl or 0, boot_sl))
                 if boot_sl > self.current_sl:
                     self.current_sl = boot_sl
             else:
-                boot_sl = self._clamp_radar_to_tv_floor(
-                    min(new_sl, self.watched_entry - fee_buffer)
-                )
+                boot_sl = self._clamp_radar_to_tv_floor(min(new_sl or boot_sl, boot_sl))
                 if boot_sl < self.current_sl or self.current_sl >= self.watched_entry:
                     self.current_sl = boot_sl
             self._save_state()
