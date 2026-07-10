@@ -15,7 +15,10 @@ from webhook_parser import (
     format_tv_field_sources,
     classify_tv_close,
     close_type_display_label,
+    format_vps_sizing_note,
     format_tv_sizing_note,
+    VPS_RISK_PCT,
+    VPS_REGIME_SCALE,
     normalize_entry_type,
     ENTRY_TYPE_OPEN,
     ENTRY_TYPE_PYRAMID,
@@ -153,33 +156,61 @@ def _format_tp_audit(audit, tv_tps=None):
     return "".join(lines) or "暂无有效 TP 审计"
 
 
+def _format_vps_sizing_basis(principal, meta=None, leverage=None):
+    """VPS OPEN 仓位预算公式 — 管理员一眼看懂"""
+    meta = meta or {}
+    eff = float(meta.get("effective_risk_pct", VPS_RISK_PCT) or VPS_RISK_PCT)
+    regime = int(meta.get("regime", 3) or 3)
+    scale = float(meta.get("regime_scale", VPS_REGIME_SCALE.get(regime, 0.95)) or 0.95)
+    order_amount = float(meta.get("order_amount", 0) or 0)
+    lev = leverage or meta.get("leverage") or DEFAULT_LEVERAGE
+    stop_dist = float(meta.get("stop_dist", 0) or 0)
+    lines = [
+        f"本金快照 **{float(principal):.2f}** USDT × VPS风险 **{eff:.3f}%** "
+        f"(R{regime}×{scale:.2f}) × **{lev}x** 杠杆",
+    ]
+    if order_amount > 0:
+        lines.append(f"→ 下单金额 **{order_amount:.2f}** USDT")
+    if stop_dist > 0:
+        lines.append(f"÷ 止损距离 **{stop_dist:.2f}** → 基准张数")
+    return "\n".join(lines)
+
+
 def _format_sizing_basis(principal, margin_pct, leverage, margin_usdt=None):
+    """兼容旧调用 — 实为 VPS 有效风险%"""
     if margin_usdt is None:
         margin_usdt = float(principal or 0) * float(margin_pct or 0)
     return (
-        f"本金快照 **{float(principal):.2f}** USDT × 档位保证金 **{margin_pct:.0%}** "
-        f"= **{margin_usdt:.2f}** USDT × **{leverage}x** 杠杆"
+        f"本金快照 **{float(principal):.2f}** USDT × VPS有效风险 **{float(margin_pct or 0):.1%}** "
+        f"× **{leverage}x** 杠杆 = **{margin_usdt:.2f}** USDT 下单额"
     )
 
 
 def report_principal_snapshot(reason, principal, regime=None, margin_pct=None, target_qty=None,
-                              leverage=None, verify_note=""):
+                              leverage=None, verify_note="", vps_sizing_meta=None):
     lev = leverage or LEVERAGE_LABEL.replace("x", "")
+    meta = vps_sizing_meta or {}
     data = {
         "📸 快照时机": _p(reason or "本金重置", P_MAIN),
         "💰 合约本金": _p(f"**{float(principal):.2f}** USDT（cashBal，非可用保证金）", P_ACCENT),
         "📌 口径说明": _p(
-            "仅用 USDT 合约本金余额 × TV 档位% × 杠杆计算仓位；"
-            "禁止用 availBal / 剩余保证金",
+            "VPS 自主风控：本金 × VPS_RISK_PCT% × REGIME_SCALE × GLOBAL_SCALE × 杠杆 ÷ |price-tv_sl|；"
+            "完全忽略 TV risk_pct；禁止用 availBal / 剩余保证金",
             P_MUTED,
         ),
     }
     if regime and margin_pct is not None:
         data["🔢 TV 档位"] = get_regime_name(int(regime))
-        data["📐 预算公式"] = _p(
-            _format_sizing_basis(principal, margin_pct, f"{lev}x"),
-            P_LIGHT,
-        )
+        if meta:
+            data["📐 预算公式"] = _p(
+                _format_vps_sizing_basis(principal, meta=meta, leverage=f"{lev}x"),
+                P_LIGHT,
+            )
+        else:
+            data["📐 预算公式"] = _p(
+                _format_sizing_basis(principal, margin_pct, f"{lev}x"),
+                P_LIGHT,
+            )
     if target_qty is not None and float(target_qty) > 0:
         data["🎯 目标仓位"] = _p(f"**{target_qty}** {UNIT_LABEL}", P_MAIN)
     if verify_note:
@@ -190,7 +221,7 @@ def report_principal_snapshot(reason, principal, regime=None, margin_pct=None, t
 def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime, tv_tps=None,
                            verify_note="", tp_audit=None, verified=True,
                            principal_balance=None, margin_pct=None, margin_usdt=None, leverage=None,
-                           tv_field_sources=None):
+                           tv_field_sources=None, vps_sizing_meta=None):
     side_str = _p("🟣 开多 (LONG)", P_LIGHT) if side == "LONG" else _p("🟪 开空 (SHORT)", P_DEEP)
     slip_txt = (
         f"{(entry_price - tv_price if side == 'LONG' else tv_price - entry_price):+.2f} 刀"
@@ -216,10 +247,17 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
         ),
     }
     if principal_balance and margin_pct is not None:
-        data["📐 仓位预算"] = _p(
-            _format_sizing_basis(principal_balance, margin_pct, lev, margin_usdt),
-            P_LIGHT,
-        )
+        if vps_sizing_meta:
+            data["📐 仓位预算"] = _p(
+                _format_vps_sizing_basis(principal_balance, meta=vps_sizing_meta, leverage=lev),
+                P_LIGHT,
+            )
+            data["📐 VPS参数"] = _p(format_vps_sizing_note(vps_sizing_meta, qty=qty), P_MUTED)
+        else:
+            data["📐 仓位预算"] = _p(
+                _format_sizing_basis(principal_balance, margin_pct, lev, margin_usdt),
+                P_LIGHT,
+            )
     if verify_note:
         data["🔍 核查明细"] = _p(verify_note, P_MUTED)
     send_alert("🖨️ 战神出击：深币大级别主阵地建立", data)
@@ -604,7 +642,7 @@ def report_radar_regime_cap_trim(side, old_qty, new_qty, target_qty, regime, mar
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "📊 TV 档位上限": _p(
-            f"**R{regime}** 档 · 保证金比例 **{margin_pct:.0%}** · 允许持仓 **{target_qty}** {UNIT_LABEL}",
+            f"**R{regime}** 档 · VPS有效风险 **{margin_pct:.1%}** · 允许持仓 **{target_qty}** {UNIT_LABEL}",
             P_ACCENT,
         ),
         "📐 核算公式": _p(
@@ -726,8 +764,8 @@ def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
 
 def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entry, new_entry,
                            tv_sl=0, risk_pct=0, leverage=None, qty_ratio=1.0,
-                           verify_note="", verified=True):
-    """v6.9.85 PYRAMID / PROFIT_ADD 加仓核实成功"""
+                           verify_note="", verified=True, base_qty=0, vps_sizing_meta=None):
+    """PYRAMID / PROFIT_ADD 加仓核实成功 — base_qty × qty_ratio"""
     type_label = {
         ENTRY_TYPE_PYRAMID: "金字塔加仓 PYRAMID",
         ENTRY_TYPE_PROFIT_ADD: "浮盈加仓 PROFIT_ADD",
@@ -746,8 +784,12 @@ def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entr
             P_MUTED,
         ),
         "📡 TV底线 tv_sl": _p(f"**{float(tv_sl or 0):.2f}** USDT", P_ACCENT),
-        "📐 比例参数": _p(
-            format_tv_sizing_note(risk_pct, lev, qty_ratio),
+        "📐 加仓公式": _p(
+            format_vps_sizing_note(
+                vps_sizing_meta or {"base_qty": base_qty, "qty_ratio": qty_ratio, "sizing_mode": "VPS_ADD"},
+                qty=add_qty,
+                entry_type=entry_type,
+            ),
             P_MUTED,
         ),
         "✅ 风控动作": _p("只追加仓位 + 更新硬止损 · TP123 保持不变", P_MAIN),

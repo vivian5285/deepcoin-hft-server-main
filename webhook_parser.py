@@ -10,14 +10,23 @@ logger = logging.getLogger(__name__)
 
 TV_STRATEGY_VERSION = "v6.9.85"
 
-# VPS 档位风险系数：最终 risk = min(TV risk_pct × 系数, MAX_RISK_PCT_LIMIT)
-VPS_REGIME_RISK_MULTIPLIERS = {
-    1: 1.0,   # 极弱
-    2: 1.0,   # 弱
-    3: 1.1,   # 中势
-    4: 1.25,  # 强势
+# VPS 自主风控（与 TV risk_pct 完全脱钩）
+VPS_RISK_PCT = 3.0
+VPS_GLOBAL_SCALE = 1.0
+VPS_REGIME_SCALE = {
+    1: 0.55,   # 极弱
+    2: 0.75,   # 弱
+    3: 0.95,   # 中势
+    4: 1.30,   # 强势
 }
-MAX_RISK_PCT_LIMIT = 4.0
+MAX_RISK_PCT = 4.0
+MIN_RISK_PCT = 0.5
+MAX_POSITION_SIZE = 9999.0
+MIN_QTY_DEFAULT = 0.001
+
+# 兼容旧引用
+MAX_RISK_PCT_LIMIT = MAX_RISK_PCT
+VPS_REGIME_RISK_MULTIPLIERS = VPS_REGIME_SCALE
 
 ENTRY_TYPE_OPEN = "OPEN"
 ENTRY_TYPE_PYRAMID = "PYRAMID"
@@ -157,108 +166,173 @@ def normalize_entry_type(val, default=ENTRY_TYPE_OPEN):
     return default
 
 
-def apply_vps_regime_risk(risk_pct, regime):
-    """TV risk_pct × VPS 档位系数，上限 MAX_RISK_PCT_LIMIT"""
+def compute_vps_effective_risk(regime, global_scale=None):
+    """VPS 有效风险% = clamp(VPS_RISK_PCT × REGIME_SCALE × GLOBAL_SCALE)"""
     regime = int(regime or 3)
-    if regime not in VPS_REGIME_RISK_MULTIPLIERS:
-        regime = 3
-    tv_risk = float(risk_pct or 0)
-    mult = VPS_REGIME_RISK_MULTIPLIERS[regime]
-    adjusted = tv_risk * mult
-    capped = adjusted > MAX_RISK_PCT_LIMIT
-    final = min(adjusted, MAX_RISK_PCT_LIMIT)
+    regime_scale = float(VPS_REGIME_SCALE.get(regime, VPS_REGIME_SCALE.get(3, 0.95)))
+    gs = float(global_scale if global_scale is not None else VPS_GLOBAL_SCALE)
+    raw = VPS_RISK_PCT * regime_scale * gs
+    capped = raw > MAX_RISK_PCT
+    final = min(max(raw, MIN_RISK_PCT), MAX_RISK_PCT)
     return final, {
-        "tv_risk_pct_raw": tv_risk,
         "regime": regime,
-        "vps_regime_multiplier": mult,
-        "adjusted_risk_pct": round(adjusted, 4),
-        "final_risk_pct": round(final, 4),
+        "vps_risk_pct": VPS_RISK_PCT,
+        "regime_scale": regime_scale,
+        "global_scale": gs,
+        "effective_risk_pct": round(final, 4),
+        "raw_risk_pct": round(raw, 4),
         "risk_capped": capped,
     }
 
 
-def compute_tv_order_qty(principal, risk_pct, leverage, qty_ratio, price, tv_sl,
-                         qty_step=0.001, min_qty=0.001, face_value=None, regime=None):
-    """
-    v6.9.85 比例下单（VPS 档位系数调控）：
-    effective_risk = min(TV risk_pct × VPS系数[regime], MAX_RISK_PCT_LIMIT)
-    qty = (本金 × effective_risk% × leverage × qty_ratio) / |price - tv_sl|
-    """
-    principal = float(principal or 0)
-    risk_pct = float(risk_pct or 0)
-    leverage = float(leverage or 1)
-    qty_ratio = float(qty_ratio if qty_ratio is not None else 1.0)
+def _normalize_stop_dist(price, tv_sl):
     price = float(price or 0)
     tv_sl = float(tv_sl or 0)
-
-    risk_meta = {}
-    if regime is not None and int(regime or 0) > 0:
-        risk_pct, risk_meta = apply_vps_regime_risk(risk_pct, regime)
-
-    meta = {
-        "principal": principal,
-        "risk_pct": risk_pct,
-        "leverage": leverage,
-        "qty_ratio": qty_ratio,
-        "price": price,
-        "tv_sl": tv_sl,
-        **risk_meta,
-    }
-    if principal <= 0 or price <= 0 or risk_pct <= 0 or leverage <= 0:
-        meta["error"] = "invalid_inputs"
-        return 0.0, meta
-
     stop_dist = abs(price - tv_sl)
     if stop_dist <= 0:
         stop_dist = max(price * 0.001, 0.01)
     elif stop_dist < price * 0.0005:
         stop_dist = max(price * 0.001, 0.01)
+    return stop_dist
 
-    risk_factor = risk_pct / 100.0 if risk_pct > 1 else risk_pct
-    numerator = principal * risk_factor * leverage * max(qty_ratio, 0.01)
-    meta["numerator_usdt"] = round(numerator, 2)
+
+def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=5,
+                         global_scale=None, qty_step=0.001, min_qty=None,
+                         face_value=None, max_position=None):
+    """
+    首次开仓 OPEN：
+    下单金额 = 本金 × VPS_RISK_PCT% × REGIME_SCALE × GLOBAL_SCALE × leverage
+    基准数量 = 下单金额 / |price - tv_sl|
+    """
+    principal = float(principal or 0)
+    price = float(price or 0)
+    leverage = float(leverage or 1)
+    min_qty = float(min_qty if min_qty is not None else MIN_QTY_DEFAULT)
+    max_position = float(max_position if max_position is not None else MAX_POSITION_SIZE)
+
+    effective_risk, risk_meta = compute_vps_effective_risk(regime, global_scale)
+    meta = {
+        "principal": principal,
+        "price": price,
+        "tv_sl": float(tv_sl or 0),
+        "leverage": leverage,
+        "sizing_mode": "VPS_OPEN",
+        **risk_meta,
+    }
+    if principal <= 0 or price <= 0 or leverage <= 0:
+        meta["error"] = "invalid_inputs"
+        return 0.0, meta
+
+    stop_dist = _normalize_stop_dist(price, tv_sl)
+    order_amount = principal * (effective_risk / 100.0) * leverage
+    meta["order_amount"] = round(order_amount, 2)
     meta["stop_dist"] = round(stop_dist, 2)
+    meta["numerator_usdt"] = round(order_amount, 2)
 
     if face_value and float(face_value) > 0:
         fv = float(face_value)
-        raw_qty = numerator / stop_dist / fv
+        raw_qty = order_amount / stop_dist / fv
         max_qty = (principal * leverage) / (fv * price)
         qty = max(1, int(raw_qty))
-        qty = min(qty, max(1, int(max_qty)))
+        qty = min(qty, max(1, int(max_qty)), int(max_position))
         meta["max_qty"] = int(max_qty)
+        meta["raw_qty"] = round(raw_qty, 4)
+        meta["base_qty"] = float(qty)
         meta["capped"] = qty >= int(max_qty)
         return float(qty), meta
 
-    raw_qty = numerator / stop_dist
-    max_qty = (principal * leverage) / price
+    raw_qty = order_amount / stop_dist
+    max_qty = min((principal * leverage) / price, max_position)
     qty = math.floor(raw_qty / qty_step) * qty_step
     qty = max(min_qty, qty)
     qty = min(qty, math.floor(max_qty / qty_step) * qty_step)
     qty = round(qty, 3)
     meta["max_qty"] = round(max_qty, 3)
     meta["raw_qty"] = round(raw_qty, 4)
+    meta["base_qty"] = qty
     meta["capped"] = qty >= round(max_qty, 3) - qty_step
     return qty, meta
 
 
-def format_tv_sizing_note(risk_pct, leverage, qty_ratio, principal=None, qty=None,
-                          regime=None, final_risk_pct=None):
-    tv_raw = float(risk_pct or 0)
-    if final_risk_pct is None and regime is not None and int(regime or 0) > 0:
-        final_risk_pct, _ = apply_vps_regime_risk(tv_raw, regime)
-    eff = float(final_risk_pct if final_risk_pct is not None else tv_raw)
-    if final_risk_pct is not None and abs(eff - tv_raw) > 0.0005:
-        parts = [
-            f"risk={eff:.3f}% (TV {tv_raw:.2f}%×R{int(regime or 0)})",
-            f"lev={int(round(float(leverage or 1)))}x",
-            f"ratio={float(qty_ratio or 1):.2f}",
-        ]
-    else:
-        parts = [
-            f"risk={eff:.2f}%",
-            f"lev={int(round(float(leverage or 1)))}x",
-            f"ratio={float(qty_ratio or 1):.2f}",
-        ]
+def compute_vps_add_qty(base_qty, qty_ratio, qty_step=0.001, min_qty=None,
+                        face_value=None, max_position=None):
+    """加仓 PYRAMID/PROFIT_ADD：add_qty = base_qty × qty_ratio"""
+    base_qty = float(base_qty or 0)
+    qty_ratio = float(qty_ratio if qty_ratio is not None else 0.5)
+    min_qty = float(min_qty if min_qty is not None else MIN_QTY_DEFAULT)
+    max_position = float(max_position if max_position is not None else MAX_POSITION_SIZE)
+    meta = {
+        "base_qty": base_qty,
+        "qty_ratio": qty_ratio,
+        "sizing_mode": "VPS_ADD",
+    }
+    if base_qty <= 0 or qty_ratio <= 0:
+        meta["error"] = "invalid_base_or_ratio"
+        return 0.0, meta
+
+    raw = base_qty * qty_ratio
+    if face_value and float(face_value) > 0:
+        qty = max(1, int(raw))
+        qty = min(qty, int(max_position))
+        meta["raw_qty"] = round(raw, 4)
+        return float(qty), meta
+
+    qty = math.floor(raw / qty_step) * qty_step
+    qty = max(min_qty, qty)
+    qty = min(qty, math.floor(max_position / qty_step) * qty_step)
+    qty = round(qty, 3)
+    meta["raw_qty"] = round(raw, 4)
+    return qty, meta
+
+
+def apply_vps_regime_risk(risk_pct, regime):
+    """兼容旧调用：转为 VPS 自主 effective_risk"""
+    return compute_vps_effective_risk(regime)
+
+
+def compute_tv_order_qty(principal, risk_pct, leverage, qty_ratio, price, tv_sl,
+                         qty_step=0.001, min_qty=0.001, face_value=None, regime=None):
+    """兼容别名 → VPS OPEN（忽略 TV risk_pct）"""
+    return compute_vps_open_qty(
+        principal, price, tv_sl, regime, leverage=leverage,
+        qty_step=qty_step, min_qty=min_qty, face_value=face_value,
+    )
+
+
+def format_vps_sizing_note(meta=None, qty=None, entry_type="OPEN"):
+    meta = meta or {}
+    mode = meta.get("sizing_mode", "VPS_OPEN")
+    if mode == "VPS_ADD":
+        return (
+            f"base={float(meta.get('base_qty', 0)):.3f} "
+            f"× ratio={float(meta.get('qty_ratio', 0)):.2f} "
+            f"→ add={float(qty or meta.get('raw_qty', 0)):.3f}"
+        )
+    eff = float(meta.get("effective_risk_pct", VPS_RISK_PCT))
+    parts = [
+        f"VPS风险={eff:.3f}%",
+        f"R{int(meta.get('regime', 3))}×{float(meta.get('regime_scale', 1)):.2f}",
+        f"lev={int(round(float(meta.get('leverage', 5))))}x",
+        f"下单额={float(meta.get('order_amount', 0)):.1f}U",
+    ]
+    if qty is not None and float(qty) > 0:
+        parts.append(f"qty={float(qty)}")
+    if meta.get("base_qty"):
+        parts.append(f"base={float(meta['base_qty'])}")
+    return " · ".join(parts)
+
+
+def format_tv_sizing_note(risk_pct=None, leverage=None, qty_ratio=None, principal=None, qty=None,
+                          regime=None, final_risk_pct=None, meta=None, entry_type="OPEN"):
+    if meta:
+        return format_vps_sizing_note(meta, qty=qty, entry_type=entry_type)
+    eff_meta, _ = compute_vps_effective_risk(regime or 3)
+    parts = [
+        f"VPS风险={eff_meta:.3f}%",
+        f"lev={int(round(float(leverage or 5)))}x",
+    ]
+    if qty_ratio is not None:
+        parts.append(f"ratio={float(qty_ratio):.2f}")
     if principal and principal > 0:
         parts.append(f"本金={float(principal):.0f}U")
     if qty is not None and float(qty) > 0:
