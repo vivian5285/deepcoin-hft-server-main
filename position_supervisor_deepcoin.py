@@ -35,7 +35,11 @@ from webhook_parser import (
 
 if not os.path.exists('logs'):
     os.makedirs('logs')
-handler = RotatingFileHandler('logs/deepcoin_brain.log', maxBytes=5 * 1024 * 1024, backupCount=3)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOG_DIR = os.path.join(_BASE_DIR, 'logs')
+os.makedirs(_LOG_DIR, exist_ok=True)
+_BRAIN_LOG = os.path.join(_LOG_DIR, 'deepcoin_brain.log')
+handler = RotatingFileHandler(_BRAIN_LOG, maxBytes=5 * 1024 * 1024, backupCount=3)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] Brain: %(message)s',
@@ -43,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.21.0-false-flat-guard"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.22.0-trusted-initial-tp123"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -162,7 +166,7 @@ class PositionSupervisor:
         self.add_count = 0
         self._last_idle_takeover_ts = 0.0
 
-        self.state_file = 'deepcoin_vps_state.json'
+        self.state_file = os.path.join(_BASE_DIR, 'deepcoin_vps_state.json')
         logger.info(
             f"🧠 深币 VPS [{DEEPCOIN_SUPERVISOR_VERSION}/{CLIENT_VERSION}] "
             f"军师托管版已加载：双轨智慧雷达 · {self.leverage}x 杠杆"
@@ -286,7 +290,7 @@ class PositionSupervisor:
 
         pos_ctx = {"side": side, "size": real_amt, "entry_price": float(pos.get("entry_price", 0))}
         reconcile_notes = self._hydrate_tv_defense_context(pos_ctx)
-        saved_initial = self._resolve_open_initial_qty(real_amt)
+        saved_initial = self._resolve_open_initial_qty(real_amt, self.watched_entry)
         if saved_initial <= 0:
             saved_initial = real_amt
         if self.base_qty <= 0:
@@ -977,14 +981,26 @@ class PositionSupervisor:
             self._reset_fresh_takeover_state()
 
         self._reconcile_stale_tp_consumed(
-            self.initial_qty or live_qty, live_qty, curr_px,
+            self._trusted_initial_qty(live_qty, entry), live_qty, curr_px,
         )
-        self._sanitize_tp_consumed(self.initial_qty or live_qty, live_qty, curr_px)
+        trusted_initial = self._trusted_initial_qty(live_qty, entry)
+        if self._safe_qty(self.initial_qty) != trusted_initial:
+            self.initial_qty = trusted_initial
+        self._sanitize_tp_consumed(trusted_initial, live_qty, curr_px)
         if not self._ensure_tp123_prices_from_tv(entry):
             notes.append("TP123补全失败")
         if float(getattr(self, "tv_sl", 0) or 0) <= 0:
             pos_ctx = {"side": self.current_side, "size": live_qty, "entry_price": entry}
             self._hydrate_tv_defense_context(pos_ctx)
+        if float(getattr(self, "tv_sl", 0) or 0) <= 0 and entry > 0:
+            atr = float(getattr(self, "open_atr", None) or self.current_atr or 30)
+            if self.current_side == "LONG":
+                self.tv_sl = round(entry - atr * TV_BOOT_SL_ATR, 2)
+            elif self.current_side == "SHORT":
+                self.tv_sl = round(entry + atr * TV_BOOT_SL_ATR, 2)
+            if float(getattr(self, "tv_sl", 0) or 0) > 0:
+                notes.append(f"boot tv_sl={self.tv_sl:.2f}")
+                self._save_state()
 
         try:
             cap = self._radar_enforce_regime_cap(live_qty, curr_px, force=True)
@@ -999,7 +1015,7 @@ class PositionSupervisor:
         tp_repair = {"repaired": False}
         try:
             tp_repair = self._repair_partial_tp_on_recover(
-                live_qty, entry, self.initial_qty or live_qty, curr_px,
+                live_qty, entry, trusted_initial, curr_px,
             )
             if tp_repair.get("repaired"):
                 notes.extend(tp_repair.get("actions") or [])
@@ -1160,11 +1176,34 @@ class PositionSupervisor:
         if saved_watched <= 0 and real_amt > 0:
             reconcile["manual_open"] = True
             self.initial_qty = real_amt
+            self.tp_levels_consumed = []
             if int(getattr(self, "base_qty", 0) or 0) <= 0:
                 self.base_qty = int(real_amt)
             notes.append(
                 f"人工开仓(重启): 账本空仓 → 实盘 {real_amt}张 {side}，已接管为基准仓"
             )
+        elif saved_watched > 0 and real_amt > 0:
+            entry_px = float(pos.get("entry_price", 0) or 0)
+            je = float(last_open.get("entry", 0) or 0) if last_open else 0.0
+            entry_tol = max(3.0, entry_px * 0.003) if entry_px > 0 else 3.0
+            if last_open and je > 0 and entry_px > 0 and abs(entry_px - je) > entry_tol:
+                reconcile["manual_open"] = True
+                self.initial_qty = real_amt
+                self.tp_levels_consumed = []
+                self.base_qty = int(real_amt)
+                notes.append(
+                    f"人工新开(入场偏差): 日志 {je:.2f} vs 实盘 {entry_px:.2f} → 重置 TP123"
+                )
+            elif saved_initial > real_amt:
+                trusted = self._trusted_initial_qty(real_amt, entry_px)
+                if trusted <= real_amt:
+                    reconcile["manual_open"] = True
+                    self.initial_qty = real_amt
+                    self.tp_levels_consumed = []
+                    notes.append(
+                        f"人工/重置(重启): 陈旧 initial={saved_initial} > 现仓 {real_amt}张 "
+                        f"但无日志锚定 → 全链 TP123"
+                    )
 
         if saved_watched > 0 and self._is_material_qty_change(saved_watched, real_amt):
             action_msg = (
@@ -1193,22 +1232,36 @@ class PositionSupervisor:
             logger.warning(f"🔎 重启对账: {n}")
         return reconcile
 
-    def _resolve_open_initial_qty(self, live_qty):
-        """开单原始张数：state initial_qty 优先，否则开仓日志"""
+    def _trusted_initial_qty(self, live_qty, entry=None):
         live_qty = self._safe_qty(live_qty)
-        saved = self._safe_qty(self.initial_qty)
-        if saved > live_qty:
-            return saved
+        entry = float(entry or self.watched_entry or 0)
         last_open = self._load_last_journal_entry(OPEN_JOURNAL)
         if last_open:
             jq = self._safe_qty(last_open.get("qty", 0))
-            if jq > live_qty:
-                logger.info(
-                    f"📖 开单张数取自开仓日志 {jq} 张 "
-                    f"(state initial={saved}, 现仓 {live_qty}张)"
-                )
+            je = float(last_open.get("entry", 0) or 0)
+            entry_tol = max(3.0, entry * 0.003) if entry > 0 else 3.0
+            if jq > 0 and (entry <= 0 or je <= 0 or abs(entry - je) <= entry_tol):
                 return jq
-        return saved if saved > 0 else live_qty
+        saved = self._safe_qty(self.initial_qty)
+        if 0 < saved <= live_qty:
+            return max(saved, live_qty)
+        return live_qty if live_qty > 0 else saved
+
+    def _resolve_open_initial_qty(self, live_qty, entry=None):
+        live_qty = self._safe_qty(live_qty)
+        trusted = self._trusted_initial_qty(live_qty, entry)
+        saved = self._safe_qty(self.initial_qty)
+        if saved > live_qty and trusted <= live_qty:
+            logger.warning(
+                f"📖 丢弃陈旧 initial_qty={saved}张 → 锚定 {trusted}张 "
+                f"(现仓 {live_qty}张，无日志锚定减仓证据)"
+            )
+            self.initial_qty = trusted
+            self.tp_levels_consumed = []
+            self._save_state()
+        elif trusted > live_qty:
+            self.initial_qty = trusted
+        return trusted if trusted > 0 else live_qty
 
     def _qty_change_ratio(self, old_qty, new_qty):
         old = float(old_qty or 0)
@@ -3429,6 +3482,13 @@ class PositionSupervisor:
         expected = audit.get("expected", 0)
         if expected <= 0:
             return True
+        tp_prices = sum(1 for t in (self.tv_tps or []) if t > 0)
+        if (
+            tp_prices >= 3
+            and not self._tp_level_consumed(1)
+            and expected < 3
+        ):
+            return False
         return (
             audit.get("matched_full", 0) >= expected
             and not audit.get("orphans")
@@ -5683,7 +5743,7 @@ class PositionSupervisor:
                     align_notes = self._apply_recover_live_alignment(side, reconcile)
                     reconcile_notes.extend(align_notes)
 
-                    saved_initial = self._resolve_open_initial_qty(real_amt)
+                    saved_initial = self._resolve_open_initial_qty(real_amt, self.watched_entry)
                     if saved_initial <= 0:
                         saved_initial = real_amt
                     if self.base_qty <= 0:

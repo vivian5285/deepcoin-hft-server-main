@@ -6,7 +6,7 @@
 
 set -uo pipefail
 
-DEPLOY_SCRIPT_VERSION="v13.21-deploy-audit"
+DEPLOY_SCRIPT_VERSION="v13.22-deploy-audit"
 # 接受 v13.4.6+、v13.5~9、v13.10+（含 -tv-pure-sl 等后缀标签）
 MIN_SUPERVISOR_VERSION_RE='v13\.(4\.[6-9]|(?:[5-9]|[1-9][0-9]+)\.)'
 
@@ -241,6 +241,9 @@ install_deps() {
 start_service() {
     log_step "[3/6] 启动 Gunicorn 网关 (workers=${WORKERS}, threads=${THREADS})..."
     mkdir -p "$LOG_DIR"
+    touch "$BRAIN_LOG" 2>/dev/null || true
+    chmod 664 "$BRAIN_LOG" 2>/dev/null || true
+    chmod 775 "$LOG_DIR" 2>/dev/null || true
     : > "$LOG_FILE"
 
     nohup gunicorn \
