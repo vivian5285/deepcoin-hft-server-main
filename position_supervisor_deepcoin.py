@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.25.0-dynamic-add"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.26.0-add-tp-radar-realign"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -5030,8 +5030,78 @@ class PositionSupervisor:
             curr_px=curr_px,
         )
 
+    def _realign_after_position_add(self, new_qty, new_entry, curr_px, entry_type):
+        """
+        加仓成功后：按 TV TP123 价格 + 新总头寸重挂止盈，并同步 tv_sl / 雷达。
+        加仓必撤旧 TP（数量已过期），再按 open_regime 比例重算剩余档位。
+        """
+        self._ensure_tp123_prices_from_tv(new_entry)
+        tp_txt = "/".join(
+            f"{float(p):.0f}" for p in (self.tv_tps or []) if float(p or 0) > 0
+        ) or "—"
+        ratios = self.regime_settings[self._tp_split_regime()]["ratios"]
+        consumed = list(getattr(self, "tp_levels_consumed", []) or [])
+
+        sl_to_pass = None
+        radar_note = "雷达待命(TP1前)"
+        if self._tp1_filled_verified(new_qty, curr_px):
+            self._refresh_radar_state_on_recover(curr_px, new_entry)
+            sl_to_pass = self._radar_sl_to_pass()
+            radar_note = (
+                f"雷达已激活 SL={sl_to_pass:.2f}"
+                if sl_to_pass else "雷达跟进中"
+            )
+
+        logger.info(
+            f"🕸️ [{entry_type}] 加仓后防线重挂 | 新仓 {new_qty} 张 @ {new_entry:.2f} "
+            f"| TV TP={tp_txt} | R{self._tp_split_regime()} 比例 {ratios} "
+            f"| 已成交档 {consumed or '无'}"
+        )
+        self._cancel_all_tp_limit_orders()
+        time.sleep(0.45)
+
+        result = self._enforce_defense_alignment(
+            new_qty, new_entry,
+            dynamic_sl=sl_to_pass,
+            reason=f"{entry_type}加仓后TP123重挂",
+            rounds=4,
+        )
+        audit = result.get("audit") or self._audit_tp_levels(new_qty)
+        if not self._tp_audit_ok(audit):
+            logger.warning(
+                f"⚠️ [{entry_type}] 加仓后 TP 未齐 → 核武重挂 | "
+                f"{self._format_audit_summary(audit)}"
+            )
+            audit = self._nuclear_realign_tp(
+                new_qty, new_entry, dynamic_sl=sl_to_pass, rounds=3,
+            )
+            result["audit"] = audit
+
+        shield_ok = self._maintain_hard_shield(
+            new_qty, curr_px, force=True, radar_sl=sl_to_pass,
+        )
+        if self._tp1_filled_verified(new_qty, curr_px):
+            self._process_radar_trailing(new_qty, curr_px)
+            sl = self._radar_sl_to_pass()
+            if sl:
+                shield_ok = self._maintain_hard_shield(
+                    new_qty, curr_px, force=True, radar_sl=sl,
+                ) or shield_ok
+                radar_note = f"雷达推升 SL={sl:.2f}"
+
+        self.shield_sized_qty = float(new_qty)
+        self._save_state()
+        return {
+            "shield_ok": shield_ok,
+            "audit": audit,
+            "radar_note": radar_note,
+            "tp_prices": tp_txt,
+            "ratios": ratios,
+            "result": result,
+        }
+
     def _add_to_position(self, action, payload):
-        """PYRAMID / PROFIT_ADD：base_qty × TV qty_ratio 追加，只更新 tv_sl，不改 TP123"""
+        """PYRAMID / PROFIT_ADD：base_qty × TV qty_ratio 追加，并重挂 TP123 + 同步雷达"""
         entry_type = normalize_entry_type(payload.get("entry_type"))
         max_add = self._max_add_times_for_regime()
         tv_ratio = float(getattr(self, "tv_qty_ratio", 0) or 0)
@@ -5111,17 +5181,26 @@ class PositionSupervisor:
         self.monitoring = True
         self._save_state()
 
-        sl_ok = self._maintain_hard_shield(new_qty, curr_px, force=True)
+        realign = self._realign_after_position_add(
+            new_qty, new_entry, curr_px, entry_type,
+        )
+        sl_ok = realign.get("shield_ok", False)
+        audit = realign.get("audit") or {}
         self.add_count = int(getattr(self, "add_count", 0) or 0) + 1
         self._save_state()
         type_label = "浮盈加仓" if entry_type == ENTRY_TYPE_PROFIT_ADD else "金字塔加仓"
+        tp_summary = self._format_audit_summary(audit)
         verify_note = (
             f"{type_label} | {self._tv_sizing_note(add_qty, meta, entry_type=entry_type)} "
             f"| base={getattr(self, 'base_qty', 0)} "
             f"| 加仓次数 {self.add_count}/{max_add} "
             f"| 持仓 {old_qty}→{new_qty} 张 @ {new_entry:.2f} "
+            f"| TV TP={realign.get('tp_prices', '—')} "
+            f"| TP {audit.get('matched_full', 0)}/{audit.get('expected', 0)} "
+            f"| {tp_summary} "
+            f"| {realign.get('radar_note', '')} "
             f"| tv_sl={getattr(self, 'tv_sl', 0):.2f} "
-            f"| {'止损已核实' if sl_ok else '止损待核实'}"
+            f"| {'防线已核实' if sl_ok and self._tp_audit_ok(audit) else '防线待核实'}"
         )
         self._call_dingtalk(
             dingtalk.report_tv_position_add,
@@ -5141,13 +5220,15 @@ class PositionSupervisor:
             add_count=self.add_count,
             max_add_times=max_add,
             regime=self.regime,
+            tp_audit=tp_summary,
+            radar_note=realign.get("radar_note", ""),
             verify_note=verify_note,
-            verified=sl_ok,
+            verified=sl_ok and self._tp_audit_ok(audit),
         )
         self._ensure_sentinel_running()
 
     def _handle_smart_entry(self, action, payload=None):
-        """VPS sizing：OPEN 先平后开；PYRAMID/PROFIT_ADD 只追加；未标 entry_type 走智能筛选"""
+        """VPS sizing：OPEN 先平后开；PYRAMID/PROFIT_ADD 追加并重挂 TP123+雷达"""
         payload = payload or {}
         entry_type = normalize_entry_type(payload.get("entry_type"))
 

@@ -1,6 +1,6 @@
 # 深币 Deepcoin · ETH 永续 Webhook 交易系统
 
-**当前版本：`v13.25.0-dynamic-add`**
+**当前版本：`v13.26.0-add-tp-radar-realign`**
 
 与币安 VPS **同一套军师大脑逻辑**（`position_supervisor_deepcoin.py` 镜像 `position_supervisor_binance.py`）。本文档侧重深币部署差异；**完整统一逻辑见币安仓库 README**（两仓库 README 同步维护）。
 
@@ -11,13 +11,13 @@
 | 端口 | **5004** |
 | 单位 | **张**（0.1 ETH/张） |
 | 杠杆 | **15x** cross |
-| 健康检查 | `GET /health` → `"version":"v13.25.0-dynamic-add"` |
+| 健康检查 | `GET /health` → `"version":"v13.26.0-add-tp-radar-realign"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
 
 ---
 
-## 与币安统一的核心逻辑（v13.25）
+## 与币安统一的核心逻辑（v13.26）
 
 以下两工厂 **完全一致**，详见 [`eth-webhook-server` README](https://github.com/vivian5285/eth-webhook-server)：
 
@@ -29,6 +29,7 @@
 - **同向智能筛选** ATR → Regime → 价差 0.15%  
 - **空闲巡检 12s** orphan 同向接管 / 反向强平  
 - **动态加仓 v6.9.93**：OPEN 由 VPS sizing；PYRAMID/PROFIT_ADD = `base_qty × TV qty_ratio`  
+- **加仓后重挂** `_realign_after_position_add()`：撤旧 TP → 按 TV TP123 价 + 新总头寸重挂 + 雷达/tv_sl 同步  
 - **Regime activation** 92%/95%（对齐 TV v6.9.86）  
 - **trailTight** TP1 后 0.20 ATR / TP2 后 0.30 ATR  
 
@@ -41,7 +42,7 @@
 | R3 | 50% | 2 |
 | R4 | 70% | 3 |
 
-加仓单位：**张**（`base_qty` 为首仓张数，追加量 `int(base × ratio)` 至少 1 张）。
+加仓单位：**张**（`base_qty` 为首仓张数）。加仓后按**新总张数**重算 TP123 比例并同步雷达。
 
 ---
 
@@ -112,8 +113,9 @@ FLASK_PORT=5004
 | v13.17~18 | TV 反向强平 + 空闲 orphan 接管 |
 | v13.19~23 | 全链防线 + TP1 门控 + 伪 TP 解除 |
 | **v13.24** | 安全雷达交棒 + README 统一 |
-| **v13.25** | 动态加仓：首仓 VPS sizing，加仓 base×TV qty_ratio + 档位次数上限 |
+| **v13.25** | 动态加仓：首仓 VPS sizing，加仓 base×TV qty_ratio |
+| **v13.26** | 加仓后 TP123 按新总头寸重挂 + 雷达/tv_sl 同步 |
 
 ---
 
-*GEMINI Quant · 深币紫金引擎 · v13.25.0-dynamic-add*
+*GEMINI Quant · 深币紫金引擎 · v13.26.0-add-tp-radar-realign*

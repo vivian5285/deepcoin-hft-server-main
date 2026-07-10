@@ -766,8 +766,8 @@ def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
 def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entry, new_entry,
                            tv_sl=0, risk_pct=0, leverage=None, qty_ratio=1.0,
                            verify_note="", verified=True, base_qty=0, vps_sizing_meta=None,
-                           add_count=0, max_add_times=2, regime=3):
-    """PYRAMID / PROFIT_ADD 加仓核实 — 首仓 base_qty × TV qty_ratio（v6.9.93 动态加仓）"""
+                           add_count=0, max_add_times=2, regime=3, tp_audit="", radar_note=""):
+    """PYRAMID / PROFIT_ADD 加仓核实 — 首仓×TV比例 + 新总头寸重挂 TP123/雷达"""
     type_label = {
         ENTRY_TYPE_PYRAMID: "金字塔加仓 PYRAMID",
         ENTRY_TYPE_PROFIT_ADD: "浮盈加仓 PROFIT_ADD",
@@ -803,10 +803,15 @@ def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entr
         ),
         "📡 TV加仓比例": _p(f"**{float(qty_ratio):.2f}** × 首仓", P_LIGHT),
         "🔢 加仓次数": _p(f"**{add_count}/{max_add_times}**", P_LIGHT),
-        "✅ 风控动作": _p("只追加仓位 + 更新硬止损 · TP123 保持不变", P_MAIN),
+        "🕸️ TP123 重挂": _p(tp_audit or "已按新总头寸重算", P_MAIN),
+        "📡 雷达状态": _p(radar_note or "待命(TP1前)", P_LIGHT),
+        "✅ 风控动作": _p(
+            "加仓成交 → TV TP123 按新头寸重挂 + tv_sl/雷达同步",
+            P_MAIN,
+        ),
         "📡 实盘核查": _verify_line(
             verify_note if not verified else "",
-            f"{VERIFY_TAG} | 加仓成交 + 止损已同步",
+            f"{VERIFY_TAG} | 加仓 + TP123 + 止损/雷达已同步",
             f"⏳ 加仓已提交，{VERIFY_DELAY_MARK} | 哨兵继续核实",
         ),
     }
