@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.16.0-leverage-15x"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.17.0-tv-direction-guard"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -170,6 +170,8 @@ class PositionSupervisor:
                         continue
                     pos = self._get_active_position()
                     if not pos or self._safe_qty(pos.get("size")) <= 0:
+                        continue
+                    if self._enforce_tv_direction_or_flat(pos, source="空闲巡检"):
                         continue
                     real_amt = self._safe_qty(pos["size"])
                     if not self._is_dust_qty(real_amt) and not self._should_finalize_tp_victory(real_amt):
@@ -372,6 +374,56 @@ class PositionSupervisor:
                     last_open = entry
         return last_open
 
+    def _resolve_tv_authoritative_side(self):
+        """TV 战略方向：仅信 TV 日志/开仓信号，不以实盘为准"""
+        last_open_tv = self._load_last_tv_open_signal()
+        if last_open_tv:
+            tv_open = (last_open_tv.get("action") or "").upper()
+            if tv_open in ("LONG", "SHORT"):
+                return tv_open
+        last_tv = self._load_last_journal_entry(TV_JOURNAL)
+        if last_tv:
+            tv_action = (last_tv.get("action") or "").upper()
+            if tv_action in ("LONG", "SHORT"):
+                return tv_action
+        side = getattr(self, "last_tv_side", None)
+        if side in ("LONG", "SHORT"):
+            return side
+        return None
+
+    def _live_position_side(self, pos):
+        if not pos:
+            return None
+        if pos.get("side") in ("LONG", "SHORT"):
+            return pos["side"]
+        pos_side = (pos.get("posSide") or "").lower()
+        if pos_side == "long":
+            return "LONG"
+        if pos_side == "short":
+            return "SHORT"
+        return None
+
+    def _enforce_tv_direction_or_flat(self, pos, source="sentinel"):
+        """实盘与 TV 方向相反 → 核武全平，强制对齐 TV（拒绝人工反向手单）"""
+        if not pos or self._safe_qty(pos.get("size")) <= 0:
+            return False
+        live_side = self._live_position_side(pos)
+        tv_side = self._resolve_tv_authoritative_side()
+        if not tv_side or not live_side or live_side == tv_side:
+            return False
+        reason = f"人工反向手单 vs TV：实盘({live_side}) ≠ TV({tv_side}) [{source}]"
+        logger.error(f"🚨 {reason} → 核武全平强制对齐 TV")
+        verify_note = (
+            f"触发源: {source} | TV战略 {tv_side} | 实盘反向 {live_side} | "
+            "已核武全平，账本归零待命"
+        )
+        self._close_all(
+            reason,
+            force_align=(live_side, tv_side),
+            force_verify_note=verify_note,
+        )
+        return True
+
     def _journal_tp_prices(self, entry):
         """从日志条目解析 TP123（支持 tv_tps 列表或 tv_tp1/2/3 字段）"""
         if not entry:
@@ -553,7 +605,8 @@ class PositionSupervisor:
             notes.append(f"人工异动(重启): {saved_watched}张 → {real_amt}张 ({action_msg})")
 
         if not self.last_tv_side:
-            self.last_tv_side = side
+            if not reconcile["direction_mismatch"]:
+                self.last_tv_side = side
         elif side != self.last_tv_side and not reconcile["tv_close"]:
             reconcile["direction_mismatch"] = True
             if not any("方向背离" in n for n in notes):
@@ -1112,7 +1165,7 @@ class PositionSupervisor:
         self._report_flat_close(reason, swept_dust=True)
 
     def _apply_recover_live_alignment(self, side, reconcile):
-        """重启以实盘为准：不回放 TV 平仓，不因日志方向差异核武全平（仅 live webhook 才平仓）"""
+        """重启对账备注：TV 平仓日志不回放；方向背离由 _enforce_tv_direction_or_flat 核武处理"""
         extra_notes = []
         if reconcile.get("tv_close"):
             action = (self.last_tv_signal or {}).get("action", "CLOSE")
@@ -1127,14 +1180,11 @@ class PositionSupervisor:
                 open_tps = self._sanitize_tp_prices(last_open_tv.get("tv_tps", []))
                 if sum(1 for t in open_tps if t > 0) > 0:
                     self.tv_tps = open_tps
-        if reconcile.get("direction_mismatch") or (
-                self.last_tv_side and side != self.last_tv_side
-        ):
-            old_tv = self.last_tv_side
-            self.last_tv_side = side
-            msg = f"方向以实盘为准: {side} (TV日志={old_tv})"
-            logger.warning(f"🔄 [重启] {msg}")
-            extra_notes.append(msg)
+        elif reconcile.get("direction_mismatch"):
+            tv_side = self._resolve_tv_authoritative_side()
+            extra_notes.append(
+                f"方向背离: 实盘{side} vs TV{tv_side} → 已由核武全平强制对齐 TV"
+            )
         elif not self.last_tv_side:
             self.last_tv_side = side
         return extra_notes
@@ -4652,9 +4702,19 @@ class PositionSupervisor:
                             )
                             break
 
-                        if actual_side != self.last_tv_side:
-                            reason = f"致命方向背离：实盘({actual_side}) vs TV({self.last_tv_side})"
-                            self._close_all(reason, force_align=(actual_side, self.last_tv_side))
+                        tv_side = self._resolve_tv_authoritative_side()
+                        if tv_side and actual_side and actual_side != tv_side:
+                            reason = (
+                                f"致命方向背离：实盘({actual_side}) vs TV({tv_side}) [实盘监督]"
+                            )
+                            verify_note = (
+                                f"触发源: 实盘监督 | TV战略 {tv_side} | 实盘反向 {actual_side}"
+                            )
+                            self._close_all(
+                                reason,
+                                force_align=(actual_side, tv_side),
+                                force_verify_note=verify_note,
+                            )
                             break
 
                         curr_px = deepcoin_client.get_current_price(self.symbol)
@@ -4768,7 +4828,8 @@ class PositionSupervisor:
             )
         return placed
 
-    def _close_all(self, reason="", force_align=None, reset_state=True, close_meta=None):
+    def _close_all(self, reason="", force_align=None, reset_state=True, close_meta=None,
+                   force_verify_note=""):
         """先撤全部挂单再阶梯强平；返回是否已空仓"""
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
@@ -4846,7 +4907,7 @@ class PositionSupervisor:
                     dingtalk.report_force_align,
                     real_side=real_side,
                     expected_side=expected_side,
-                    verify_note=verify_note,
+                    verify_note=force_verify_note or verify_note,
                 )
             else:
                 self._report_flat_close(reason, close_meta=close_meta)
@@ -4935,6 +4996,9 @@ class PositionSupervisor:
                 try:
                     reconcile = self._reconcile_context_on_recover(pos)
                     reconcile_notes = reconcile["notes"]
+                    if self._enforce_tv_direction_or_flat(pos, source="VPS重启"):
+                        self._recover_in_progress = False
+                        return
                     real_amt = self._safe_qty(pos["size"])
                     side = "LONG" if pos.get("posSide") == "long" else "SHORT"
                     self.current_side = side
