@@ -138,6 +138,25 @@ def close_type_display_label(close_type, fallback_reason=""):
     return label
 
 
+# Pine v6.9.93 四档 TP123 减仓比例 qty_percent（与 gemini止损_动态加仓 一致）
+TV_REGIME_TP_RATIOS = {
+    1: [0.25, 0.35, 0.40],  # 25/35/40
+    2: [0.20, 0.35, 0.45],  # 20/35/45
+    3: [0.18, 0.32, 0.50],  # 18/32/50
+    4: [0.05, 0.20, 0.75],  # 5/20/75
+}
+
+
+def get_regime_tp_ratios(regime):
+    """返回某档位 TP123 比例列表 [tp1, tp2, tp3]"""
+    return list(TV_REGIME_TP_RATIOS.get(int(regime or 3), TV_REGIME_TP_RATIOS[3]))
+
+
+def format_regime_tp_ratios_label(regime):
+    """人类可读：25/35/40"""
+    return "/".join(str(int(round(x * 100))) for x in get_regime_tp_ratios(regime))
+
+
 # Pine v6.9.75 四档 ATR 倍数（与策略脚本一致）
 TV_REGIME_TP_MULT = {
     1: (0.75, 1.4, 2.0),
