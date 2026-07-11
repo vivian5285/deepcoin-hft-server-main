@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# position_supervisor_deepcoin.py — 与币安 VPS 逻辑完全对齐（深币张数/15x 适配）
+# position_supervisor_deepcoin.py — 与币安 VPS 逻辑完全对齐（深币张数/20x 适配）
 import logging
 import time
 import threading

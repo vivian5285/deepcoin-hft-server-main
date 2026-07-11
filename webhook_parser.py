@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 TV_STRATEGY_VERSION = "v6.9.93"
 
 # 交易所实盘杠杆（头寸倍数）；保证金美元口径仍用 VPS_MARGIN_LEVERAGE 保持 R4≈200U@1000U
-EXCHANGE_LEVERAGE = 15
+EXCHANGE_LEVERAGE = 20
 VPS_MARGIN_LEVERAGE = 5
 
 # VPS 自主风控（与 TV risk_pct / qty_ratio 完全脱钩）
@@ -253,7 +253,7 @@ def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=None,
     """
     首次开仓 OPEN：
     保证金 = 本金 × VPS_RISK_PCT% × VPS_MARGIN_LEVERAGE × REGIME_SCALE（美元口径不变）
-    头寸价值 = 保证金 × EXCHANGE_LEVERAGE（15x → 1000U R4 ≈ 200U 保证金 / 3000U 头寸）
+    头寸价值 = 保证金 × EXCHANGE_LEVERAGE（20x → 1000U R4 ≈ 200U 保证金 / 4000U 头寸）
     张数 = 头寸价值 / price
     """
     principal = float(principal or 0)

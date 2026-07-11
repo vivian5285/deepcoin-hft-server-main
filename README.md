@@ -10,7 +10,7 @@
 | VPS 目录 | `~/deepcoin-hft-server` |
 | 端口 | **5004** |
 | 单位 | **张**（0.1 ETH/张） |
-| 杠杆 | **15x** cross |
+| 杠杆 | **20x** cross |
 | 健康检查 | `GET /health` → `"version":"v13.26.0-add-tp-radar-realign"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
