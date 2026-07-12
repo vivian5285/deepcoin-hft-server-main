@@ -26,6 +26,7 @@ from webhook_parser import (
     get_regime_tp_ratios,
     format_regime_tp_ratios_label,
     EXCHANGE_LEVERAGE,
+    validate_tp_prices_for_side,
     normalize_entry_type,
     ENTRY_TYPE_OPEN,
     ENTRY_TYPE_PYRAMID,
@@ -49,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.26.0-add-tp-radar-realign"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.27.0-tp-radar-takeover-fix"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -628,9 +629,10 @@ class PositionSupervisor:
         self._append_journal(TV_JOURNAL, entry)
         sizing_note = ""
         et = normalize_entry_type(payload.get("entry_type"))
+        open_sizing_meta = None
         if et == ENTRY_TYPE_OPEN and self.tv_price > 0:
-            _, sm = self._calc_vps_open_qty(self.tv_price)
-            sizing_note = " | " + format_vps_sizing_note(sm, entry_type=ENTRY_TYPE_OPEN)
+            _, open_sizing_meta = self._calc_vps_open_qty(self.tv_price)
+            sizing_note = " | " + format_vps_sizing_note(open_sizing_meta, entry_type=ENTRY_TYPE_OPEN)
         elif et in (ENTRY_TYPE_PYRAMID, ENTRY_TYPE_PROFIT_ADD):
             _, sm = self._calc_vps_add_qty()
             sizing_note = " | " + format_vps_sizing_note(sm, entry_type=et)
@@ -649,9 +651,10 @@ class PositionSupervisor:
             atr=self.current_atr,
             tv_sl=payload.get("tv_sl"),
             risk_pct=payload.get("risk_pct"),
-            leverage=payload.get("leverage"),
+            leverage=EXCHANGE_LEVERAGE,
             qty_ratio=payload.get("qty_ratio"),
             reason=payload.get("reason", ""),
+            vps_sizing_meta=open_sizing_meta,
         )
 
     def _record_open_log(self, side, qty, entry, source="open"):
@@ -867,10 +870,23 @@ class PositionSupervisor:
                 self.tv_price = float(src["price"])
 
         tp_ok = sum(1 for t in (self.tv_tps or []) if t > 0)
+        if not self._tp_prices_valid_for_side(side, entry):
+            if tp_ok >= 3:
+                logger.warning(
+                    f"⚠️ 接管: 账本 TP{self.tv_tps} 与 {side}@{entry:.2f} 方向不符 → 重载"
+                )
+            self.tv_tps = [0.0, 0.0, 0.0]
+            tp_ok = 0
         if tp_ok < 3:
             for src in sources:
+                src_side = (src.get("action") or src.get("side") or "").upper()
+                if src_side in ("LONG", "SHORT") and side and src_side != side:
+                    continue
                 tps = self._journal_tp_prices(src)
-                if sum(1 for t in tps if t > 0) >= 3:
+                if (
+                    sum(1 for t in tps if t > 0) >= 3
+                    and self._tp_prices_valid_for_side(side, entry, tps)
+                ):
                     self.tv_tps = tps
                     notes.append(f"补全TP123 {tps}")
                     break
@@ -882,7 +898,7 @@ class PositionSupervisor:
             tps = self._sanitize_tp_prices([
                 payload.get("tv_tp1"), payload.get("tv_tp2"), payload.get("tv_tp3"),
             ])
-            if sum(1 for t in tps if t > 0) >= 3:
+            if self._tp_prices_valid_for_side(side, entry, tps):
                 self.tv_tps = tps
                 notes.append(f"ATR本地补全TP {tps}")
 
@@ -916,17 +932,59 @@ class PositionSupervisor:
         self._shield_handoff_notified = False
         self.shield_active = False
         self.shield_sized_qty = 0.0
+        self.tv_tps = [0.0, 0.0, 0.0]
+        self.tv_sl = 0.0
         if not getattr(self, "open_regime", None):
             self.open_regime = self.regime
         if not getattr(self, "open_atr", None):
             self.open_atr = self.current_atr
 
+    def _tp_prices_valid_for_side(self, side=None, entry=None, tp_list=None):
+        side = side or self.current_side
+        entry = float(entry or self.watched_entry or 0)
+        tp_list = tp_list if tp_list is not None else (self.tv_tps or [])
+        return validate_tp_prices_for_side(side, entry, tp_list)
+
+    def _reload_tv_tp_prices_from_sources(self, side, entry):
+        entry = float(entry or 0)
+        side = str(side or "").strip().upper()
+        sources = [
+            self.last_tv_signal,
+            self._load_last_journal_entry(TV_JOURNAL),
+            self._load_last_tv_open_signal(),
+            self._load_last_journal_entry(OPEN_JOURNAL),
+        ]
+        for src in sources:
+            if not src:
+                continue
+            src_side = (src.get("action") or src.get("side") or "").upper()
+            if src_side in ("LONG", "SHORT") and side and src_side != side:
+                continue
+            tps = self._journal_tp_prices(src)
+            if sum(1 for t in tps if t > 0) >= 3 and self._tp_prices_valid_for_side(side, entry, tps):
+                return tps, f"TV日志TP {tps}"
+        return None, ""
+
     def _ensure_tp123_prices_from_tv(self, entry):
         """以实盘 entry + open_atr/regime 确保 TP123 三价齐全（人工开仓必跑）"""
-        if sum(1 for t in (self.tv_tps or []) if t > 0) >= 3:
-            return True
         side = self.current_side
         entry = float(entry or self.watched_entry or 0)
+        if self._tp_prices_valid_for_side(side, entry):
+            return True
+
+        reloaded, note = self._reload_tv_tp_prices_from_sources(side, entry)
+        if reloaded:
+            self.tv_tps = reloaded
+            logger.info(f"📐 接管重载 TP123 @ entry={entry:.2f} → {self.tv_tps} ({note})")
+            self._save_state()
+            return True
+
+        if sum(1 for t in (self.tv_tps or []) if t > 0) >= 3:
+            logger.warning(
+                f"⚠️ 陈旧 TP 价位与 {side} @ {entry:.2f} 方向不符 → 丢弃重算"
+            )
+            self.tv_tps = [0.0, 0.0, 0.0]
+
         atr = float(getattr(self, "open_atr", None) or self.current_atr or 30)
         regime = int(getattr(self, "open_regime", None) or self.regime or 3)
         if not side or entry <= 0:
@@ -935,9 +993,9 @@ class PositionSupervisor:
         self.tv_tps = self._sanitize_tp_prices([
             payload.get("tv_tp1"), payload.get("tv_tp2"), payload.get("tv_tp3"),
         ])
-        ok = sum(1 for t in self.tv_tps if t > 0) >= 3
+        ok = self._tp_prices_valid_for_side(side, entry)
         if ok:
-            logger.info(f"📐 人工接管补全 TP123 @ entry={entry:.2f} → {self.tv_tps}")
+            logger.info(f"📐 人工接管 ATR 补全 TP123 @ entry={entry:.2f} → {self.tv_tps}")
         return ok
 
     def _resolve_defense_stop_for_audit(self, radar_sl=None):
@@ -1810,6 +1868,8 @@ class PositionSupervisor:
         self.initial_qty = 0
         self.base_qty = 0
         self.add_count = 0
+        self.tp_levels_consumed = []
+        self.shield_active = False
         self.current_side = None
         self._save_state()
         deepcoin_client.cancel_all_open_orders(self.symbol)
@@ -3998,7 +4058,7 @@ class PositionSupervisor:
         """按 initial 累计减仓顺序推断新成交 TP 档"""
         if new_qty >= old_qty:
             return []
-        initial = self._safe_qty(getattr(self, "initial_qty", 0) or old_qty)
+        initial = self._safe_qty(self._resolve_open_initial_qty(old_qty) or old_qty)
         consumed_before = set(getattr(self, "tp_levels_consumed", []) or [])
         new_consumed = self._infer_tp_consumed_sequential(initial, new_qty, curr_px)
         slices = {sl["level"]: sl for sl in self._tp_slices_for_initial(initial)}
@@ -4010,6 +4070,42 @@ class PositionSupervisor:
             if not sl or sl["price"] <= 0:
                 continue
             fills.append({"level": lv, "price": sl["price"], "qty": sl["qty"]})
+        if fills:
+            return fills
+        return self._detect_tp_fills_by_reduction(old_qty, new_qty, curr_px, initial)
+
+    def _detect_tp_fills_by_reduction(self, old_qty, new_qty, curr_px=0.0, initial=None):
+        initial = self._safe_qty(initial or self._resolve_open_initial_qty(old_qty) or old_qty)
+        reduced = int(old_qty) - int(new_qty)
+        if reduced <= 0 or initial <= 0:
+            return []
+        consumed = set(getattr(self, "tp_levels_consumed", []) or [])
+        slices = [
+            sl for sl in self._tp_slices_for_initial(initial)
+            if sl["level"] not in consumed and sl["qty"] > 0 and sl["price"] > 0
+        ]
+        if not slices:
+            return []
+
+        fills = []
+        cum = 0
+        for sl in sorted(slices, key=lambda x: x["level"]):
+            cum += int(sl["qty"])
+            if reduced == int(sl["qty"]):
+                fills = [{"level": sl["level"], "price": sl["price"], "qty": sl["qty"]}]
+                break
+            if reduced == cum:
+                fills = [{
+                    "level": s["level"], "price": s["price"], "qty": s["qty"],
+                } for s in slices if s["level"] <= sl["level"]]
+                break
+
+        if not fills and curr_px > 0:
+            px_tol = max(2.0, curr_px * 0.002)
+            for sl in slices:
+                if abs(curr_px - sl["price"]) <= px_tol and reduced == int(sl["qty"]):
+                    fills.append({"level": sl["level"], "price": sl["price"], "qty": reduced})
+                    break
         return fills
 
     def _cancel_tp_orders_at_levels(self, levels):
@@ -4199,11 +4295,21 @@ class PositionSupervisor:
             return []
         if new_qty >= old_qty:
             return []
+        if self._detect_tp_fills(old_qty, new_qty, curr_px):
+            return []
         stop_px = self._shield_stop_price()
         if not stop_px:
             return []
+        if curr_px > 0 and self._should_radar_trail(curr_px):
+            return []
         if self._has_shield_stop_at_price(stop_px):
             return []
+        if curr_px > 0:
+            px_tol = max(3.0, stop_px * 0.002)
+            if self.current_side == "LONG" and curr_px > stop_px + px_tol:
+                return []
+            if self.current_side == "SHORT" and curr_px < stop_px - px_tol:
+                return []
         fill_qty = old_qty - new_qty
         if fill_qty <= 0:
             return []
@@ -4740,6 +4846,16 @@ class PositionSupervisor:
             self._safe_float(payload.get("tv_tp2"), 0),
             self._safe_float(payload.get("tv_tp3"), 0),
         ])
+        if raw_action in ("LONG", "SHORT") and self.tv_price > 0:
+            if not validate_tp_prices_for_side(raw_action, self.tv_price, self.tv_tps):
+                enriched = enrich_entry_tp_prices(
+                    raw_action, self.tv_price, self.current_atr, self.regime, payload,
+                )
+                self.tv_tps = self._sanitize_tp_prices([
+                    self._safe_float(enriched.get("tv_tp1"), 0),
+                    self._safe_float(enriched.get("tv_tp2"), 0),
+                    self._safe_float(enriched.get("tv_tp3"), 0),
+                ])
         self._last_tv_field_sources = {
             "regime": payload.get("_regime_source", "tv"),
             "atr": payload.get("_atr_source", "tv"),
@@ -5023,6 +5139,8 @@ class PositionSupervisor:
         self.initial_qty = 0
         self.base_qty = 0
         self.add_count = 0
+        self.tp_levels_consumed = []
+        self.shield_active = False
         self.current_side = None
         deepcoin_client.cancel_all_open_orders(self.symbol)
         self._save_state()
@@ -5446,6 +5564,17 @@ class PositionSupervisor:
             )
             audit = self._wait_defense_settled(vqty)
             matched, expected = audit["matched_full"], audit["expected"]
+            curr_px = deepcoin_client.get_current_price(self.symbol) or entry_price
+            if expected > 0 and matched < expected:
+                logger.warning(
+                    f"⚠️ 开仓首轮 TP 仅 {matched}/{expected} → 追加核武重挂"
+                )
+                audit = self._nuclear_realign_tp(
+                    vqty, verified["entry_price"], dynamic_sl=None, rounds=3,
+                )
+                self._maintain_hard_shield(vqty, curr_px, force=True)
+                audit = self._wait_defense_settled(vqty)
+                matched, expected = audit["matched_full"], audit["expected"]
             verify_note = (
                 f"{budget_note} | " if budget_note else ""
             ) + (
@@ -5490,7 +5619,6 @@ class PositionSupervisor:
                     f"{self.current_side} {vqty}张 | 仅 {matched}/{expected} 档 | "
                     f"{self._format_audit_summary(audit)} | {hint}",
                 )
-            curr_px = deepcoin_client.get_current_price(self.symbol) or entry_price
             if self._should_activate_shield(curr_px):
                 self._maintain_hard_shield(
                     vqty, curr_px,

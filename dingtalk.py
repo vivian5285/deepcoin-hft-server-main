@@ -20,6 +20,7 @@ from webhook_parser import (
     format_regime_tp_ratios_label,
     VPS_RISK_PCT,
     VPS_REGIME_SCALE,
+    VPS_MARGIN_LEVERAGE,
     EXCHANGE_LEVERAGE,
     normalize_entry_type,
     ENTRY_TYPE_OPEN,
@@ -164,17 +165,25 @@ def _format_vps_sizing_basis(principal, meta=None, leverage=None):
     eff = float(meta.get("effective_risk_pct", VPS_RISK_PCT) or VPS_RISK_PCT)
     regime = int(meta.get("regime", 3) or 3)
     scale = float(meta.get("regime_scale", VPS_REGIME_SCALE.get(regime, 0.95)) or 0.95)
-    order_amount = float(meta.get("order_amount", 0) or 0)
-    lev = leverage or meta.get("leverage") or DEFAULT_LEVERAGE
-    stop_dist = float(meta.get("stop_dist", 0) or 0)
+    margin = float(meta.get("margin", 0) or 0)
+    order_amount = float(meta.get("order_amount", 0) or meta.get("position_value", 0) or 0)
+    exch_lev = int(round(float(
+        leverage or meta.get("leverage") or EXCHANGE_LEVERAGE
+    )))
     lines = [
-        f"本金快照 **{float(principal):.2f}** USDT × VPS风险 **{eff:.3f}%** "
-        f"(R{regime}×{scale:.2f}) × **{lev}x** 杠杆",
+        f"本金快照 **{float(principal):.2f}** USDT × **{VPS_RISK_PCT:.0f}%** "
+        f"× **{VPS_MARGIN_LEVERAGE}** × R{regime}系数 **{scale:.2f}** "
+        f"= 保证金 **{margin:.2f}** USDT" if margin > 0 else
+        f"本金快照 **{float(principal):.2f}** USDT × **{VPS_RISK_PCT:.0f}%** "
+        f"× **{VPS_MARGIN_LEVERAGE}** × R{regime}系数 **{scale:.2f}**",
     ]
     if order_amount > 0:
-        lines.append(f"→ 下单金额 **{order_amount:.2f}** USDT")
+        lines.append(
+            f"→ 保证金 × **{exch_lev}x** 杠杆 = 头寸 **{order_amount:.2f}** USDT"
+        )
+    stop_dist = float(meta.get("stop_dist", 0) or 0)
     if stop_dist > 0:
-        lines.append(f"÷ 止损距离 **{stop_dist:.2f}** → 基准张数")
+        lines.append(f"（TV tv_sl 止损距离 **{stop_dist:.2f}**，仅挂止损用，不参与 sizing）")
     return "\n".join(lines)
 
 
@@ -679,7 +688,7 @@ def report_radar_regime_cap_trim(side, old_qty, new_qty, target_qty, regime, mar
 
 def report_tv_signal_received(action, entry_type="", price=0, regime=3, atr=0,
                               tv_sl=0, risk_pct=0, leverage=None, qty_ratio=1.0,
-                              reason=""):
+                              reason="", vps_sizing_meta=None):
     """TV Webhook 信号到达（接收确认，非成交核实）"""
     act = str(action or "").upper()
     et = normalize_entry_type(entry_type)
@@ -706,11 +715,22 @@ def report_tv_signal_received(action, entry_type="", price=0, regime=3, atr=0,
     }
     if tv_sl and float(tv_sl) > 0:
         data["📡 tv_sl"] = _p(f"`{float(tv_sl):.2f}`", P_LIGHT)
-    if risk_pct and float(risk_pct) > 0:
-        data["📐 比例参数"] = _p(
-            format_tv_sizing_note(risk_pct, leverage or DEFAULT_LEVERAGE, qty_ratio),
+    if et == ENTRY_TYPE_OPEN and vps_sizing_meta:
+        data["📐 VPS预算"] = _p(
+            format_vps_sizing_note(vps_sizing_meta, entry_type=ENTRY_TYPE_OPEN),
             P_MUTED,
         )
+    elif risk_pct and float(risk_pct) > 0:
+        data["📐 比例参数"] = _p(
+            format_tv_sizing_note(
+                risk_pct, EXCHANGE_LEVERAGE, qty_ratio, regime=regime,
+            ),
+            P_MUTED,
+        )
+    data["⚙️ 实盘杠杆"] = _p(
+        f"VPS **{EXCHANGE_LEVERAGE}x**（忽略 TV payload leverage 字段）",
+        P_MUTED,
+    )
     if reason:
         data["📝 原因"] = _p(str(reason)[:120], P_MUTED)
     data["✅ 状态"] = _p("信号已入队 · 等待实盘核实后二次播报", P_MAIN)

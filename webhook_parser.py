@@ -394,10 +394,12 @@ def format_vps_sizing_note(meta=None, qty=None, entry_type="OPEN"):
             f"| R{int(meta.get('regime', 3))} 最多{int(meta.get('max_add_times', 2))}次"
         )
     eff = float(meta.get("effective_risk_pct", VPS_RISK_PCT))
+    exch_lev = int(round(float(meta.get("leverage", EXCHANGE_LEVERAGE))))
     parts = [
         f"VPS风险={eff:.3f}%",
         f"R{int(meta.get('regime', 3))}×{float(meta.get('regime_scale', 1)):.2f}",
-        f"lev={int(round(float(meta.get('leverage', EXCHANGE_LEVERAGE))))}x",
+        f"保证金×{VPS_MARGIN_LEVERAGE}",
+        f"头寸×{exch_lev}x",
     ]
     if meta.get("margin"):
         parts.append(f"保证金={float(meta['margin']):.1f}U")
@@ -418,7 +420,7 @@ def format_tv_sizing_note(risk_pct=None, leverage=None, qty_ratio=None, principa
     eff_meta, _ = compute_vps_effective_risk(regime or 3)
     parts = [
         f"VPS风险={eff_meta:.3f}%",
-        f"lev={int(round(float(leverage or EXCHANGE_LEVERAGE)))}x",
+        f"保证金×{VPS_MARGIN_LEVERAGE}·头寸×{int(round(float(leverage or EXCHANGE_LEVERAGE)))}x",
     ]
     if qty_ratio is not None:
         parts.append(f"ratio={float(qty_ratio):.2f}")
@@ -642,6 +644,37 @@ def _field_present(val):
 def _has_positive_float(val):
     f = _to_float(val)
     return f is not None and f > 0
+
+
+def validate_tp_prices_for_side(side, entry, tp_list, min_gap=0.01):
+    """
+    校验 TP123 是否与持仓方向一致（LONG 三价均高于 entry，SHORT 均低于 entry，且单调）。
+    用于接管/重启时拒绝陈旧或反向 TP，避免 LONG@1818 却挂 TP1@1809。
+    """
+    side = str(side or "").strip().upper()
+    entry = float(entry or 0)
+    if side not in ("LONG", "SHORT") or entry <= 0:
+        return False
+    prices = []
+    for t in tp_list or []:
+        try:
+            p = round(float(t), 2)
+        except (TypeError, ValueError):
+            p = 0.0
+        if p > 0:
+            prices.append(p)
+    if len(prices) < 3:
+        return False
+    gap = max(min_gap, entry * 0.0001)
+    if side == "LONG":
+        return (
+            all(p > entry + gap for p in prices)
+            and prices[0] < prices[1] < prices[2]
+        )
+    return (
+        all(p < entry - gap for p in prices)
+        and prices[0] > prices[1] > prices[2]
+    )
 
 
 def enrich_entry_tp_prices(action, price, atr, regime, payload=None):
