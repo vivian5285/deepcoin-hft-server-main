@@ -50,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.27.0-tp-radar-takeover-fix"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.28.0-manual-open-radar-guard"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -294,20 +294,26 @@ class PositionSupervisor:
             self._reset_fresh_takeover_state()
 
         pos_ctx = {"side": side, "size": real_amt, "entry_price": float(pos.get("entry_price", 0))}
-        reconcile_notes = self._hydrate_tv_defense_context(pos_ctx)
-        saved_initial = self._resolve_open_initial_qty(real_amt, self.watched_entry)
-        if saved_initial <= 0:
-            saved_initial = real_amt
-        if self.base_qty <= 0:
-            self.base_qty = int(saved_initial or real_amt)
-        self.watched_qty = real_amt
-        self.initial_qty = saved_initial
         self.watched_entry = float(pos.get("entry_price", 0))
+        if manual_open:
+            self.initial_qty = real_amt
+            self.base_qty = int(real_amt)
+            self.tp_levels_consumed = []
+            saved_initial = real_amt
+        else:
+            saved_initial = self._resolve_open_initial_qty(real_amt, self.watched_entry)
+            if saved_initial <= 0:
+                saved_initial = real_amt
+            if self.base_qty <= 0:
+                self.base_qty = int(saved_initial or real_amt)
+            self.initial_qty = saved_initial
+        self.watched_qty = real_amt
         if not getattr(self, "open_regime", None):
             self.open_regime = self.regime
         if not getattr(self, "open_atr", None):
             self.open_atr = self.current_atr
 
+        reconcile_notes = self._hydrate_tv_defense_context(pos_ctx)
         curr_px = deepcoin_client.get_current_price(self.symbol)
         stack = self._ensure_full_defense_stack(
             real_amt, self.watched_entry, curr_px,
@@ -318,11 +324,7 @@ class PositionSupervisor:
         sl_ok = stack.get("shield_ok", False)
         matched = audit.get("matched_full", 0)
         expected = audit.get("expected", 0)
-        radar_active = (
-            health.get("radar_active")
-            or health.get("should_radar")
-            or self._is_radar_active()
-        )
+        radar_active = self._is_radar_active()
         reconcile_notes.extend(stack.get("notes") or [])
 
         self.monitoring = True
@@ -1057,13 +1059,17 @@ class PositionSupervisor:
             self._hydrate_tv_defense_context(pos_ctx)
         if float(getattr(self, "tv_sl", 0) or 0) <= 0 and entry > 0:
             atr = float(getattr(self, "open_atr", None) or self.current_atr or 30)
+            regime = int(getattr(self, "open_regime", None) or self.regime or 3)
+            sl_m = {1: 0.9, 2: 1.05, 3: 1.10, 4: 1.25}.get(regime, 1.10)
             if self.current_side == "LONG":
-                self.tv_sl = round(entry - atr * TV_BOOT_SL_ATR, 2)
+                self.tv_sl = round(entry - atr * sl_m, 2)
             elif self.current_side == "SHORT":
-                self.tv_sl = round(entry + atr * TV_BOOT_SL_ATR, 2)
+                self.tv_sl = round(entry + atr * sl_m, 2)
             if float(getattr(self, "tv_sl", 0) or 0) > 0:
                 notes.append(f"boot tv_sl={self.tv_sl:.2f}")
                 self._save_state()
+
+        self._enforce_pre_tp1_radar_standby(live_qty, curr_px, source=source)
 
         try:
             cap = self._radar_enforce_regime_cap(live_qty, curr_px, force=True)
@@ -1098,6 +1104,10 @@ class PositionSupervisor:
             )
 
         stop_check = self._resolve_defense_stop_for_audit(radar_sl)
+        if not self._tp1_filled_verified(live_qty, curr_px):
+            radar_sl = None
+            self._enforce_pre_tp1_radar_standby(live_qty, curr_px, source=source)
+            stop_check = self._shield_stop_price()
         shield_ok = self._maintain_hard_shield(live_qty, curr_px, force=True)
         if radar_sl and not self._has_trigger_sl_near(radar_sl):
             shield_ok = self._ensure_radar_sl(live_qty, radar_sl) or shield_ok
@@ -1304,6 +1314,13 @@ class PositionSupervisor:
             je = float(last_open.get("entry", 0) or 0)
             entry_tol = max(3.0, entry * 0.003) if entry > 0 else 3.0
             if jq > 0 and (entry <= 0 or je <= 0 or abs(entry - je) <= entry_tol):
+                qty_tol = max(1, int(live_qty * 0.02)) if live_qty > 0 else 1
+                if live_qty > 0 and jq > live_qty + qty_tol:
+                    logger.warning(
+                        f"📖 OPEN日志 {jq}张 @ {je:.2f} > 现仓 {live_qty}张 "
+                        f"→ 视作全新人工首仓，不用日志锚定"
+                    )
+                    return live_qty
                 return jq
         saved = self._safe_qty(self.initial_qty)
         if 0 < saved <= live_qty:
@@ -1323,7 +1340,13 @@ class PositionSupervisor:
             self.tp_levels_consumed = []
             self._save_state()
         elif trusted > live_qty:
-            self.initial_qty = trusted
+            logger.warning(
+                f"📖 开单量 {trusted}张 > 现仓 {live_qty}张 → 锚定现仓，清除伪 TP 标记"
+            )
+            self.initial_qty = live_qty
+            self.tp_levels_consumed = []
+            self._save_state()
+            return live_qty
         return trusted if trusted > 0 else live_qty
 
     def _qty_change_ratio(self, old_qty, new_qty):
@@ -3297,7 +3320,11 @@ class PositionSupervisor:
                 radar_progress=progress,
                 verify_note=(
                     f"撤 {n} 笔 TV硬止损 | "
-                    f"{'雷达已激活，专注移动保本' if progress >= 1.0 else f'雷达进度 {progress:.0%}，推升止损防回吐'}"
+                    + (
+                        "雷达已激活，专注移动保本"
+                        if self._is_radar_active()
+                        else f"雷达进度 {progress:.0%}，TP1成交后推升止损"
+                    )
                 ),
             )
 
@@ -3534,6 +3561,22 @@ class PositionSupervisor:
         """雷达首次激活：核实实盘后推送（硬止损已撤 + 保本止损已挂）"""
         if getattr(self, "_radar_activation_notified", False):
             return
+        if not self._tp1_filled_verified(real_amt, curr_px):
+            logger.warning(
+                f"📡 雷达激活钉钉跳过：TP1 未实盘成交 "
+                f"(entry={self.watched_entry:.2f} sl={new_sl:.2f})"
+            )
+            return
+        if self.current_side == "LONG" and float(new_sl or 0) <= float(self.watched_entry or 0):
+            logger.warning(
+                f"📡 雷达激活钉钉跳过：LONG 止损 {new_sl:.2f} 未高于 entry"
+            )
+            return
+        if self.current_side == "SHORT" and float(new_sl or 0) >= float(self.watched_entry or 0):
+            logger.warning(
+                f"📡 雷达激活钉钉跳过：SHORT 止损 {new_sl:.2f} 未低于 entry"
+            )
+            return
         verified = self._wait_verify(
             lambda: self._has_trigger_sl_near(new_sl),
             retries=10,
@@ -3596,6 +3639,60 @@ class PositionSupervisor:
         if sl <= 0 or px <= 0:
             return False
         return abs(px - sl) <= max(2.5, px * 0.002)
+
+    def _enforce_pre_tp1_radar_standby(self, live_qty=None, curr_px=0.0, source=""):
+        """TP1 未成交：强制雷达待命，止损仅 tv_sl 宽线"""
+        if self._tp1_filled_verified(live_qty, curr_px):
+            return False
+
+        tv = float(getattr(self, "tv_sl", 0) or 0)
+        entry = float(self.watched_entry or 0)
+        changed = False
+
+        consumed = list(getattr(self, "tp_levels_consumed", []) or [])
+        if consumed:
+            self.tp_levels_consumed = []
+            changed = True
+            logger.warning(
+                f"📡 [{source or '雷达'}] 清除伪 TP{consumed} 标记 "
+                f"(TP1 未实盘成交)"
+            )
+
+        if entry > 0 and self.current_sl:
+            sl = float(self.current_sl)
+            if self.current_side == "LONG" and sl > entry + 0.01:
+                self.current_sl = tv if tv > 0 else sl
+                changed = True
+            elif self.current_side == "SHORT" and sl < entry - 0.01:
+                self.current_sl = tv if tv > 0 else sl
+                changed = True
+
+        if tv > 0 and entry > 0:
+            if self.current_side == "LONG" and (
+                not self.current_sl or float(self.current_sl) > entry + 0.01
+            ):
+                self.current_sl = tv
+                changed = True
+            elif self.current_side == "SHORT" and (
+                not self.current_sl or float(self.current_sl) < entry - 0.01
+            ):
+                self.current_sl = tv
+                changed = True
+
+        if getattr(self, "_radar_activation_notified", False):
+            self._radar_activation_notified = False
+            changed = True
+        if getattr(self, "_shield_handoff_notified", False):
+            self._shield_handoff_notified = False
+            changed = True
+
+        if changed:
+            self.best_price = entry if entry > 0 else self.best_price
+            self._save_state()
+            logger.info(
+                f"📡 [{source or '雷达'}] TP1前待命 | tv_sl={tv:.2f} | entry={entry:.2f}"
+            )
+        return changed
 
     def _disarm_premature_radar(self, live_qty=None, curr_px=0.0, source=""):
         live_qty = self._safe_qty(live_qty or self.watched_qty)

@@ -1,6 +1,6 @@
 # 深币 Deepcoin · ETH 永续 Webhook 交易系统
 
-**当前版本：`v13.27.0-tp-radar-takeover-fix`**
+**当前版本：`v13.28.0-manual-open-radar-guard`**
 
 与币安 VPS **同一套军师大脑逻辑**（`position_supervisor_deepcoin.py` 镜像 `position_supervisor_binance.py`）。本文档侧重深币部署差异；**完整统一逻辑见币安仓库 README**（两仓库 README 同步维护）。
 

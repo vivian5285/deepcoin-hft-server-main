@@ -317,6 +317,9 @@ def report_tp_fill(tp_level, tp_price, filled_qty, remain_qty, entry_px, side, r
 def report_manual_position_change(action_type, old_qty, new_qty, new_entry_price,
                                   verify_note="", tp_audit=None, verified=True):
     action_txt = _p("手动增仓", P_LIGHT) if "加仓" in action_type else _p("手动部分减仓", P_ACCENT)
+    is_manual_open = "人工开仓" in str(action_type or "")
+    if is_manual_open:
+        action_txt = _p("人工首仓 · 系统接管", P_LIGHT)
     data = {
         "触发机制": _p("🛡️ 智慧大脑态势感知同步", P_MAIN),
         "实盘动作": action_txt,
@@ -328,6 +331,11 @@ def report_manual_position_change(action_type, old_qty, new_qty, new_entry_price
             f"⏳ 重挂已提交，{VERIFY_DELAY_MARK} | 哨兵持续对齐",
         ),
     }
+    if is_manual_open:
+        data["📡 雷达/止损"] = _p(
+            "TP1 成交前 **仅 tv_sl 宽止损** · 雷达 **待命**（禁止提前保本）",
+            P_MUTED,
+        )
     if tp_audit:
         data["🕸️ TP123 审计"] = _p(_format_tp_audit(tp_audit), P_ACCENT)
     if verify_note:
