@@ -50,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.28.0-manual-open-radar-guard"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.29.0-update-tp-momentum"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -548,6 +548,14 @@ class PositionSupervisor:
                 action,
                 str(payload.get("side", "")).upper(),
                 round(self._safe_float(payload.get("tv_sl"), 0), 2),
+            )
+        if action == "UPDATE_TP":
+            return (
+                action,
+                str(payload.get("side", "")).upper(),
+                round(self._safe_float(payload.get("tv_tp1"), 0), 2),
+                round(self._safe_float(payload.get("tv_tp2"), 0), 2),
+                round(self._safe_float(payload.get("tv_tp3"), 0), 2),
             )
         if action in ("LONG", "SHORT"):
             return (
@@ -2607,6 +2615,166 @@ class PositionSupervisor:
             dingtalk.report_system_alert(
                 "TV硬止损更新失败",
                 f"UPDATE_SL tv_sl={self.tv_sl:.2f} | 核实未通过，哨兵将继续重试",
+            )
+
+    def _place_tp_levels_only(self, live_qty, retries=2):
+        """只挂未成交 TP 限价档，绝不触碰止损/雷达"""
+        close_side = "sell" if self.current_side == "LONG" else "buy"
+        pos_side = "long" if self.current_side == "LONG" else "short"
+        live_qty = self._resolve_live_qty(live_qty)
+        if live_qty <= 0:
+            return 0
+        placed = 0
+        for lv in self._expected_tp_levels(live_qty):
+            q, px = float(lv["qty"] or 0), float(lv["price"] or 0)
+            if q <= 0 or px <= 0:
+                continue
+            ok = False
+            for attempt in range(max(1, retries + 1)):
+                res = deepcoin_client.place_limit_order(
+                    self.symbol, close_side, pos_side, px, q, reduce_only=True,
+                )
+                if res and deepcoin_client._is_success(res):
+                    ok = True
+                    break
+                time.sleep(0.2)
+            if ok:
+                placed += 1
+                logger.info(f"📈 UPDATE_TP 挂 TP{lv['level']} {q} @ {px:.2f}")
+            else:
+                logger.error(f"❌ UPDATE_TP 挂 TP{lv['level']} @ {px:.2f} 失败")
+            time.sleep(0.25)
+        return placed
+
+    def _handle_tv_tp_update(self, payload):
+        """
+        UPDATE_TP（v6.9.108 动能止盈升级）：
+        只撤换限价 TP123，绝不触碰硬止损 / 雷达。
+        """
+        side = str(payload.get("side") or "").strip().upper()
+        new_tps = self._sanitize_tp_prices([
+            self._safe_float(payload.get("tv_tp1"), 0),
+            self._safe_float(payload.get("tv_tp2"), 0),
+            self._safe_float(payload.get("tv_tp3"), 0),
+        ])
+        if sum(1 for t in new_tps if t > 0) < 3:
+            logger.warning(f"UPDATE_TP 无效：TP 不全 {new_tps}")
+            return
+
+        pos = self._get_active_position()
+        if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
+            logger.info("UPDATE_TP 到达但盘口已空仓 → 忽略")
+            return
+
+        pos_side = self._pos_side_label(pos)
+        if side and side != pos_side:
+            logger.warning(f"UPDATE_TP side={side} 与实盘 {pos_side} 不符，已忽略")
+            return
+
+        live_qty = self._resolve_live_qty(pos["size"])
+        entry = float(pos.get("entry_price") or self.watched_entry or 0)
+        curr_px = float(
+            deepcoin_client.get_current_price(self.symbol)
+            or self.tv_price
+            or 0
+        )
+        self.current_side = pos_side
+        if not self.monitoring:
+            self.monitoring = True
+            self.watched_qty = live_qty
+            self.watched_entry = entry
+
+        if not validate_tp_prices_for_side(pos_side, entry, new_tps):
+            logger.warning(
+                f"UPDATE_TP 方向校验失败 {pos_side} entry={entry:.2f} tps={new_tps} → 忽略"
+            )
+            dingtalk.report_system_alert(
+                "UPDATE_TP 已拒绝",
+                f"{pos_side} entry `{entry:.2f}` | 新TP {new_tps} 与持仓方向不符",
+            )
+            return
+
+        tp1 = float(new_tps[0])
+        if curr_px > 0:
+            if pos_side == "LONG" and tp1 <= curr_px:
+                logger.warning(
+                    f"UPDATE_TP 新TP1={tp1:.2f} ≤ 市价 {curr_px:.2f} → 忽略（防即时成交）"
+                )
+                return
+            if pos_side == "SHORT" and tp1 >= curr_px:
+                logger.warning(
+                    f"UPDATE_TP 新TP1={tp1:.2f} ≥ 市价 {curr_px:.2f} → 忽略（防即时成交）"
+                )
+                return
+
+        old_tps = list(getattr(self, "_prev_tv_tps_before_update", None) or self.tv_tps or [])
+        self.tv_tps = new_tps
+        self._save_state()
+
+        same_ledger = (
+            len(old_tps) >= 3
+            and all(
+                abs(float(old_tps[i] or 0) - float(new_tps[i] or 0)) <= 0.51
+                for i in range(3)
+            )
+        )
+        audit_before = self._audit_tp_levels(live_qty)
+        if same_ledger and self._tp_audit_ok(audit_before):
+            logger.info(f"UPDATE_TP 幂等跳过：TP 已是 {new_tps}")
+            return
+
+        cancelled = self._cancel_all_tp_limit_orders(max_rounds=4)
+        time.sleep(0.45)
+        leftover = self._collect_tp_limit_orders()
+        if leftover:
+            logger.error(
+                f"UPDATE_TP 撤旧 TP 未净（剩 {len(leftover)}）→ 放弃挂新单，等待下次"
+            )
+            dingtalk.report_system_alert(
+                "UPDATE_TP 撤单失败",
+                f"旧限价 TP 未清净 {len(leftover)} 张，未挂新价，硬止损/雷达未动",
+            )
+            if old_tps and sum(1 for t in old_tps if float(t or 0) > 0) >= 2:
+                self.tv_tps = self._sanitize_tp_prices(old_tps)
+                self._save_state()
+            return
+
+        placed = self._place_tp_levels_only(live_qty, retries=2)
+        time.sleep(0.5)
+        audit = self._audit_tp_levels(live_qty)
+        verified = self._tp_audit_ok(audit)
+        if not verified and placed > 0:
+            time.sleep(0.35)
+            placed += self._place_tp_levels_only(live_qty, retries=1)
+            time.sleep(0.4)
+            audit = self._audit_tp_levels(live_qty)
+            verified = self._tp_audit_ok(audit)
+
+        verify_note = (
+            f"动能 UPDATE_TP | {old_tps} → {new_tps} | "
+            f"撤旧 {cancelled} | 新挂 {placed} | "
+            f"止盈 {audit.get('matched_full', 0)}/{audit.get('expected', 0)} | "
+            f"持仓 {live_qty} 张 @ {entry:.2f} | "
+            f"市价 {curr_px:.2f} | 硬止损/雷达未触碰"
+        )
+        logger.info(f"🚀 UPDATE_TP 完成 verified={verified} | {verify_note}")
+        self._call_dingtalk(
+            dingtalk.report_tv_tp_updated,
+            side=pos_side,
+            live_qty=live_qty,
+            entry=entry,
+            old_tps=old_tps,
+            new_tps=new_tps,
+            placed=placed,
+            regime=self.regime,
+            verify_note=verify_note,
+            verified=verified,
+            curr_px=curr_px,
+        )
+        if not verified:
+            dingtalk.report_system_alert(
+                "UPDATE_TP 对齐未完成",
+                f"{self._format_audit_summary(audit)} | 哨兵将继续核对",
             )
 
     def _shield_tier_prices(self, entry=None):
@@ -4932,27 +5100,48 @@ class PositionSupervisor:
 
     def _process_signal(self, payload):
         raw_action = str(payload.get("action", "")).strip().upper()
-        self.regime = self._safe_int(payload.get("regime"), 3)
-        if self.regime not in self.regime_settings:
-            self.regime = 3
+        is_tp_sl_update = raw_action in ("UPDATE_TP", "UPDATE_SL")
 
-        self.current_atr = self._safe_float(payload.get("atr"), 30.0)
-        self.tv_price = self._safe_float(payload.get("price"), 0.0)
-        self.tv_tps = self._sanitize_tp_prices([
+        if not is_tp_sl_update or payload.get("regime") is not None:
+            self.regime = self._safe_int(payload.get("regime"), self.regime or 3)
+            if self.regime not in self.regime_settings:
+                self.regime = 3
+
+        atr_in = self._safe_float(payload.get("atr"), 0.0)
+        if atr_in > 0:
+            self.current_atr = atr_in
+        elif not is_tp_sl_update:
+            self.current_atr = self._safe_float(payload.get("atr"), 30.0)
+
+        px_in = self._safe_float(payload.get("price"), 0.0)
+        if px_in > 0:
+            self.tv_price = px_in
+        elif not is_tp_sl_update:
+            self.tv_price = 0.0
+
+        new_tps = self._sanitize_tp_prices([
             self._safe_float(payload.get("tv_tp1"), 0),
             self._safe_float(payload.get("tv_tp2"), 0),
             self._safe_float(payload.get("tv_tp3"), 0),
         ])
-        if raw_action in ("LONG", "SHORT") and self.tv_price > 0:
-            if not validate_tp_prices_for_side(raw_action, self.tv_price, self.tv_tps):
-                enriched = enrich_entry_tp_prices(
-                    raw_action, self.tv_price, self.current_atr, self.regime, payload,
-                )
-                self.tv_tps = self._sanitize_tp_prices([
-                    self._safe_float(enriched.get("tv_tp1"), 0),
-                    self._safe_float(enriched.get("tv_tp2"), 0),
-                    self._safe_float(enriched.get("tv_tp3"), 0),
-                ])
+        if raw_action == "UPDATE_TP":
+            self._prev_tv_tps_before_update = list(self.tv_tps or [0.0, 0.0, 0.0])
+            self.tv_tps = new_tps
+        elif raw_action in ("LONG", "SHORT"):
+            self.tv_tps = new_tps
+            if self.tv_price > 0:
+                if not validate_tp_prices_for_side(raw_action, self.tv_price, self.tv_tps):
+                    enriched = enrich_entry_tp_prices(
+                        raw_action, self.tv_price, self.current_atr, self.regime, payload,
+                    )
+                    self.tv_tps = self._sanitize_tp_prices([
+                        self._safe_float(enriched.get("tv_tp1"), 0),
+                        self._safe_float(enriched.get("tv_tp2"), 0),
+                        self._safe_float(enriched.get("tv_tp3"), 0),
+                    ])
+        elif sum(1 for t in new_tps if t > 0) >= 2:
+            self.tv_tps = new_tps
+
         self._last_tv_field_sources = {
             "regime": payload.get("_regime_source", "tv"),
             "atr": payload.get("_atr_source", "tv"),
@@ -4970,8 +5159,10 @@ class PositionSupervisor:
         if not raw_action:
             logger.warning("TV 信号缺少 action，已忽略")
             return
-        if raw_action in ("LONG", "SHORT", "CLOSE", "CLOSE_PROTECT", "CLOSE_TP3", "CLOSE_STOPLOSS", "UPDATE_SL") or \
-                raw_action.startswith("CLOSE"):
+        if raw_action in (
+            "LONG", "SHORT", "CLOSE", "CLOSE_PROTECT", "CLOSE_TP3",
+            "CLOSE_STOPLOSS", "UPDATE_SL", "UPDATE_TP",
+        ) or raw_action.startswith("CLOSE"):
             self._record_tv_signal(payload, raw_action)
 
         if not self._lock.acquire(timeout=120.0):
@@ -5038,6 +5229,8 @@ class PositionSupervisor:
                 self._close_all(f"🧹 换防清场：{close_reason}{close_extra}", close_meta=close_meta)
             elif raw_action == "UPDATE_SL":
                 self._handle_tv_sl_update(payload)
+            elif raw_action == "UPDATE_TP":
+                self._handle_tv_tp_update(payload)
             elif raw_action in ["LONG", "SHORT"]:
                 self._apply_tv_sl_from_payload(payload, source=f"{raw_action}开仓")
                 self._apply_tv_sizing_params(payload)
