@@ -50,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.30.0-block-open-reentry-flatten"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.31.0-tp1-gate-radar"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -162,6 +162,8 @@ class PositionSupervisor:
         self._last_radar_report_ts = 0.0
         self._last_radar_report_sl = 0.0
         self._radar_activation_notified = False
+        self._radar_armed_after_tp1 = False
+        self._ws_tp1_fill_hint = False
         self.sizing_principal = 0.0
         self.tv_sl = 0.0
         self._last_applied_tv_sl = 0.0
@@ -1423,6 +1425,9 @@ class PositionSupervisor:
                     ),
                     "base_qty": int(getattr(self, "base_qty", 0) or 0),
                     "add_count": int(getattr(self, "add_count", 0) or 0),
+                    "radar_armed_after_tp1": bool(
+                        getattr(self, "_radar_armed_after_tp1", False)
+                    ),
                 }, f)
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
@@ -2914,6 +2919,23 @@ class PositionSupervisor:
         real_amt = float(self._resolve_live_qty(real_amt) or 0)
         if real_amt <= 0:
             return False
+        if getattr(self, "_open_in_progress", False) or getattr(
+            self, "_defense_align_in_progress", False
+        ):
+            logger.info(f"📡 雷达交棒拒绝：开仓/防线重建中 | {reason or ''}")
+            return False
+        if not self._tp1_filled_verified(real_amt, curr_px):
+            logger.info(f"📡 雷达交棒拒绝：TP1 未核实成交 | {reason or ''}")
+            return False
+        if not getattr(self, "_radar_armed_after_tp1", False):
+            if not self._price_reached_tp1_zone(curr_px):
+                logger.info(
+                    f"📡 雷达交棒拒绝：价格未达 TP1 区域 | 现价={float(curr_px or 0):.2f} | "
+                    f"{reason or ''}"
+                )
+                return False
+            self._radar_armed_after_tp1 = True
+            self._save_state()
         if not self._should_radar_trail(curr_px):
             return False
 
@@ -2946,6 +2968,7 @@ class PositionSupervisor:
         )
         old_tv = self._shield_stop_price()
         self.current_sl = safe_sl
+        self._radar_armed_after_tp1 = True
         self._save_state()
 
         sl_placed = self._ensure_radar_sl(real_amt, safe_sl)
@@ -3796,7 +3819,67 @@ class PositionSupervisor:
         return True
 
     def _tp1_filled_verified(self, live_qty=None, curr_px=0.0):
-        return self._tp_filled_verified(1, live_qty, curr_px)
+        """TP1 实盘成交：账本+减仓+盘口无TP1；开仓/重建中一律否。"""
+        if getattr(self, "_open_in_progress", False) or getattr(
+            self, "_defense_align_in_progress", False
+        ):
+            return False
+        if getattr(self, "_radar_armed_after_tp1", False):
+            return True
+        if not self._tp_filled_verified(1, live_qty, curr_px):
+            return False
+        live_qty = self._safe_qty(live_qty if live_qty is not None else self.watched_qty)
+        initial = self._trusted_initial_qty(live_qty)
+        if initial <= live_qty:
+            return False
+        slices = {
+            sl["level"]: sl for sl in self._tp_slices_for_initial(initial)
+        }
+        tp1 = slices.get(1)
+        if not tp1 or int(tp1.get("qty") or 0) <= 0:
+            return False
+        reduced = int(initial) - int(live_qty)
+        if reduced < int(tp1["qty"]):
+            return False
+        if not (
+            self._price_reached_tp1_zone(curr_px, tp1.get("price"))
+            or getattr(self, "_ws_tp1_fill_hint", False)
+        ):
+            return False
+        return True
+
+    def _price_reached_tp1_zone(self, curr_px=0.0, tp1_px=None):
+        tp1_px = float(
+            tp1_px
+            if tp1_px is not None
+            else ((self.tv_tps[0] if self.tv_tps else 0) or 0)
+        )
+        entry = float(self.watched_entry or 0)
+        if tp1_px <= 0 or entry <= 0:
+            return False
+        px_tol = max(3.0, tp1_px * 0.003)
+        for px in (float(curr_px or 0), float(self.best_price or 0)):
+            if px <= 0:
+                continue
+            if self.current_side == "LONG" and px >= tp1_px - px_tol:
+                return True
+            if self.current_side == "SHORT" and px <= tp1_px + px_tol:
+                return True
+        return False
+
+    def _tp_fill_ok_to_arm_radar(self, tp_fills, curr_px, old_qty, new_qty):
+        if getattr(self, "_open_in_progress", False) or getattr(
+            self, "_defense_align_in_progress", False
+        ):
+            return False
+        fills = list(tp_fills or [])
+        if not fills or not any(int(f.get("level") or 0) == 1 for f in fills):
+            return False
+        f1 = next(f for f in fills if int(f.get("level") or 0) == 1)
+        tp1_px = float(
+            f1.get("price") or ((self.tv_tps[0] if self.tv_tps else 0) or 0)
+        )
+        return self._price_reached_tp1_zone(curr_px, tp1_px)
 
     def _likely_exchange_stop_exit(self, curr_px=0.0):
         px = float(curr_px or deepcoin_client.get_current_price(self.symbol) or 0)
@@ -3854,6 +3937,12 @@ class PositionSupervisor:
         if getattr(self, "_shield_handoff_notified", False):
             self._shield_handoff_notified = False
             changed = True
+        if getattr(self, "_radar_armed_after_tp1", False):
+            self._radar_armed_after_tp1 = False
+            changed = True
+        if getattr(self, "_ws_tp1_fill_hint", False):
+            self._ws_tp1_fill_hint = False
+            changed = True
 
         if changed:
             self.best_price = entry if entry > 0 else self.best_price
@@ -3885,6 +3974,8 @@ class PositionSupervisor:
             return False
         self._radar_activation_notified = False
         self._shield_handoff_notified = False
+        self._radar_armed_after_tp1 = False
+        self._ws_tp1_fill_hint = False
         self._save_state()
         logger.warning(
             f"📡 [{source or '雷达'}] 解除过早雷达/伪TP{stale or '标记'} "
@@ -3937,11 +4028,14 @@ class PositionSupervisor:
         if not self._tp1_filled_verified():
             if self.current_sl == 0.0 and float(getattr(self, "tv_sl", 0) or 0) > 0:
                 self.current_sl = float(self.tv_sl)
+            self._radar_armed_after_tp1 = False
+            self._ws_tp1_fill_hint = False
             logger.info(
                 f"📡 重启雷达待命: TP1 未成交，保留 tv_sl 宽止损 "
                 f"(进度 {self._radar_activation_progress(curr_px):.0%})"
             )
             return
+        self._radar_armed_after_tp1 = True
 
         progress = self._radar_activation_progress(curr_px)
         trail_offset = self._radar_trail_offset_price()
@@ -4591,6 +4685,10 @@ class PositionSupervisor:
             return {"kind": "add", "tp_fills": [], "shield_fills": []}
         if new_qty >= old_qty:
             return {"kind": "unchanged", "tp_fills": [], "shield_fills": []}
+        if getattr(self, "_open_in_progress", False) or getattr(
+            self, "_defense_align_in_progress", False
+        ):
+            return {"kind": "reduce_unknown", "tp_fills": [], "shield_fills": []}
         tp_fills = self._detect_tp_fills(old_qty, new_qty, curr_px)
         shield_fills = self._detect_shield_fills(old_qty, new_qty, curr_px)
         favorable = (
@@ -4608,6 +4706,11 @@ class PositionSupervisor:
     def _advance_radar_on_tp_fill(self, tp_fills, curr_px, live_qty):
         if not tp_fills:
             return None
+        if not getattr(self, "_radar_armed_after_tp1", False) and not self._price_reached_tp1_zone(curr_px):
+            logger.warning(
+                "📡 [雷达推进] 跳过：TP1 证据不足，保持阶段0宽硬止损"
+            )
+            return None
         for f in tp_fills:
             px = f["price"]
             if self.current_side == "LONG":
@@ -4617,6 +4720,7 @@ class PositionSupervisor:
                 self.best_price = min(self.best_price, px, bp)
         max_level = max(f["level"] for f in tp_fills)
         tp3 = self.tv_tps[2] if len(self.tv_tps) > 2 else 0.0
+        self._radar_armed_after_tp1 = True
         new_sl = self._compute_radar_sl()
         floor_px = self._radar_breakeven_floor()
         if new_sl is not None:
@@ -4653,10 +4757,37 @@ class PositionSupervisor:
                 self._maintain_hard_shield(new_qty, curr_px, force=True)
         elif kind == "tp_fill":
             levels = ",".join(f"TP{f['level']}" for f in change["tp_fills"])
+            evidence_ok = self._tp_fill_ok_to_arm_radar(
+                change["tp_fills"], curr_px, old_qty, new_qty,
+            )
+            if not evidence_ok:
+                logger.warning(
+                    f"🎯 [智慧大脑] {levels} 疑似伪成交"
+                    f"（价未达TP1 / 开仓重建竞态）→ 不标记·不启雷达 | "
+                    f"{old_qty}→{new_qty}"
+                )
+                dingtalk.report_system_alert(
+                    "雷达拒启·伪TP1拦截",
+                    f"{self.current_side} {old_qty}→{new_qty}张 | {levels} | "
+                    f"现价 {float(curr_px or 0):.2f} | "
+                    f"规则：TP1限价实盘成交前不激活雷达",
+                )
+                result = self._smart_realign_defenses(
+                    new_qty, self.watched_entry, dynamic_sl=None,
+                    reason="伪TP拦截·保宽硬止损",
+                )
+                if self._should_activate_shield(curr_px) or getattr(
+                    self, "shield_active", False
+                ):
+                    self._maintain_hard_shield(new_qty, curr_px, force=True)
+                change = {"kind": "reduce_unknown", "tp_fills": [], "shield_fills": []}
+                self._save_state()
+                return change, result
             logger.info(
                 f"🎯 [智慧大脑] {levels} 成交减仓 {old_qty} ➔ {new_qty} → 雷达推进 + 守剩余TP"
             )
             self._mark_tp_levels_consumed([f["level"] for f in change["tp_fills"]])
+            self._radar_armed_after_tp1 = True
             curr_px_safe = curr_px or deepcoin_client.get_current_price(self.symbol) or 0
             sl_to_pass = self._clamp_radar_to_tv_floor(
                 self._advance_radar_on_tp_fill(
@@ -4721,7 +4852,10 @@ class PositionSupervisor:
             )
         else:
             retry_fills = self._detect_tp_fills(old_qty, new_qty, curr_px)
-            if retry_fills:
+            if retry_fills and self._tp_fill_ok_to_arm_radar(
+                retry_fills, curr_px, old_qty, new_qty,
+            ):
+                change = {"kind": "tp_fill", "tp_fills": retry_fills, "shield_fills": []}
                 return self._handle_smart_qty_change(old_qty, new_qty, curr_px)
             self._bump_best_on_tp_fill(old_qty, new_qty, curr_px)
             self._sync_radar_sl_from_best(curr_px)
@@ -5922,6 +6056,8 @@ class PositionSupervisor:
         if hasattr(self, "_radar_stage_last"):
             self._radar_stage_last = 0
         self._radar_activation_notified = False
+        self._radar_armed_after_tp1 = False
+        self._ws_tp1_fill_hint = False
         self.watched_qty, self.watched_entry, self.monitoring = qty, entry_price, True
         self._save_state()
 
@@ -6028,11 +6164,11 @@ class PositionSupervisor:
 
     def _should_radar_trail(self, curr_px):
         """已激活后持续追踪；TP1 未成交前不做移动保本"""
-        if self._is_radar_active():
+        if getattr(self, "_radar_armed_after_tp1", False) and self._is_radar_active():
             return True
         if curr_px <= 0 or not self.watched_entry:
             return False
-        if not self._tp1_filled_verified():
+        if not self._tp1_filled_verified(None, curr_px):
             return False
         if self.current_side == "LONG":
             return curr_px >= self._radar_activation_price()
@@ -6479,6 +6615,9 @@ class PositionSupervisor:
                     self.leverage = EXCHANGE_LEVERAGE
                     self.base_qty = int(s.get("base_qty", 0) or 0)
                     self.add_count = int(s.get("add_count", 0) or 0)
+                    self._radar_armed_after_tp1 = bool(
+                        s.get("radar_armed_after_tp1", False)
+                    )
                     if self.sizing_principal <= 0:
                         eq = deepcoin_client.get_principal_wallet_balance()
                         if eq > 0:
