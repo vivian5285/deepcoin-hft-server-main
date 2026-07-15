@@ -50,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.29.0-update-tp-momentum"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.30.0-block-open-reentry-flatten"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -96,6 +96,7 @@ MIN_TP_LEG_QTY = 1
 # 同向 TV 智能筛选：① ATR 变化 → 先平后开；② 价差低于该百分比 → 不重复开仓，仅刷新 TP123
 SAME_DIR_MIN_SPREAD_PCT = 0.15
 SAME_DIR_DEDUP_SEC = 300
+OPEN_SAME_DIR_COOLDOWN_SEC = 180  # 同向重复 OPEN：开仓后冷却期内禁止先平后开
 ATR_SIMILAR_RATIO = 0.03  # 持仓 ATR 与 TV ATR 偏差 ≤3% 视为未变
 TV_JOURNAL = "logs/deepcoin_tv_journal.jsonl"
 OPEN_JOURNAL = "logs/deepcoin_open_journal.jsonl"
@@ -5639,8 +5640,42 @@ class PositionSupervisor:
         )
         self._ensure_sentinel_running()
 
+    def _is_fresh_open_cooldown(self, pos=None, cooldown_sec=None):
+        """刚开仓同向冷却窗：重复 OPEN 禁止立刻先平后开"""
+        cooldown_sec = float(
+            cooldown_sec if cooldown_sec is not None else OPEN_SAME_DIR_COOLDOWN_SEC
+        )
+        if cooldown_sec <= 0:
+            return False
+        now = time.time()
+        sig = getattr(self, "_last_entry_signal", None) or {}
+        live_side = self._pos_side_label(pos) if pos else self.current_side
+        if (
+            self.monitoring
+            and self.current_side
+            and (not pos or live_side == self.current_side)
+            and float(sig.get("ts") or 0) > 0
+            and now - float(sig["ts"]) < cooldown_sec
+        ):
+            return True
+        last_open = self._load_last_journal_entry(OPEN_JOURNAL)
+        if not last_open:
+            return False
+        side = str(last_open.get("side") or "").upper()
+        if pos and side and side != live_side:
+            return False
+        ts_raw = last_open.get("ts")
+        try:
+            if isinstance(ts_raw, (int, float)):
+                age = now - float(ts_raw)
+            else:
+                age = now - datetime.strptime(str(ts_raw), "%Y-%m-%d %H:%M:%S").timestamp()
+            return 0 <= age < cooldown_sec
+        except Exception:
+            return False
+
     def _handle_smart_entry(self, action, payload=None):
-        """VPS sizing：OPEN 先平后开；PYRAMID/PROFIT_ADD 追加并重挂 TP123+雷达"""
+        """VPS sizing：OPEN 同向智能；反向/确需刷新才先平后开；加仓重挂 TP123"""
         payload = payload or {}
         entry_type = normalize_entry_type(payload.get("entry_type"))
 
@@ -5652,8 +5687,59 @@ class PositionSupervisor:
         if entry_type == ENTRY_TYPE_OPEN:
             pos = self._get_active_position()
             if pos and self._safe_qty(pos.get("size", 0)) > 0:
-                logger.info(f"📡 TV OPEN → 先平后开 [{action}]")
-                self._full_reentry(action, "TV OPEN 先平后开")
+                live_side = self._pos_side_label(pos)
+                if live_side != action:
+                    logger.info(
+                        f"⚡ 反方向 OPEN [{action}] vs 实盘 [{live_side}] → 先平后开"
+                    )
+                    self._full_reentry(
+                        action, "反方向 OPEN 到达，触发【先平后开】原子对冲换防",
+                    )
+                    self._touch_entry_signal_signature(action)
+                    return
+
+                curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
+                if self._is_fresh_open_cooldown(pos):
+                    logger.warning(
+                        f"🛡️ 同向 OPEN 冷却 {OPEN_SAME_DIR_COOLDOWN_SEC:.0f}s 内 "
+                        f"→ 禁止先平后开，仅刷新 TP123 [{action}]"
+                    )
+                    mode, diff_pct, reason, open_atr, tv_atr = (
+                        self._same_direction_entry_mode(action, pos, curr_px)
+                    )
+                    self._same_direction_refresh_tp(
+                        action, pos, curr_px, diff_pct, open_atr, tv_atr,
+                    )
+                    self._touch_entry_signal_signature(action)
+                    return
+
+                mode, diff_pct, reason, open_atr, tv_atr = (
+                    self._same_direction_entry_mode(action, pos, curr_px)
+                )
+                if mode == "REFRESH_TP":
+                    self._same_direction_refresh_tp(
+                        action, pos, curr_px, diff_pct, open_atr, tv_atr,
+                    )
+                    self._touch_entry_signal_signature(action)
+                    return
+
+                close_msgs = {
+                    "atr_changed": (
+                        f"同向 TV ATR 变化 ({open_atr:.2f}→{tv_atr:.2f})，"
+                        f"触发【先平后开】刷新仓位"
+                    ),
+                    "regime_changed": "同向 TV 档位变化，触发【先平后开】重入",
+                    "spread_ok": (
+                        f"同向理论价差 {diff_pct:.3f}% 达标，触发【先平后开】重入"
+                    ),
+                }
+                self._report_smart_reentry(
+                    action, pos, diff_pct, reason, open_atr, tv_atr,
+                )
+                self._full_reentry(
+                    action,
+                    close_msgs.get(reason, "同方向刷新仓位，触发【先平后开】重入"),
+                )
                 self._touch_entry_signal_signature(action)
                 return
             if self._is_duplicate_flat_entry(
@@ -5826,11 +5912,15 @@ class PositionSupervisor:
 
     def _protect_and_monitor(self, qty, entry_price, budget_note="", target_qty=0, sizing_meta=None):
         tp_pxs = self.tv_tps
-        self.current_sl = entry_price
+        # 开仓后 current_sl 必须是硬止损底线，绝不能写成成本价
+        hard_sl = float(getattr(self, "tv_sl", 0) or 0)
+        self.current_sl = hard_sl if hard_sl > 0 else 0.0
         self.best_price = entry_price
         self.shield_active = False
         self.shield_tiers_consumed = []
         self.tp_levels_consumed = []
+        if hasattr(self, "_radar_stage_last"):
+            self._radar_stage_last = 0
         self._radar_activation_notified = False
         self.watched_qty, self.watched_entry, self.monitoring = qty, entry_price, True
         self._save_state()
@@ -5847,6 +5937,9 @@ class PositionSupervisor:
                 self._save_state()
 
             self._scorched_earth_cancel_for_recover()
+            self._enforce_pre_tp1_radar_standby(
+                vqty, verified["entry_price"], source="开仓保护",
+            )
             self._enforce_defense_alignment(
                 vqty, verified["entry_price"],
                 dynamic_sl=None, reason="开仓后防线对齐", rounds=4,
