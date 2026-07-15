@@ -257,7 +257,7 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
         "📡 TV字段": _p(format_tv_field_sources(tv_field_sources or {}), P_MUTED),
         "📡 哨兵状态": _verify_line(
             verify_note if not verified else "",
-            f"🟢 {VERIFY_TAG} | 限价 TP123 已挂 · 雷达阶段0未激活（等TP1限价成交）",
+            f"🟢 {VERIFY_TAG} | TP123已挂 · 雷达等TP1三角对账(价到+限价成交+量匹配)",
             "⏳ 开仓已提交，REST 同步略延迟 | 哨兵待确认",
         ),
     }
