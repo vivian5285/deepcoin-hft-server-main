@@ -2,17 +2,24 @@
 # -*- coding: utf-8 -*-
 import os, threading, logging
 from flask import Flask, request, jsonify
-from position_supervisor_deepcoin import position_supervisor
+from position_supervisor_deepcoin import (
+    get_supervisor_for_payload,
+    SUPERVISORS,
+    bootstrap_supervisors,
+    DEEPCOIN_SUPERVISOR_VERSION,
+)
 from webhook_parser import parse_webhook_request, normalize_tv_payload, format_webhook_log, TV_STRATEGY_VERSION, EXCHANGE_LEVERAGE
-from position_supervisor_deepcoin import DEEPCOIN_SUPERVISOR_VERSION
+from symbol_config import active_deepcoin_symbols
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] Flask: %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+
 @app.route('/webhook', methods=['POST'])
-def webhook():
+@app.route('/webhook/<path:ticker>', methods=['POST'])
+def webhook(ticker=None):
     try:
         _, data = parse_webhook_request(
             request.get_data(),
@@ -31,6 +38,10 @@ def webhook():
     if not data.get("_parse_ok"):
         return jsonify({"status": "error", "message": "Missing or invalid action"}), 400
 
+    if ticker:
+        data["ticker"] = ticker
+        data["symbol"] = ticker
+
     raw_action = data.get("action", "UNKNOWN")
     if raw_action == "PING":
         return jsonify({
@@ -38,16 +49,32 @@ def webhook():
             "message": "pong",
             "action": "PING",
             "schema": TV_STRATEGY_VERSION,
+            "symbols": active_deepcoin_symbols(),
         }), 200
-    logger.info(f"[Webhook] {format_webhook_log(data)}")
 
-    threading.Thread(target=position_supervisor.handle_signal, args=(data,), daemon=True).start()
+    supervisor, sym = get_supervisor_for_payload(data)
+    if supervisor is None:
+        logger.warning(f"[Webhook] 不支持的品种: {sym}")
+        return jsonify({
+            "status": "error",
+            "message": f"Unsupported symbol: {sym}",
+            "allowed": active_deepcoin_symbols(),
+        }), 400
+
+    logger.info(f"[Webhook] [{sym}] {format_webhook_log(data)}")
+
+    threading.Thread(
+        target=supervisor.handle_signal, args=(data,), daemon=True,
+        name=f"tv-{sym}",
+    ).start()
     return jsonify({
         "status": "success",
         "message": "Signal processing started",
         "action": raw_action,
+        "symbol": sym,
         "schema": TV_STRATEGY_VERSION,
     }), 200
+
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -57,9 +84,16 @@ def health():
         "version": DEEPCOIN_SUPERVISOR_VERSION,
         "tv_strategy": TV_STRATEGY_VERSION,
         "leverage": EXCHANGE_LEVERAGE,
+        "symbols": list(SUPERVISORS.keys()) or active_deepcoin_symbols(),
+        "monitoring": {
+            s: bool(getattr(sup, "monitoring", False))
+            for s, sup in SUPERVISORS.items()
+        },
     }), 200
 
+
 if __name__ == '__main__':
+    bootstrap_supervisors()
     host_ip = os.getenv("FLASK_HOST", "0.0.0.0")
     port_num = int(os.getenv("FLASK_PORT", 5004))
     logger.info(f"🚀 深币 Webhook 服务启动 -> {host_ip}:{port_num}")

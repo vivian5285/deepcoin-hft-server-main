@@ -232,15 +232,18 @@ def report_principal_snapshot(reason, principal, regime=None, margin_pct=None, t
 def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime, tv_tps=None,
                            verify_note="", tp_audit=None, verified=True,
                            principal_balance=None, margin_pct=None, margin_usdt=None, leverage=None,
-                           tv_field_sources=None, vps_sizing_meta=None):
+                           tv_field_sources=None, vps_sizing_meta=None, symbol=None, unit_label=None):
     side_str = _p("🟣 开多 (LONG)", P_LIGHT) if side == "LONG" else _p("🟪 开空 (SHORT)", P_DEEP)
     slip_txt = (
         f"{(entry_price - tv_price if side == 'LONG' else tv_price - entry_price):+.2f} 刀"
         if tv_price > 0 else "未知"
     )
     lev = leverage or DEFAULT_LEVERAGE
+    unit = unit_label or UNIT_LABEL
+    sym = str(symbol or "").strip() or "ETH-USDT-SWAP"
 
     data = {
+        "🎛️ 品种": _p(f"**{sym}**", P_ACCENT),
         "🎛️ 趋势方向": side_str,
         "📊 市场强度": get_regime_name(regime),
         "🕸️ TP123 比例": _p(
@@ -248,7 +251,7 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
             P_LIGHT,
         ),
         "💰 进场成本": _p(f"**{entry_price:.2f}** USDT (滑点: **{slip_txt}**)", P_MAIN),
-        "📦 唯一头寸": _p(f"**{qty}** {UNIT_LABEL} ({EXCHANGE_LABEL} {LEVERAGE_LABEL} 稳健火力)", P_ACCENT),
+        "📦 唯一头寸": _p(f"**{qty}** {unit} ({EXCHANGE_LABEL} {LEVERAGE_LABEL} 稳健火力)", P_ACCENT),
         "🕸️ 止盈布防比对": _p(
             _format_tp_audit(tp_audit, tv_tps) if tp_audit else _format_tp_compare(tp_pxs, tv_tps),
             P_LIGHT,
@@ -275,7 +278,7 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
             )
     if verify_note:
         data["🔍 核查明细"] = _p(verify_note, P_MUTED)
-    send_alert("🖨️ 战神出击：深币大级别主阵地建立", data)
+    send_alert(f"🖨️ 战神出击：深币 {sym} 阵地建立", data)
 
 
 def report_intervention(qty, entry_px, new_sl, action_msg, verify_note="", verified=True):

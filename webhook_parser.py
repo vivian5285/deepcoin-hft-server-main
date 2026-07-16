@@ -10,23 +10,30 @@ logger = logging.getLogger(__name__)
 
 TV_STRATEGY_VERSION = "v6.9.108"
 
-# 交易所实盘杠杆（头寸倍数）；保证金美元口径仍用 VPS_MARGIN_LEVERAGE 保持 R4≈200U@1000U
-EXCHANGE_LEVERAGE = 20
-VPS_MARGIN_LEVERAGE = 5
+# 交易所实盘杠杆（双品种文档统一 25x，与币安一致）
+EXCHANGE_LEVERAGE = 25
+VPS_MARGIN_LEVERAGE = 1
 
 # VPS 自主风控（与 TV risk_pct / qty_ratio 完全脱钩）
-VPS_RISK_PCT = 3.0
+VPS_MARGIN_PCT_BY_REGIME = {
+    1: 0.05,
+    2: 0.10,
+    3: 0.15,
+    4: 0.18,
+}
+VPS_RISK_PCT = 18.0
 VPS_GLOBAL_SCALE = 1.0
 VPS_REGIME_SCALE = {
-    1: 0.55,   # 极弱
-    2: 0.75,   # 弱
-    3: 0.95,   # 中势
-    4: 1.33,   # 强势（开发清单最终版）
+    1: VPS_MARGIN_PCT_BY_REGIME[1] / VPS_MARGIN_PCT_BY_REGIME[4],
+    2: VPS_MARGIN_PCT_BY_REGIME[2] / VPS_MARGIN_PCT_BY_REGIME[4],
+    3: VPS_MARGIN_PCT_BY_REGIME[3] / VPS_MARGIN_PCT_BY_REGIME[4],
+    4: 1.0,
 }
-MAX_RISK_PCT = 4.0
-MIN_RISK_PCT = 0.5
+MAX_RISK_PCT = 20.0
+MIN_RISK_PCT = 1.0
 MAX_POSITION_SIZE = 9999.0
 MIN_QTY_DEFAULT = 0.001
+MAX_TOTAL_NOTIONAL_MULT = 9.0
 
 # TV v6.9.93 动态加仓：TV qty_ratio 优先；缺失时按档位默认值
 ADD_QTY_RATIO_BY_REGIME = {
@@ -159,6 +166,125 @@ def format_regime_tp_ratios_label(regime):
     return "/".join(str(int(round(x * 100))) for x in get_regime_tp_ratios(regime))
 
 
+# VPS 自主硬止损：按开仓价百分比等比呼吸（与 ETH 价格缩放）
+VPS_HARD_SL_PCT = {1: 0.0278, 2: 0.0389, 3: 0.0556, 4: 0.0833}
+VPS_HARD_SL_EXTRA_RELAX = 0.0
+VPS_HARD_SL_LIMIT_PCT = 0.0015
+VPS_HARD_SL_M = VPS_HARD_SL_PCT
+VPS_REGIME_BREATH_MULT = {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0}
+VPS_HARD_SL_LIMIT_OFFSET = 0.0
+
+RADAR_STAGE1_TP1_RATIO = 1.0
+RADAR_STAGE2_TP1_RATIO = 1.0
+RADAR_STAGE_COST_BUFFER_PCT = 0.001
+RADAR_STAGE_ATR_MULT = {2: 1.0, 3: 0.6, 4: 0.5, 5: 0.3}
+RADAR_STAGE_LABELS = {
+    0: "硬止损防守(TP1前)",
+    1: "TP1成交·成本保本",
+    2: "TP1→TP2 50%追踪",
+    3: "达TP2锁利",
+    4: "TP2→TP3 50%追踪",
+    5: "达TP3极限保护",
+}
+
+
+def get_vps_hard_sl_params(regime):
+    regime = int(regime or 3)
+    pct = float(VPS_HARD_SL_PCT.get(regime, 0.056))
+    return {
+        "regime": regime,
+        "pct": pct,
+        "pct_label": f"{pct * 100:.1f}%",
+        "sl_m": pct,
+        "breath_mult": 1.0,
+        "final_mult": pct,
+    }
+
+
+def compute_vps_hard_sl_distance(entry, regime, extra_relax=None, atr=None):
+    entry = float(entry or 0)
+    if entry <= 0:
+        return 0.0
+    params = get_vps_hard_sl_params(regime)
+    relax = VPS_HARD_SL_EXTRA_RELAX if extra_relax is None else float(extra_relax or 0)
+    dist = entry * params["pct"]
+    if relax > 0:
+        dist *= (1.0 + relax)
+    return round(dist, 2)
+
+
+def compute_vps_hard_sl(side, entry, atr=None, regime=None, extra_relax=None):
+    entry = float(entry or 0)
+    if entry <= 0:
+        return 0.0
+    if regime is None:
+        regime = 3
+    dist = compute_vps_hard_sl_distance(entry, regime, extra_relax)
+    if dist <= 0:
+        return 0.0
+    side = str(side or "").strip().upper()
+    if side == "LONG":
+        return round(entry - dist, 2)
+    if side == "SHORT":
+        return round(entry + dist, 2)
+    return 0.0
+
+
+def compute_vps_hard_sl_limit_price(side, trigger_px, offset=None):
+    trigger_px = float(trigger_px or 0)
+    if trigger_px <= 0:
+        return 0.0
+    if offset is None:
+        offset = trigger_px * VPS_HARD_SL_LIMIT_PCT
+    else:
+        offset = float(offset or 0)
+    side = str(side or "").strip().upper()
+    if side == "LONG":
+        return round(trigger_px - offset, 2)
+    if side == "SHORT":
+        return round(trigger_px + offset, 2)
+    return round(trigger_px, 2)
+
+
+def format_vps_hard_sl_note(side, entry, atr=None, regime=3, tv_sl_ref=0, extra_relax=None):
+    params = get_vps_hard_sl_params(regime)
+    dist = compute_vps_hard_sl_distance(entry, regime, extra_relax)
+    vps_sl = compute_vps_hard_sl(side, entry, atr, regime, extra_relax)
+    limit_px = compute_vps_hard_sl_limit_price(side, vps_sl)
+    ref = f" | TV参考 `{float(tv_sl_ref):.2f}`" if tv_sl_ref and float(tv_sl_ref) > 0 else ""
+    return (
+        f"VPS硬止损 `{vps_sl:.2f}` | R{regime} "
+        f"开仓价×{params['pct_label']} | 呼吸 **{dist:.2f}U** "
+        f"({params['pct_label']})"
+        f" | Stop-Limit 触发@{vps_sl:.2f} 限价@{limit_px:.2f}{ref}"
+    )
+
+
+def format_tv_vps_sl_compare(side, entry, atr=None, regime=3, tv_sl_ref=0, extra_relax=None):
+    entry = float(entry or 0)
+    if entry <= 0:
+        return ""
+    side = str(side or "").strip().upper()
+    vps_sl = compute_vps_hard_sl(side, entry, atr, regime, extra_relax)
+    ref = float(tv_sl_ref or 0)
+    vps_dist = abs(entry - vps_sl) if vps_sl > 0 else 0
+    if ref <= 0:
+        return format_vps_hard_sl_note(side, entry, atr, regime)
+    tv_dist = abs(entry - ref)
+    if vps_dist > tv_dist + 0.5:
+        wider = "VPS更宽(挂单)"
+    elif tv_dist > vps_dist + 0.5:
+        wider = "TV更紧(仅警报)"
+    else:
+        wider = "宽度接近"
+    pct = get_vps_hard_sl_params(regime)["pct_label"]
+    return (
+        f"TV紧止损 `{ref:.2f}` 距入场 {tv_dist:.2f}U · "
+        f"VPS宽止损 `{vps_sl:.2f}` 距入场 {vps_dist:.2f}U(开仓×{pct}) · "
+        f"**实盘挂单价=VPS** · {wider} | CLOSE_STOPLOSS=TV第一指令立即全平"
+    )
+
+
 # Pine v6.9.75 四档 ATR 倍数（与策略脚本一致）
 TV_REGIME_TP_MULT = {
     1: (0.75, 1.4, 2.0),
@@ -238,22 +364,31 @@ def normalize_entry_type(val, default=ENTRY_TYPE_OPEN):
     return default
 
 
-def compute_vps_effective_risk(regime, global_scale=None):
-    """VPS 有效风险% = clamp(VPS_RISK_PCT × REGIME_SCALE × GLOBAL_SCALE)"""
+def get_vps_margin_pct(regime):
+    """档位保证金占账户总本金比例（双品种文档）。"""
     regime = int(regime or 3)
-    regime_scale = float(VPS_REGIME_SCALE.get(regime, VPS_REGIME_SCALE.get(3, 0.95)))
+    return float(VPS_MARGIN_PCT_BY_REGIME.get(regime, VPS_MARGIN_PCT_BY_REGIME[3]))
+
+
+def compute_vps_effective_risk(regime, global_scale=None):
+    """有效「保证金占本金%」= 档位系数 × GLOBAL_SCALE。"""
+    regime = int(regime or 3)
+    margin_pct = get_vps_margin_pct(regime)
     gs = float(global_scale if global_scale is not None else VPS_GLOBAL_SCALE)
-    raw = VPS_RISK_PCT * regime_scale * gs
+    raw = margin_pct * 100.0 * gs
     capped = raw > MAX_RISK_PCT
     final = min(max(raw, MIN_RISK_PCT), MAX_RISK_PCT)
+    regime_scale = float(VPS_REGIME_SCALE.get(regime, 1.0))
     return final, {
         "regime": regime,
-        "vps_risk_pct": VPS_RISK_PCT,
+        "vps_risk_pct": round(margin_pct * 100.0, 4),
+        "margin_pct": margin_pct,
         "regime_scale": regime_scale,
         "global_scale": gs,
         "effective_risk_pct": round(final, 4),
         "raw_risk_pct": round(raw, 4),
         "risk_capped": capped,
+        "sizing_mode": "MARGIN_PCT_BY_REGIME",
     }
 
 
@@ -272,10 +407,10 @@ def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=None,
                          global_scale=None, qty_step=0.001, min_qty=None,
                          face_value=None, max_position=None):
     """
-    首次开仓 OPEN：
-    保证金 = 本金 × VPS_RISK_PCT% × VPS_MARGIN_LEVERAGE × REGIME_SCALE（美元口径不变）
-    头寸价值 = 保证金 × EXCHANGE_LEVERAGE（20x → 1000U R4 ≈ 200U 保证金 / 4000U 头寸）
-    张数 = 头寸价值 / price
+    首次开仓 OPEN（双品种文档）：
+    保证金 = TOTAL_EQUITY × 档位保证金系数
+    名义头寸 = 保证金 × EXCHANGE_LEVERAGE(25)
+    张数 = 名义 / (price × face_value)
     """
     principal = float(principal or 0)
     price = float(price or 0)
@@ -284,26 +419,28 @@ def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=None,
     max_position = float(max_position if max_position is not None else MAX_POSITION_SIZE)
 
     effective_risk, risk_meta = compute_vps_effective_risk(regime, global_scale)
-    regime_scale = float(risk_meta.get("regime_scale", 1.0))
+    margin_pct = float(risk_meta.get("margin_pct") or get_vps_margin_pct(regime))
     meta = {
         "principal": principal,
         "price": price,
         "tv_sl": float(tv_sl or 0),
         "leverage": leverage,
         "margin_leverage": VPS_MARGIN_LEVERAGE,
-        "sizing_mode": "VPS_OPEN",
+        "sizing_mode": "VPS_OPEN_MARGIN_PCT",
         **risk_meta,
     }
     if principal <= 0 or price <= 0 or leverage <= 0:
         meta["error"] = "invalid_inputs"
         return 0.0, meta
 
-    margin = principal * (VPS_RISK_PCT / 100.0) * VPS_MARGIN_LEVERAGE * regime_scale
+    margin = principal * margin_pct
     position_value = margin * leverage
     meta["margin"] = round(margin, 2)
+    meta["margin_pct"] = margin_pct
     meta["order_amount"] = round(position_value, 2)
     meta["position_value"] = round(position_value, 2)
     meta["numerator_usdt"] = round(position_value, 2)
+    meta["effective_risk_pct"] = round(margin_pct * 100.0, 4)
     if tv_sl and price:
         meta["stop_dist"] = round(_normalize_stop_dist(price, tv_sl), 2)
 
@@ -324,12 +461,34 @@ def compute_vps_open_qty(principal, price, tv_sl, regime, leverage=None,
     qty = math.floor(raw_qty / qty_step) * qty_step
     qty = max(min_qty, qty)
     qty = min(qty, math.floor(max_qty / qty_step) * qty_step)
-    qty = round(qty, 3)
-    meta["max_qty"] = round(max_qty, 3)
+    decimals = max(0, int(round(-math.log10(qty_step)))) if qty_step > 0 else 3
+    decimals = min(decimals, 6)
+    qty = round(qty, decimals)
+    meta["max_qty"] = round(max_qty, decimals)
     meta["raw_qty"] = round(raw_qty, 4)
     meta["base_qty"] = qty
-    meta["capped"] = qty >= round(max_qty, 3) - qty_step
+    meta["capped"] = qty >= round(max_qty, decimals) - qty_step
     return qty, meta
+
+
+def check_total_notional_cap(equity, existing_notional, new_notional, mult=None):
+    """双品种风控硬顶：existing + new ≤ equity × mult（默认 9）。"""
+    equity = float(equity or 0)
+    existing = max(0.0, float(existing_notional or 0))
+    new_n = max(0.0, float(new_notional or 0))
+    mult = float(mult if mult is not None else MAX_TOTAL_NOTIONAL_MULT)
+    cap = equity * mult if equity > 0 else 0.0
+    total = existing + new_n
+    ok = equity > 0 and total <= cap + 1e-6
+    return ok, {
+        "equity": round(equity, 2),
+        "existing_notional": round(existing, 2),
+        "new_notional": round(new_n, 2),
+        "total_notional": round(total, 2),
+        "cap": round(cap, 2),
+        "mult": mult,
+        "ok": ok,
+    }
 
 
 def compute_vps_add_qty(base_qty, qty_ratio=None, regime=None, qty_step=0.001, min_qty=None,
@@ -561,6 +720,17 @@ def normalize_tv_payload(data):
 
     secret = str(src.get("secret") or src.get("token") or src.get("key") or "").strip()
 
+    try:
+        from symbol_config import extract_symbol_from_payload
+        ticker_raw = extract_symbol_from_payload(src)
+    except Exception:
+        ticker_raw = str(
+            src.get("symbol") or src.get("ticker") or src.get("sym") or ""
+        ).strip()
+    if ticker_raw:
+        out["ticker"] = ticker_raw
+        out["symbol"] = ticker_raw
+
     out["action"] = action
     out["side"] = side
     if price is not None:
@@ -623,19 +793,27 @@ def compute_atr_from_klines(klines, period=14):
     return sum(trs[-period:]) / period
 
 
-def fetch_eth_atr_14_public(period=14):
-    """Public Binance ETHUSDT ATR — 币安/深币共用 TP 补全。"""
+def fetch_eth_atr_14_public(period=14, symbol="ETHUSDT"):
+    """Public Binance mark ATR — 默认 ETH；双品种可传 XAUUSDT。"""
+    return fetch_symbol_atr_14_public(symbol or "ETHUSDT", period=period)
+
+
+def fetch_symbol_atr_14_public(symbol="ETHUSDT", period=14):
+    """Public Binance futures ATR for any USDT-M symbol."""
+    sym = str(symbol or "ETHUSDT").upper().replace(".P", "")
+    if ":" in sym:
+        sym = sym.split(":")[-1]
     try:
         import requests
         resp = requests.get(
             "https://fapi.binance.com/fapi/v1/klines",
-            params={"symbol": "ETHUSDT", "interval": "15m", "limit": period + 20},
+            params={"symbol": sym, "interval": "15m", "limit": period + 20},
             timeout=8,
         )
         resp.raise_for_status()
         return compute_atr_from_klines(resp.json(), period)
     except Exception as e:
-        logger.warning(f"Public ETH ATR fetch failed: {e}")
+        logger.warning(f"Public ATR fetch failed [{sym}]: {e}")
         return 0.0
 
 

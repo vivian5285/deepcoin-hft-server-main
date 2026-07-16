@@ -25,6 +25,7 @@ CLIENT_VERSION = "v13.28.0"
 # 公开 instruments 接口失败时的硬编码兜底
 SYMBOL_TICK_FALLBACK = {
     "ETH-USDT-SWAP": "0.01",
+    "XAU-USDT-SWAP": "0.01",
     "BTC-USDT-SWAP": "0.1",
 }
 
@@ -412,6 +413,48 @@ class DeepcoinClient:
 
     def get_position_info(self, symbol="ETH-USDT-SWAP"):
         return self._request("GET", "/account/positions", {"instType": "SWAP", "instId": symbol})
+
+    def get_all_swap_position_notionals(self):
+        """
+        账户全部 SWAP 名义敞口（|张数|×ctVal×mark）。
+        用于双品种 Σnotional ≤ equity×9 硬顶。
+        """
+        from symbol_config import DEEPCOIN_SYMBOL_META
+        out = {}
+        total = 0.0
+        try:
+            res = self._request("GET", "/account/positions", {"instType": "SWAP"})
+        except Exception as e:
+            logger.error(f"[全仓名义查询失败] {e}")
+            return out, 0.0
+        rows = (res or {}).get("data") or []
+        for p in rows:
+            inst = str(p.get("instId") or "")
+            try:
+                pos = abs(float(p.get("pos") or 0))
+            except (TypeError, ValueError):
+                continue
+            if pos <= 0 or not inst:
+                continue
+            meta = DEEPCOIN_SYMBOL_META.get(inst, {})
+            fv = float(meta.get("face_value") or 0.1)
+            try:
+                info = self.get_instrument_info(inst)
+                ct = float(info.get("ctVal") or 0)
+                if ct > 0:
+                    fv = ct
+            except Exception:
+                pass
+            try:
+                mark = float(p.get("markPx") or p.get("last") or 0)
+            except (TypeError, ValueError):
+                mark = 0.0
+            if mark <= 0:
+                mark = float(self.get_current_price(inst) or 0)
+            notional = pos * fv * mark
+            out[inst] = round(notional, 2)
+            total += notional
+        return out, round(total, 2)
 
     def set_leverage(self, symbol="ETH-USDT-SWAP", leverage=20, mgn_mode="cross", mrg_position="merge"):
         """POST /deepcoin/account/set-leverage"""

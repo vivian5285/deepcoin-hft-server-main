@@ -34,6 +34,12 @@ from webhook_parser import (
     CLOSE_TYPE_TP3,
     CLOSE_TYPE_BREAKEVEN,
     CLOSE_TYPE_VPS_SHIELD,
+    check_total_notional_cap,
+    MAX_TOTAL_NOTIONAL_MULT,
+    compute_vps_hard_sl,
+    compute_vps_hard_sl_distance,
+    get_vps_hard_sl_params,
+    format_tv_vps_sl_compare,
 )
 
 if not os.path.exists('logs'):
@@ -50,7 +56,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.32.0-tp1-triad-reconcile"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.34.0-dual-symbol-eth-xau"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -103,21 +109,35 @@ OPEN_JOURNAL = "logs/deepcoin_open_journal.jsonl"
 
 
 class PositionSupervisor:
-    def __init__(self):
-        self.symbol = "ETH-USDT-SWAP"
+    def __init__(self, symbol="ETH-USDT-SWAP"):
+        from symbol_config import resolve_deepcoin_symbol
+        meta = resolve_deepcoin_symbol(symbol)
+        self.symbol = meta["symbol"]
+        self.unit_label = meta.get("unit") or "张"
+        self.face_value = float(meta.get("face_value") or 0.1)
+        try:
+            info = deepcoin_client.get_instrument_info(self.symbol)
+            ct = float(info.get("ctVal") or info.get("contractVal") or 0)
+            if ct > 0:
+                self.face_value = ct
+                logger.info(f"📐 {self.symbol} face_value={ct} (instruments)")
+        except Exception as e:
+            logger.warning(f"face_value instruments 失败，用 meta {self.face_value}: {e}")
+        self.atr_fallback_symbol = meta.get("atr_fallback_symbol") or "ETHUSDT"
+        self.binance_mark = meta.get("binance_mark") or "ETHUSDT"
         self.monitoring = False
         self._lock = threading.Lock()
 
-        # 与币安一致：activation=TP1 后参考进度；trail 距离见 TV_TRAIL_* 常量
+        # 钉钉展示用档位保证金%（双品种文档）
         self.regime_settings = {
-            1: {"margin": 0.15, "ratios": get_regime_tp_ratios(1), "activation": 0.92, "trail_offset": TV_TRAIL_TP2_ATR},
-            2: {"margin": 0.25, "ratios": get_regime_tp_ratios(2), "activation": 0.92, "trail_offset": TV_TRAIL_TP2_ATR},
-            3: {"margin": 0.35, "ratios": get_regime_tp_ratios(3), "activation": 0.95, "trail_offset": TV_TRAIL_TP3_ATR},
-            4: {"margin": 0.50, "ratios": get_regime_tp_ratios(4), "activation": 0.95, "trail_offset": TV_TRAIL_TP3_ATR},
+            1: {"margin": 0.05, "ratios": get_regime_tp_ratios(1), "activation": 0.92, "trail_offset": TV_TRAIL_TP2_ATR},
+            2: {"margin": 0.10, "ratios": get_regime_tp_ratios(2), "activation": 0.92, "trail_offset": TV_TRAIL_TP2_ATR},
+            3: {"margin": 0.15, "ratios": get_regime_tp_ratios(3), "activation": 0.95, "trail_offset": TV_TRAIL_TP3_ATR},
+            4: {"margin": 0.18, "ratios": get_regime_tp_ratios(4), "activation": 0.95, "trail_offset": TV_TRAIL_TP3_ATR},
         }
         self.leverage = EXCHANGE_LEVERAGE
         self.tv_sizing_leverage = EXCHANGE_LEVERAGE
-        self.face_value = 0.1
+        # face_value 已按品种 meta 设定，禁止再写死 0.1
 
         self.regime = 3
         self.current_atr = 30.0
@@ -167,6 +187,7 @@ class PositionSupervisor:
         self._open_settled_qty = 0
         self.sizing_principal = 0.0
         self.tv_sl = 0.0
+        self.tv_sl_ref = 0.0
         self._last_applied_tv_sl = 0.0
         self.tv_risk_pct = 0.0
         self.tv_qty_ratio = 1.0
@@ -175,10 +196,24 @@ class PositionSupervisor:
         self.add_count = 0
         self._last_idle_takeover_ts = 0.0
 
-        self.state_file = os.path.join(_BASE_DIR, 'deepcoin_vps_state.json')
+        self.state_file = os.path.join(
+            _BASE_DIR, f'deepcoin_vps_state_{self.symbol.replace("-", "_")}.json'
+        )
+        legacy = os.path.join(_BASE_DIR, 'deepcoin_vps_state.json')
+        if (
+            self.symbol == "ETH-USDT-SWAP"
+            and not os.path.exists(self.state_file)
+            and os.path.exists(legacy)
+        ):
+            try:
+                import shutil
+                shutil.copy2(legacy, self.state_file)
+                logger.info(f"📦 已迁移旧状态 → {self.state_file}")
+            except Exception as e:
+                logger.warning(f"旧状态迁移失败: {e}")
         logger.info(
             f"🧠 深币 VPS [{DEEPCOIN_SUPERVISOR_VERSION}/{CLIENT_VERSION}] "
-            f"军师托管版已加载：双轨智慧雷达 · {self.leverage}x 杠杆"
+            f"{self.symbol} 军师已加载：双品种 · {self.leverage}x"
         )
         self._start_signal_worker()
         self._start_idle_flat_patrol()
@@ -1414,6 +1449,7 @@ class PositionSupervisor:
                     "shield_sized_qty": float(getattr(self, "shield_sized_qty", 0) or 0),
                     "sizing_principal": float(getattr(self, "sizing_principal", 0) or 0),
                     "tv_sl": float(getattr(self, "tv_sl", 0) or 0),
+                    "tv_sl_ref": float(getattr(self, "tv_sl_ref", 0) or 0),
                     "last_applied_tv_sl": float(
                         getattr(self, "_last_applied_tv_sl", 0) or 0
                     ),
@@ -1583,7 +1619,54 @@ class PositionSupervisor:
             min_qty=1,
         )
         meta["principal"] = principal
+        meta["symbol"] = self.symbol
         return int(qty or 0), meta
+
+    def _other_symbols_notional(self, exclude_symbol=None):
+        """账户其它品种名义敞口合计（不含本品种）。"""
+        exclude = str(exclude_symbol or self.symbol)
+        by_sym, total = deepcoin_client.get_all_swap_position_notionals()
+        other = 0.0
+        for sym, notion in (by_sym or {}).items():
+            if str(sym) == exclude:
+                continue
+            other += float(notion or 0)
+        return round(other, 2), by_sym, total
+
+    def _assert_notional_cap_or_reject(self, qty, price, sizing_meta=None):
+        """双品种硬顶：其它品种名义 + 本笔名义 ≤ equity×9。"""
+        equity = float(
+            (sizing_meta or {}).get("principal")
+            or self._resolve_cap_sizing_base()
+            or 0
+        )
+        new_notional = float(qty or 0) * float(self.face_value or 0.1) * float(price or 0)
+        other, by_sym, all_total = self._other_symbols_notional(self.symbol)
+        existing = other
+        ok, meta = check_total_notional_cap(
+            equity, existing, new_notional, mult=MAX_TOTAL_NOTIONAL_MULT,
+        )
+        meta["by_symbol"] = by_sym
+        meta["symbol"] = self.symbol
+        if ok:
+            logger.info(
+                f"📐 敞口校验通过 {self.symbol}: 其它 {existing:.0f}U + 本笔 {new_notional:.0f}U "
+                f"= {meta['total_notional']:.0f}U ≤ 本金 {equity:.0f}U×{MAX_TOTAL_NOTIONAL_MULT:.0f}"
+            )
+            return True, meta
+        logger.error(
+            f"🚫 敞口硬顶拦截 {self.symbol}: 其它 {existing:.0f}U + 本笔 {new_notional:.0f}U "
+            f"= {meta['total_notional']:.0f}U > 上限 {meta['cap']:.0f}U "
+            f"(本金 {equity:.0f}U×{MAX_TOTAL_NOTIONAL_MULT:.0f}) | 盘口 {by_sym}"
+        )
+        dingtalk.report_system_alert(
+            f"开仓拦截·名义敞口超限 [{self.symbol}]",
+            f"本金 {equity:.0f}U · 上限 {meta['cap']:.0f}U ({MAX_TOTAL_NOTIONAL_MULT:.0f}x)\n"
+            f"其它品种名义 {existing:.0f}U + 本笔 {new_notional:.0f}U "
+            f"= {meta['total_notional']:.0f}U\n"
+            f"盘口名义 {by_sym}",
+        )
+        return False, meta
 
     def _calc_vps_add_qty(self, qty_ratio=None):
         base = float(getattr(self, "base_qty", 0) or 0)
@@ -2511,29 +2594,67 @@ class PositionSupervisor:
         return None
 
     def _shield_stop_price(self, entry=None):
-        """TV tv_sl 为唯一硬止损价"""
+        """VPS 自主硬止损价（tv_sl 账本字段存 VPS 计算结果）"""
         tv = round(float(getattr(self, "tv_sl", 0) or 0), 2)
         return tv if tv > 0 else None
 
-    def _apply_tv_sl_from_payload(self, payload, source=""):
-        """解析并持久化 TV 动态硬止损价"""
-        raw = payload.get("tv_sl")
-        if raw is None or raw == "":
+    def _refresh_vps_hard_sl(self, entry=None, side=None, regime=None, atr=None,
+                             tv_sl_ref=None, source=""):
+        """VPS 自主硬止损：开仓价 × 档位百分比；TV tv_sl 仅参考。"""
+        entry = float(entry or self.watched_entry or self.tv_price or 0)
+        side = (side or self.current_side or "").strip().upper()
+        regime = int(regime if regime is not None else self.regime or 3)
+
+        if tv_sl_ref is not None:
+            ref = round(self._safe_float(tv_sl_ref, 0), 2)
+            if ref > 0:
+                self.tv_sl_ref = ref
+
+        if entry <= 0 or side not in ("LONG", "SHORT"):
             return False
-        px = round(self._safe_float(raw, 0), 2)
-        if px <= 0:
+
+        vps_sl = compute_vps_hard_sl(side, entry, atr, regime)
+        if vps_sl <= 0:
             return False
+
         old = round(float(getattr(self, "tv_sl", 0) or 0), 2)
-        self.tv_sl = px
-        if abs(px - old) > SHIELD_STOP_TOLERANCE:
+        self.tv_sl = vps_sl
+        if abs(vps_sl - old) > SHIELD_STOP_TOLERANCE:
             self._last_applied_tv_sl = 0.0
         self._save_state()
+
+        params = get_vps_hard_sl_params(regime)
+        dist = compute_vps_hard_sl_distance(entry, regime)
+        ref_txt = (
+            f" | {format_tv_vps_sl_compare(side, entry, atr, regime, tv_sl_ref=self.tv_sl_ref)}"
+            if getattr(self, "tv_sl_ref", 0) > 0 else ""
+        )
         logger.info(
-            f"📡 TV硬止损 tv_sl={px:.2f}"
+            f"🛡️ VPS硬止损 R{regime} 开仓×{params['pct_label']} | "
+            f"呼吸 {dist:.2f}U → {vps_sl:.2f}"
             + (f" ({source})" if source else "")
-            + (f" | 原 {old:.2f}" if old > 0 and abs(px - old) > SHIELD_STOP_TOLERANCE else "")
+            + ref_txt
+            + (f" | 原 {old:.2f}" if old > 0 and abs(vps_sl - old) > SHIELD_STOP_TOLERANCE else "")
         )
         return True
+
+    def _apply_tv_sl_from_payload(self, payload, source=""):
+        """TV tv_sl 仅参考；挂单价由 VPS 按 开仓价×档位% 重算"""
+        tv_ref = payload.get("tv_sl")
+        if tv_ref is None or tv_ref == "":
+            return self._refresh_vps_hard_sl(source=source or "信号")
+        ref_px = round(self._safe_float(tv_ref, 0), 2)
+        if ref_px <= 0:
+            return False
+        entry = float(self.tv_price or self.watched_entry or 0)
+        side = str(payload.get("action") or payload.get("side") or self.current_side or "").upper()
+        if side not in ("LONG", "SHORT"):
+            side = self.current_side
+        return self._refresh_vps_hard_sl(
+            entry=entry, side=side,
+            regime=self.regime, atr=self.current_atr,
+            tv_sl_ref=ref_px, source=source or "TV参考",
+        )
 
     def _clamp_radar_to_tv_floor(self, radar_sl):
         """雷达保本线不得低于 TV 硬止损底线"""
@@ -5151,7 +5272,7 @@ class PositionSupervisor:
         return enrich_signal_fields(
             payload,
             action,
-            fetch_atr=fetch_eth_atr_14_public,
+            fetch_atr=lambda: fetch_eth_atr_14_public(symbol=self.atr_fallback_symbol),
             fallback_regime=self.regime or 3,
             fallback_atr=self.current_atr or 30.0,
             fallback_price=live_px,
@@ -6045,12 +6166,18 @@ class PositionSupervisor:
             deepcoin_client.set_leverage(self.symbol, leverage=EXCHANGE_LEVERAGE)
             notional = qty * self.face_value * curr_px
             budget_txt = format_vps_sizing_note(sizing_meta, qty=qty, entry_type=ENTRY_TYPE_OPEN)
-            logger.info(f"📐 仓位预算: {budget_txt} (名义 ~{notional:.0f}U)")
+            logger.info(f"📐 仓位预算 [{self.symbol}]: {budget_txt} (名义 ~{notional:.0f}U)")
+
+            cap_ok, _cap_meta = self._assert_notional_cap_or_reject(
+                qty, curr_px, sizing_meta=sizing_meta,
+            )
+            if not cap_ok:
+                return
 
             if not self._wait_verify(self._verify_flat, retries=4, delay=0.35):
                 logger.error("开仓中止：市价下单前盘口仍非空")
                 dingtalk.report_system_alert(
-                    "开仓中止 · 下单前盘口非空",
+                    f"开仓中止 · 下单前盘口非空 [{self.symbol}]",
                     f"TV **{action}** 目标 **{qty}** 张，下单前 REST 仍显示持仓，已拒绝叠仓",
                     suggestion="系统将尝试强制清场，请核查是否有人工挂单或残仓",
                 )
@@ -6058,7 +6185,7 @@ class PositionSupervisor:
 
             open_side = "buy" if action == "LONG" else "sell"
             pos_side = "long" if action == "LONG" else "short"
-            logger.info(f"🚀 [唯一主仓] 极速开仓: {open_side} {qty} 张 | 档位 {self.regime}")
+            logger.info(f"🚀 [唯一主仓] 极速开仓: {open_side} {qty} 张 | {self.symbol} | 档位 {self.regime}")
             res = deepcoin_client.place_market_order(self.symbol, open_side, pos_side, qty)
             if not res or not deepcoin_client._is_success(res):
                 logger.error("开仓失败：市价单未成交")
@@ -6096,7 +6223,7 @@ class PositionSupervisor:
             self.add_count = 0
             self._protect_and_monitor(
                 real_qty, pos['entry_price'],
-                budget_note=f"{budget_txt} | ",
+                budget_note=f"[{self.symbol}] {budget_txt} | ",
                 target_qty=qty,
                 sizing_meta=sizing_meta,
             )
@@ -6105,7 +6232,11 @@ class PositionSupervisor:
 
     def _protect_and_monitor(self, qty, entry_price, budget_note="", target_qty=0, sizing_meta=None):
         tp_pxs = self.tv_tps
-        # 开仓后 current_sl 必须是硬止损底线，绝不能写成成本价
+        self._refresh_vps_hard_sl(
+            entry=entry_price, side=self.current_side, regime=self.regime,
+            atr=self.current_atr, tv_sl_ref=getattr(self, "tv_sl_ref", 0) or None,
+            source="开仓后",
+        )
         hard_sl = float(getattr(self, "tv_sl", 0) or 0)
         self.current_sl = hard_sl if hard_sl > 0 else 0.0
         self.best_price = entry_price
@@ -6192,6 +6323,8 @@ class PositionSupervisor:
                 leverage=EXCHANGE_LEVERAGE,
                 vps_sizing_meta=sizing_meta,
                 tv_field_sources=getattr(self, "_last_tv_field_sources", {}),
+                symbol=self.symbol,
+                unit_label=self.unit_label,
             )
             if expected > 0 and matched < expected:
                 self._open_tp_unconfirmed = True
@@ -6669,6 +6802,7 @@ class PositionSupervisor:
                         self._shield_arm_notified = True
                     self.sizing_principal = float(s.get("sizing_principal", 0) or 0)
                     self.tv_sl = float(s.get("tv_sl", 0) or 0)
+                    self.tv_sl_ref = float(s.get("tv_sl_ref", 0) or 0)
                     self._last_applied_tv_sl = float(
                         s.get("last_applied_tv_sl", 0) or 0
                     )
@@ -6971,8 +7105,44 @@ class PositionSupervisor:
             dingtalk.report_system_alert("重启接管失败", str(e))
 
 
-position_supervisor = PositionSupervisor()
+position_supervisor = None
+SUPERVISORS = {}
 
-# 仅在被 app / gunicorn 导入时执行一次闪电接管（避免 deploy 重复启动双进程）
-if __name__ != "__main__":
-    position_supervisor.recover_state_on_startup()
+
+def get_supervisor(symbol="ETH-USDT-SWAP"):
+    from symbol_config import resolve_deepcoin_symbol
+    meta = resolve_deepcoin_symbol(symbol)
+    sym = meta["symbol"]
+    if sym not in SUPERVISORS:
+        SUPERVISORS[sym] = PositionSupervisor(sym)
+    return SUPERVISORS[sym]
+
+
+def get_supervisor_for_payload(data):
+    from symbol_config import extract_symbol_from_payload, resolve_deepcoin_symbol, active_deepcoin_symbols
+    raw = extract_symbol_from_payload(data) if isinstance(data, dict) else ""
+    meta = resolve_deepcoin_symbol(raw or "ETH-USDT-SWAP")
+    sym = meta["symbol"]
+    allowed = set(active_deepcoin_symbols())
+    if sym not in allowed:
+        return None, sym
+    return get_supervisor(sym), sym
+
+
+def bootstrap_supervisors():
+    from symbol_config import active_deepcoin_symbols
+    global position_supervisor
+    for sym in active_deepcoin_symbols():
+        get_supervisor(sym)
+    position_supervisor = SUPERVISORS.get("ETH-USDT-SWAP") or next(iter(SUPERVISORS.values()), None)
+    if __name__ != "__main__":
+        for sym, sup in SUPERVISORS.items():
+            try:
+                logger.info(f"🔄 启动恢复 [{sym}] …")
+                sup.recover_state_on_startup()
+            except Exception as e:
+                logger.error(f"启动恢复失败 [{sym}]: {e}")
+    return SUPERVISORS
+
+
+bootstrap_supervisors()
