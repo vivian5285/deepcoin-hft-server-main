@@ -63,7 +63,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.75.0-force-close-then-open"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.76.0-always-close-then-open"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -5614,7 +5614,22 @@ class PositionSupervisor:
                         close_meta=close_meta,
                     )
             elif raw_action == "CLOSE":
-                self._close_all(f"🧹 换防清场：{close_reason}{close_extra}", close_meta=close_meta)
+                pos = self._get_active_position()
+                tv_reason = close_reason or "TV单独平仓清场"
+                if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
+                    logger.info(
+                        f"🧹 TV单独平仓但盘口已空 → 撤净挂单复位等待 | {tv_reason}{close_extra}"
+                    )
+                    self._handle_manual_flat_detected(
+                        tv_reason,
+                        close_meta=close_meta,
+                        curr_px=self.tv_price,
+                    )
+                else:
+                    self._close_all(
+                        f"🧹 TV单独平仓清场：{tv_reason}{close_extra}",
+                        close_meta=close_meta,
+                    )
             elif raw_action == "UPDATE_SL":
                 self._handle_tv_sl_update(payload)
             elif raw_action == "UPDATE_TP":
@@ -5783,13 +5798,15 @@ class PositionSupervisor:
             ).start()
 
     def _full_reentry(self, action, close_reason):
+        """铁律：先平现有仓 → 净挂单 → 再开仓刷新；钉钉核实。"""
+        reason = close_reason or "TV开仓·一律先平后开"
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
-        if not self._close_all(close_reason, reset_state=True):
+        if not self._close_all(reason, reset_state=True):
             logger.error("❌ 先平后开中止：平仓未归零，拒绝叠仓开仓")
             dingtalk.report_system_alert(
                 "先平后开中止 · 平仓未归零",
-                "6 轮强平后盘口仍有持仓，已拒绝新开仓，请人工核查 Deepcoin 盘口",
+                "强平后盘口仍有持仓，已拒绝新开仓，请人工核查 Deepcoin 盘口",
             )
             return
         if not self._wait_verify(self._verify_flat, retries=8, delay=0.5):
@@ -5802,8 +5819,22 @@ class PositionSupervisor:
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
         curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
-        if curr_px > 0:
-            self._open_position(action, curr_px)
+        if curr_px <= 0:
+            logger.error("❌ 先平后开中止：无有效市价")
+            return
+        try:
+            dingtalk.report_system_alert(
+                title=f"先平后开·执行 [{self.symbol}]",
+                detail=(
+                    f"{reason} | 无菌通过 @ {float(curr_px):.2f} → 开 {action} "
+                    f"| 终态必须有仓"
+                ),
+                level="信息",
+                suggestion="已先平后开；核对实盘仓位与 TP/止损",
+            )
+        except Exception:
+            pass
+        self._open_position(action, curr_px)
 
     def _handle_manual_flat_detected(self, reason, close_meta=None, curr_px=0.0):
         """人工全平 / 止盈吃满 / 止损触发：智能复位账本 + 四标签收网钉钉"""
@@ -6062,7 +6093,9 @@ class PositionSupervisor:
             return False
 
     def _handle_smart_entry(self, action, payload=None):
-        """VPS sizing：OPEN 同向智能；反向/确需刷新才先平后开；加仓重挂 TP123"""
+        """
+        铁律：带开仓的 TV → 一律先平后开刷新；单独平仓由 CLOSE* 清零等待。
+        """
         payload = payload or {}
         entry_type = normalize_entry_type(payload.get("entry_type"))
 
@@ -6071,152 +6104,41 @@ class PositionSupervisor:
             self._touch_entry_signal_signature(action)
             return
 
-        if entry_type == ENTRY_TYPE_OPEN:
-            pos = self._get_active_position()
-            if pos and self._safe_qty(pos.get("size", 0)) > 0:
-                live_side = self._pos_side_label(pos)
-                if live_side != action:
-                    logger.info(
-                        f"⚡ 反方向 OPEN [{action}] vs 实盘 [{live_side}] → 先平后开"
-                    )
-                    self._full_reentry(
-                        action, "反方向 OPEN 到达，触发【先平后开】原子对冲换防",
-                    )
-                    self._touch_entry_signal_signature(action)
-                    return
-
-                curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
-                if self._is_fresh_open_cooldown(pos):
-                    logger.warning(
-                        f"🛡️ 同向 OPEN 冷却 {OPEN_SAME_DIR_COOLDOWN_SEC:.0f}s 内 "
-                        f"→ 禁止先平后开，仅刷新 TP123 [{action}]"
-                    )
-                    mode, diff_pct, reason, open_atr, tv_atr = (
-                        self._same_direction_entry_mode(action, pos, curr_px)
-                    )
-                    self._same_direction_refresh_tp(
-                        action, pos, curr_px, diff_pct, open_atr, tv_atr,
-                    )
-                    self._touch_entry_signal_signature(action)
-                    return
-
-                mode, diff_pct, reason, open_atr, tv_atr = (
-                    self._same_direction_entry_mode(action, pos, curr_px)
-                )
-                if mode == "REFRESH_TP":
-                    self._same_direction_refresh_tp(
-                        action, pos, curr_px, diff_pct, open_atr, tv_atr,
-                    )
-                    self._touch_entry_signal_signature(action)
-                    return
-
-                close_msgs = {
-                    "atr_changed": (
-                        f"同向 TV ATR 变化 ({open_atr:.2f}→{tv_atr:.2f})，"
-                        f"触发【先平后开】刷新仓位"
-                    ),
-                    "regime_changed": "同向 TV 档位变化，触发【先平后开】重入",
-                    "spread_ok": (
-                        f"同向理论价差 {diff_pct:.3f}% 达标，触发【先平后开】重入"
-                    ),
-                }
-                self._report_smart_reentry(
-                    action, pos, diff_pct, reason, open_atr, tv_atr,
-                )
-                self._full_reentry(
-                    action,
-                    close_msgs.get(reason, "同方向刷新仓位，触发【先平后开】重入"),
-                )
-                self._touch_entry_signal_signature(action)
-                return
-            if self._is_duplicate_flat_entry(
-                action, deepcoin_client.get_current_price(self.symbol) or self.tv_price,
-            ):
-                logger.info(f"🧠 TV OPEN 短时重复 [{action}] → 忽略")
-                self._touch_entry_signal_signature(action)
-                return
-            if not self._ensure_flat_before_open("TV OPEN"):
-                dingtalk.report_system_alert(
-                    "TV OPEN 中止",
-                    "盘口非空，拒绝叠仓",
-                    suggestion="请人工核查盘口，待全平后再等下一 TV 信号",
-                )
-                return
-            deepcoin_client.cancel_all_open_orders(self.symbol)
-            time.sleep(0.5)
-            curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
-            if curr_px > 0:
-                self._open_position(action, curr_px, payload=payload)
-            self._touch_entry_signal_signature(action)
-            return
-
         curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
+        if self._verify_flat() and self._is_duplicate_flat_entry(action, curr_px):
+            logger.info(f"🧠 空仓短时重复开仓 TV [{action}] → 忽略，干净等待下次")
+            try:
+                self._call_dingtalk(
+                    dingtalk.report_smart_same_dir_decision,
+                    side=action,
+                    decision="skip_duplicate_flat",
+                    live_entry=0.0,
+                    tv_price=self.tv_price,
+                    diff_pct=0.0,
+                    threshold_pct=SAME_DIR_MIN_SPREAD_PCT,
+                    open_regime=self.regime,
+                    tv_regime=self.regime,
+                    open_atr=self._last_entry_signal.get("atr", self.current_atr),
+                    tv_atr=self.current_atr,
+                    qty=0.0,
+                    verify_note="空仓重复开仓信号已忽略 | 状态干净等待",
+                )
+            except Exception:
+                pass
+            self._touch_entry_signal_signature(action)
+            return
+
         pos = self._get_active_position()
-
-        if pos and self._safe_qty(pos.get("size", 0)) > 0:
-            current_side = self._pos_side_label(pos)
-            if current_side != action:
-                logger.info(f"⚡ 反方向 [{action}] vs 实盘 [{current_side}] → 先平后开")
-                self._full_reentry(action, "反方向指令到达，触发【先平后开】原子对冲换防")
-                self._touch_entry_signal_signature(action)
-                return
-
-            mode, diff_pct, reason, open_atr, tv_atr = self._same_direction_entry_mode(action, pos, curr_px)
-            if mode == "REFRESH_TP":
-                self._same_direction_refresh_tp(action, pos, curr_px, diff_pct, open_atr, tv_atr)
-                self._touch_entry_signal_signature(action)
-                return
-
-            close_msgs = {
-                "atr_changed": f"同向 TV ATR 变化 ({open_atr:.2f}→{tv_atr:.2f})，触发【先平后开】刷新仓位",
-                "regime_changed": "同向 TV 档位变化，触发【先平后开】重入",
-                "spread_ok": f"同向理论价差 {diff_pct:.3f}% 达标，触发【先平后开】重入",
-            }
-            self._report_smart_reentry(action, pos, diff_pct, reason, open_atr, tv_atr)
-            self._full_reentry(action, close_msgs.get(reason, "同方向刷新仓位，触发【先平后开】重入"))
-            self._touch_entry_signal_signature(action)
-            return
-
-        if self._is_duplicate_flat_entry(action, curr_px):
-            ref_px = curr_px or self.tv_price or 1.0
-            diff_pct = self._entry_price_diff_pct(
-                self._last_entry_signal.get("tv_price", 0), self.tv_price, ref_px,
-            )
-            logger.info(f"🧠 空仓短时重复同向 TV [{action}] → 忽略开仓")
-            self._call_dingtalk(
-                dingtalk.report_smart_same_dir_decision,
-                side=action,
-                decision="skip_duplicate_flat",
-                live_entry=0.0,
-                tv_price=self.tv_price,
-                diff_pct=diff_pct,
-                threshold_pct=SAME_DIR_MIN_SPREAD_PCT,
-                open_regime=self.regime,
-                tv_regime=self.regime,
-                open_atr=self._last_entry_signal.get("atr", self.current_atr),
-                tv_atr=self.current_atr,
-                qty=0.0,
-                verify_note=(
-                    f"5分钟内重复 {action} | ATR {self.current_atr:.2f} 未变 | "
-                    f"TV {self.tv_price:.2f} 价差 {diff_pct:.3f}% | 档位 R{self.regime} | 未重复下单"
-                ),
-            )
-            self._touch_entry_signal_signature(action)
-            return
-
-        logger.info(f"⚡ 收到建仓信号 [{action}]，空仓极速开仓")
-        if not self._ensure_flat_before_open("空仓开仓"):
-            dingtalk.report_system_alert(
-                "开仓中止 · 盘口非空",
-                f"收到 TV **{action}** 但实盘仍有残留持仓，已拒绝叠仓开仓",
-                suggestion="请人工核查盘口，待全平后再等下一 TV 信号",
-            )
-            return
-        deepcoin_client.cancel_all_open_orders(self.symbol)
-        time.sleep(0.5)
-        curr_px = curr_px or deepcoin_client.get_current_price(self.symbol)
-        if curr_px > 0:
-            self._open_position(action, curr_px, payload=payload)
+        live_sz = self._safe_qty((pos or {}).get("size", 0))
+        live_side = self._pos_side_label(pos) if pos else None
+        logger.info(
+            f"⚡ TV开仓 [{action}] entry={entry_type} → 铁律先平后开刷新 "
+            f"| 现仓 {live_side or 'FLAT'} {live_sz}张"
+        )
+        self._full_reentry(
+            action,
+            "TV开仓·一律先平后开刷新仓位（有仓先平；无仓净挂单再开）",
+        )
         self._touch_entry_signal_signature(action)
 
     def _open_position(self, action, curr_px, payload=None):
