@@ -11,6 +11,13 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from deepcoin_client import deepcoin_client, CLIENT_VERSION
 import dingtalk
+from tv_seq import (
+    reorder_batch_close_then_open,
+    extract_seq_meta,
+    is_close_action,
+    is_open_action,
+    SAME_BAR_SETTLE_SEC,
+)
 from webhook_parser import (
     enrich_signal_fields,
     enrich_entry_tp_prices,
@@ -56,7 +63,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.34.0-dual-symbol-eth-xau"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.75.0-force-close-then-open"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2
@@ -564,14 +571,80 @@ class PositionSupervisor:
         threading.Thread(target=self._signal_worker_loop, daemon=True, name="tv-signal-worker").start()
 
     def _signal_worker_loop(self):
+        """同秒开+平：短停聚合后强制先平后开（终态必须有仓）。"""
         while True:
-            payload = self._signal_queue.get()
+            first = self._signal_queue.get()
+            batch = [first]
+            settle = max(0.3, float(SAME_BAR_SETTLE_SEC))
+            deadline = time.time() + settle
+            while True:
+                remain = deadline - time.time()
+                if remain <= 0:
+                    break
+                try:
+                    batch.append(self._signal_queue.get(timeout=remain))
+                except queue.Empty:
+                    break
+            while True:
+                try:
+                    batch.append(self._signal_queue.get_nowait())
+                except queue.Empty:
+                    break
+            batch = reorder_batch_close_then_open(batch)
+            self._annotate_close_open_chain(batch)
+            for payload in batch:
+                try:
+                    bi, sq = extract_seq_meta(payload or {})
+                    act = str((payload or {}).get("action", "")).upper()
+                    if bi is not None:
+                        logger.info(
+                            f"⚙️ [{self.symbol}] 时序消费 bar={bi} seq={sq} action={act}"
+                        )
+                    self._process_signal(payload)
+                except Exception as e:
+                    logger.error(f"❌ 信号处理异常: {e}", exc_info=True)
+                finally:
+                    try:
+                        self._signal_queue.task_done()
+                    except ValueError:
+                        pass
+
+    def _annotate_close_open_chain(self, batch):
+        """同秒开+平 → 钉钉标明强制先平后开。"""
+        by_bar = {}
+        for p in batch or []:
+            bi, sq = extract_seq_meta(p or {})
+            act = str((p or {}).get("action", "")).strip().upper()
+            key = bi if bi is not None else "_legacy"
+            by_bar.setdefault(key, []).append((sq, act, p))
+        for bi, items in by_bar.items():
+            acts = [a for _, a, _ in items]
+            has_close = any(is_close_action(a) for a in acts)
+            has_open = any(is_open_action(a) for a in acts)
+            if not (has_close and has_open):
+                continue
+            exec_chain = " → ".join(
+                f"seq{sq if sq is not None else '?'}:{a}" for sq, a, _ in items
+            )
+            tv_by_seq = " → ".join(
+                f"seq{sq if sq is not None else '?'}:{a}"
+                for sq, a, _ in sorted(items, key=lambda x: (x[0] is None, x[0] or 0))
+            )
+            logger.info(
+                f"📬 [{self.symbol}] 同秒强制先平后开 | 执行序 {exec_chain} | TV {tv_by_seq}"
+            )
             try:
-                self._process_signal(payload)
+                dingtalk.report_system_alert(
+                    title=f"先平后开链·同秒开平 [{self.symbol}]",
+                    detail=(
+                        f"执行 {exec_chain} | TV按seq {tv_by_seq} | "
+                        f"终态必须开仓（动作优先于seq）"
+                    ),
+                    level="信息",
+                    suggestion="同秒开+平已强制先平后开；核对实盘终态有仓",
+                )
             except Exception as e:
-                logger.error(f"❌ 信号处理异常: {e}", exc_info=True)
-            finally:
-                self._signal_queue.task_done()
+                logger.warning(f"先平后开链钉钉失败: {e}")
 
     def _signal_fingerprint(self, payload):
         action = str(payload.get("action", "")).strip().upper()
