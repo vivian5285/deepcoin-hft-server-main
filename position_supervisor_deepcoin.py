@@ -63,7 +63,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.76.0-always-close-then-open"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.76.1-dingtalk-dedupe-qty"
 SENTINEL_POLL_NORMAL = 6
 SENTINEL_POLL_ARMING = 3
 SENTINEL_POLL_RADAR = 2

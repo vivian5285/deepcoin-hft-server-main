@@ -8,6 +8,7 @@ import hashlib
 import base64
 import urllib.parse
 import logging
+import threading
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -84,10 +85,40 @@ def _get_signed_url():
     return f"{DINGTALK_WEBHOOK}&timestamp={ts}&sign={sign}"
 
 
+# 标题短窗去重（与币安一致：防雷同告警刷屏）
+DINGTALK_TITLE_DEDUP_SEC = float(os.getenv("DINGTALK_TITLE_DEDUP_SEC", "120"))
+DINGTALK_ALERT_DEDUP_SEC = float(os.getenv("DINGTALK_ALERT_DEDUP_SEC", "600"))
+_title_dedup_lock = threading.Lock()
+_title_dedup_ts = {}
+
+
+def _title_dedup_window(title):
+    t = str(title or "")
+    if "异常减仓" in t or "系统告警" in t:
+        return float(DINGTALK_ALERT_DEDUP_SEC)
+    return float(DINGTALK_TITLE_DEDUP_SEC)
+
+
 def send_alert(title, data_dict, header_color=P_TITLE):
     signed_url = _get_signed_url()
     if not signed_url:
         return
+
+    raw_title = str(title or "")
+    dedup_key = raw_title[:96]
+    now = time.time()
+    window = _title_dedup_window(raw_title)
+    with _title_dedup_lock:
+        dead = [
+            k for k, ts in _title_dedup_ts.items()
+            if now - float(ts) > max(window, DINGTALK_TITLE_DEDUP_SEC) * 4
+        ]
+        for k in dead:
+            _title_dedup_ts.pop(k, None)
+        last = float(_title_dedup_ts.get(dedup_key) or 0)
+        if last > 0 and now - last < window:
+            return
+        _title_dedup_ts[dedup_key] = now
 
     text_lines = [f"- **{k}** : {v}" for k, v in data_dict.items()]
     body_text = "\n".join(text_lines)
