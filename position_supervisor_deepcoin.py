@@ -25,7 +25,6 @@ from breath_stop import (
     get_breathing_coefficient,
     STOP_EXEC_BUFFER_USD,
 )
-from atr_1h import get_atr_1h_engine
 from webhook_parser import (
     enrich_signal_fields,
     enrich_entry_tp_prices,
@@ -72,7 +71,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.80.0-radar-tp12-gate"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.81.0-tv-atr-no-tp3"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -2293,7 +2292,7 @@ class PositionSupervisor:
         tp_pxs = tp_pxs if tp_pxs is not None else self.tv_tps
         consumed = set(getattr(self, "tp_levels_consumed", []) or [])
         return sum(
-            1 for i, t in enumerate(tp_pxs)
+            1 for i, t in enumerate((tp_pxs or [])[:2])
             if t > 0 and (i + 1) not in consumed
         )
 
@@ -2306,10 +2305,10 @@ class PositionSupervisor:
         initial_qty = self._safe_qty(initial_qty)
         ratios = self.regime_settings[self._tp_split_regime()]["ratios"]
         o1, o2, o3 = self._calculate_tp_quantities(initial_qty, ratios)
+        # v13.81：只返回 TP1+TP2 限价切片；TP3 量留给雷达
         return [
             {"level": 1, "price": self.tv_tps[0], "qty": o1},
             {"level": 2, "price": self.tv_tps[1], "qty": o2},
-            {"level": 3, "price": self.tv_tps[2], "qty": o3},
         ]
 
     @staticmethod
@@ -2440,7 +2439,7 @@ class PositionSupervisor:
         qty_map = self._split_remaining_tp_quantities(live_qty)
         qty_map = self._normalize_tp_qty_map(qty_map, live_qty)
         levels = []
-        for level in (1, 2, 3):
+        for level in (1, 2):  # v13.81: TP3 永不挂限价
             if level in consumed:
                 continue
             price = self.tv_tps[level - 1]
@@ -2784,21 +2783,23 @@ class PositionSupervisor:
         return atr if atr > 0 else 0.0
 
     def _atr_1h_engine(self):
-        sym = str(getattr(self, "atr_fallback_symbol", None) or "ETHUSDT").upper()
-        return get_atr_1h_engine(sym, fetch_binance_klines)
+        """已废除：ATR 只信 TV webhook。"""
+        return None
 
     def _refresh_breathing_coefficient(self, force=False):
-        """用 Binance 1h ATR / initial_atr 更新呼吸系数（3 次平滑）。"""
+        """呼吸系数固定 1.0（ATR 只用 TV 锁值）。"""
         init = float(getattr(self, "open_atr", 0) or 0)
-        if init <= 0:
-            return float(getattr(self, "breathing_coefficient", 1.0) or 1.0)
-        eng = self._atr_1h_engine()
-        eng.ratio_history = list(getattr(self, "_breath_ratio_history", None) or [])
-        profile = getattr(self, "breath_profile", None)
-        coeff, meta = eng.breathing_coefficient(init, force_refresh=force, profile=profile)
-        self.breathing_coefficient = float(coeff or 1.0)
-        self._breath_ratio_history = list(meta.get("ratio_history") or [])
-        self._breath_coeff_meta = meta
+        self.breathing_coefficient = 1.0
+        self._breath_coeff_meta = {
+            "atr_1h": 0.0,
+            "initial_atr": init,
+            "ratio": 1.0,
+            "smoothed": 1.0,
+            "source": "tv_fixed",
+            "ratio_history": list(getattr(self, "_breath_ratio_history", None) or []),
+        }
+        if init > 0:
+            self.current_atr = float(init)
         return self.breathing_coefficient
 
     def _should_ignore_late_close(self, payload=None):
@@ -2996,6 +2997,8 @@ class PositionSupervisor:
             return 0
         placed = 0
         for lv in self._expected_tp_levels(live_qty):
+            if int(lv.get("level") or 0) >= 3:
+                continue  # TP3 永不挂限价
             q, px = float(lv["qty"] or 0), float(lv["price"] or 0)
             if q <= 0 or px <= 0:
                 continue
@@ -5027,8 +5030,15 @@ class PositionSupervisor:
         if live_qty > DUST_ORPHAN_CONTRACTS and self._expected_tp_count() == 0:
             self._sanitize_tp_consumed(initial_qty, live_qty, curr_px)
             if self._expected_tp_count() == 0 and live_qty > DUST_ORPHAN_CONTRACTS:
-                logger.warning(f"⚠️ 仍有 {live_qty}张 但无待挂 TP → 强制挂最后一档 TP3")
+                logger.warning(
+                    f"⚠️ 仍有 {live_qty}张 且无待挂 TP → TP1+TP2 已尽，"
+                    f"余仓交雷达（不挂TP3限价）"
+                )
                 self.tp_levels_consumed = [1, 2]
+                try:
+                    self._cancel_tp_orders_at_levels([3])
+                except Exception:
+                    pass
                 self._save_state()
 
         n_stale = self._cancel_tp_orders_at_levels(consumed)
@@ -6451,7 +6461,7 @@ class PositionSupervisor:
         else:
             self.initial_stop = 0.0
         try:
-            self._atr_1h_engine().reset_ratio_history()
+            self._breath_ratio_history = []
         except Exception:
             pass
         self._refresh_breathing_coefficient(force=True)

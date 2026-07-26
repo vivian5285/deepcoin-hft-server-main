@@ -1,6 +1,6 @@
 # 深币 Deepcoin · ETH 永续 Webhook 交易系统
 
-**当前版本：`v13.80.0-radar-tp12-gate`**
+**当前版本：`v13.81.0-tv-atr-no-tp3`**
 
 与币安 VPS **同一套军师大脑逻辑**（`position_supervisor_deepcoin.py` 镜像 `position_supervisor_binance.py`）。本文档侧重深币部署差异；**完整统一逻辑见币安仓库 README**（两仓库 README 同步维护）。
 
@@ -11,23 +11,24 @@
 | 端口 | **5004** |
 | 单位 | **张**（0.1 ETH/张） |
 | 杠杆 | **20x** cross |
-| 健康检查 | `GET /health` → `"version":"v13.80.0-radar-tp12-gate"` |
+| 健康检查 | `GET /health` → `"version":"v13.81.0-tv-atr-no-tp3"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
 
 ---
 
-## 与币安统一的核心逻辑（v13.80 · 对齐币安 v16.3.7）
+## 与币安统一的核心逻辑（v13.80 · 对齐币安 v16.4.0）
 
 以下与币安单系统 **对齐**，详见 [`eth-webhook-server` README](https://github.com/vivian5285/eth-webhook-server)：
 
 - **硬止损**：`|TV.price−TV.stop_loss|×1.15` 锚定成交价；永久共存，不因雷达激活撤销  
 - **雷达启动（规格 §5.1 绝对价）**：首次 **`(TP1+TP2)/2`** · 重入 **`TP2`**（共用同一套 TP 绝对价；过中点未到 TP2 不得激活重入雷达）  
 - **激活臂**：entry ± 0.5×ATR  
-- **TP123**：10/20/70；TP3↔雷达互斥  
+- **TP**：概念 10/20/70；**仅挂 TP1+TP2 限价**；TP3(70%) 永不挂限价交雷达；ATR 只信 TV  
 - **重入**：最多 1 次；强趋势 + TP1 未成交等闸门以币安 README 为准  
 - **通知**：雷达激活文案区分「TP1-TP2中点 / TP2绝对价」  
 
+> **v13.81.0**：删 TP3 限价 + ATR 只信 TV（对齐币安 v16.4.0）。  
 > **v13.80.0**：雷达绝对价门 + `reentry_profiles.radar_gate_price_from_tps`；钉钉文案对齐币安。  
 > 旧 Regime activation 92%/95% 仅作无 TP12 时的兜底，不再是主路径。
 
