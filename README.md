@@ -1,6 +1,6 @@
 # 深币 Deepcoin · ETH 永续 Webhook 交易系统
 
-**当前版本：`v13.28.0-manual-open-radar-guard`**
+**当前版本：`v13.80.0-radar-tp12-gate`**
 
 与币安 VPS **同一套军师大脑逻辑**（`position_supervisor_deepcoin.py` 镜像 `position_supervisor_binance.py`）。本文档侧重深币部署差异；**完整统一逻辑见币安仓库 README**（两仓库 README 同步维护）。
 
@@ -11,27 +11,25 @@
 | 端口 | **5004** |
 | 单位 | **张**（0.1 ETH/张） |
 | 杠杆 | **20x** cross |
-| 健康检查 | `GET /health` → `"version":"v13.26.0-add-tp-radar-realign"` |
+| 健康检查 | `GET /health` → `"version":"v13.80.0-radar-tp12-gate"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
 
 ---
 
-## 与币安统一的核心逻辑（v13.26）
+## 与币安统一的核心逻辑（v13.80 · 对齐币安 v16.3.7）
 
-以下两工厂 **完全一致**，详见 [`eth-webhook-server` README](https://github.com/vivian5285/eth-webhook-server)：
+以下与币安单系统 **对齐**，详见 [`eth-webhook-server` README](https://github.com/vivian5285/eth-webhook-server)：
 
-- **防线总线** `_ensure_full_defense_stack()`：TP123 + `tv_sl` + 雷达待命  
-- **硬止损** exclusively TV `tv_sl`（无 ±10% fallback）  
-- **TP1 验证门控** `_tp1_filled_verified()`：伪 TP1 → `_disarm_premature_radar()`  
-- **安全雷达交棒** `_perform_radar_handoff()`：先挂保本 STOP → 核实 → 再撤 tv_sl → 钉钉  
-- **mark gap** `RADAR_STOP_MIN_GAP`：防刚激活就 closePosition 全平  
-- **同向智能筛选** ATR → Regime → 价差 0.15%  
-- **空闲巡检 12s** orphan 同向接管 / 反向强平  
-- **动态加仓 v6.9.93**：OPEN 由 VPS sizing；PYRAMID/PROFIT_ADD = `base_qty × TV qty_ratio`  
-- **加仓后重挂** `_realign_after_position_add()`：撤旧 TP → 按 TV TP123 价 + 新总头寸重挂 + 雷达/tv_sl 同步  
-- **Regime activation** 92%/95%（对齐 TV v6.9.86）  
-- **trailTight** TP1 后 0.20 ATR / TP2 后 0.30 ATR  
+- **硬止损**：`|TV.price−TV.stop_loss|×1.15` 锚定成交价；永久共存，不因雷达激活撤销  
+- **雷达启动（规格 §5.1 绝对价）**：首次 **`(TP1+TP2)/2`** · 重入 **`TP2`**（共用同一套 TP 绝对价；过中点未到 TP2 不得激活重入雷达）  
+- **激活臂**：entry ± 0.5×ATR  
+- **TP123**：10/20/70；TP3↔雷达互斥  
+- **重入**：最多 1 次；强趋势 + TP1 未成交等闸门以币安 README 为准  
+- **通知**：雷达激活文案区分「TP1-TP2中点 / TP2绝对价」  
+
+> **v13.80.0**：雷达绝对价门 + `reentry_profiles.radar_gate_price_from_tps`；钉钉文案对齐币安。  
+> 旧 Regime activation 92%/95% 仅作无 TP12 时的兜底，不再是主路径。
 
 ### 动态加仓档位（与币安同号）
 

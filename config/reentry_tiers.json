@@ -1,0 +1,84 @@
+{
+  "schema": "v3.1-tp12-absolute-gate",
+  "activation_tp1_frac": 0.0,
+  "activation_tp1_frac_reentry": 1.0,
+  "note": "激活价改用 TP1/TP2 绝对锚定：首次=(TP1+TP2)/2，重入=TP2；frac 仅作模式标记",
+  "arm_sl_atr": 0.5,
+  "limit_discount": 0.003,
+  "limit_ttl_sec": 300,
+  "max_reentries": 1,
+  "max_unfilled_refreshes": 5,
+  "adx_bounds": {
+    "weak_lt": 20,
+    "strong_gt": 30
+  },
+  "hard_sl_buffer_mult": 1.15,
+  "ETH": {
+    "tv_tf_sec": 5400,
+    "reentry_window_bars": 2,
+    "reentry_zone_atr": 0.5,
+    "tiers": [
+      {
+        "name": "weak",
+        "step_trigger_atr": 0.40,
+        "step_advance_atr": 0.25,
+        "breath_tp12": 0.80,
+        "breath_tp23": 1.00,
+        "min_mult": 1.2,
+        "max_mult": 1.5
+      },
+      {
+        "name": "mid",
+        "step_trigger_atr": 0.50,
+        "step_advance_atr": 0.35,
+        "breath_tp12": 1.20,
+        "breath_tp23": 1.60,
+        "min_mult": 2.0,
+        "max_mult": 2.5
+      },
+      {
+        "name": "strong",
+        "step_trigger_atr": 0.60,
+        "step_advance_atr": 0.40,
+        "breath_tp12": 1.50,
+        "breath_tp23": 2.00,
+        "min_mult": 2.5,
+        "max_mult": 3.5
+      }
+    ]
+  },
+  "XAU": {
+    "tv_tf_sec": 2700,
+    "reentry_window_bars": 3,
+    "reentry_zone_atr": 0.3,
+    "tiers": [
+      {
+        "name": "weak",
+        "step_trigger_atr": 0.35,
+        "step_advance_atr": 0.20,
+        "breath_tp12": 0.70,
+        "breath_tp23": 0.90,
+        "min_mult": 1.0,
+        "max_mult": 1.3
+      },
+      {
+        "name": "mid",
+        "step_trigger_atr": 0.40,
+        "step_advance_atr": 0.30,
+        "breath_tp12": 1.00,
+        "breath_tp23": 1.40,
+        "min_mult": 1.8,
+        "max_mult": 2.2
+      },
+      {
+        "name": "strong",
+        "step_trigger_atr": 0.50,
+        "step_advance_atr": 0.35,
+        "breath_tp12": 1.30,
+        "breath_tp23": 1.80,
+        "min_mult": 2.2,
+        "max_mult": 3.0
+      }
+    ]
+  }
+}

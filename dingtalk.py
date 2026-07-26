@@ -143,15 +143,11 @@ def send_alert(title, data_dict, header_color=P_TITLE):
 
 
 def get_regime_name(regime_code):
-    names = {
-        1: "🧊 [1档] 极弱震荡 (保守防守)",
-        2: "🚶 [2档] 弱势波段 (稳健推升)",
-        3: "🏃 [3档] 中势推升 (标准波段)",
-        4: "🚀 [4档] 强势单边 (趋势吃满)",
-    }
-    shade = [P_MUTED, P_LIGHT, P_MAIN, P_ACCENT]
-    idx = regime_code if 1 <= regime_code <= 4 else 0
-    return _p(names.get(regime_code, "未知状态"), shade[idx - 1] if idx else P_MUTED)
+    """
+    旧「评分档位/中势推升/R1-R4」文案已废除。
+    regime 内部编号可保留供逻辑使用，用户可见一律 RISK20。
+    """
+    return _p("算仓=本金20%风险资金×5x杠杆（RISK20）", P_MUTED)
 
 
 def _format_tp_compare(tp_pxs, tv_tps=None):
@@ -242,7 +238,7 @@ def report_principal_snapshot(reason, principal, regime=None, margin_pct=None, t
         ),
     }
     if regime and margin_pct is not None:
-        data["🔢 TV 档位"] = get_regime_name(int(regime))
+        data["📐 算仓模式"] = get_regime_name(int(regime))
         if meta:
             data["📐 预算公式"] = _p(
                 _format_vps_sizing_basis(principal, meta=meta, leverage=f"{lev}x"),
@@ -257,7 +253,7 @@ def report_principal_snapshot(reason, principal, regime=None, margin_pct=None, t
         data["🎯 目标仓位"] = _p(f"**{target_qty}** {UNIT_LABEL}", P_MAIN)
     if verify_note:
         data["🔍 核实明细"] = _p(verify_note, P_MUTED)
-    send_alert("📸 本金快照 · 档位预算基数已锁定", data, P_TITLE)
+    send_alert("📸 本金快照 · RISK20 预算基数已锁定", data, P_TITLE)
 
 
 def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime, tv_tps=None,
@@ -276,9 +272,9 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
     data = {
         "🎛️ 品种": _p(f"**{sym}**", P_ACCENT),
         "🎛️ 趋势方向": side_str,
-        "📊 市场强度": get_regime_name(regime),
+        "📐 算仓模式": get_regime_name(regime),
         "🕸️ TP123 比例": _p(
-            f"开仓 R{regime} → **{format_regime_tp_ratios_label(regime)}%** (对齐 TV qty_percent)",
+            f"**{format_regime_tp_ratios_label(regime)}%** (固定分腿·RISK20)",
             P_LIGHT,
         ),
         "💰 进场成本": _p(f"**{entry_price:.2f}** USDT (滑点: **{slip_txt}**)", P_MAIN),
@@ -409,10 +405,23 @@ def _classify_close(reason, verify_note="", swept_dust=False, close_type="", clo
             "header": P_TITLE,
         }
     if ct == CLOSE_TYPE_PROTECT:
+        reason = (tv_reason or r or "反转保护").strip()
+        import re
+        reason = re.sub(r"\s*\|\s*TV档位\s*R\d+", "", reason)
+        reason = re.sub(r"\bR[1-4]\b", "", reason)
+        reason = re.sub(r"(中势推升|极弱震荡|弱势波段|强势单边|风控拦截)", "", reason)
+        reason = re.sub(r"\s{2,}", " ", reason).strip(" |")
+        if "已空仓" in reason or "盘口已空" in reason or "已空仓" in r:
+            return {
+                "title": f"已空仓复位：{reason[:80]}",
+                "tag": _p("**账本复位**", P_MUTED),
+                "status": _p("盘口已无仓；本次仅撤挂单并清账本（非新成交平仓）。", P_MUTED),
+                "header": P_MUTED,
+            }
         return {
-            "title": "🛡️ 风控拦截 · 保护性全平",
-            "tag": _p("**风控拦截**", P_ACCENT),
-            "status": _p("策略风控触发，多空网格全撤，空仓待命。", P_ACCENT),
+            "title": f"反转保护平仓：{reason[:80] or '反转保护'}",
+            "tag": _p("**反转保护**", P_ACCENT),
+            "status": _p("市价全平 + 撤单 + 状态重置。", P_ACCENT),
             "header": P_ACCENT,
         }
     if ct == CLOSE_TYPE_BREAKEVEN:
@@ -492,7 +501,7 @@ def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=Fa
         pnl = float(tv_pnl_pct)
         data["📈 盈亏"] = _p(f"**{pnl:+.2f}%**", P_ACCENT if pnl >= 0 else P_DEEP)
     if tv_regime is not None:
-        data["📊 TV档位"] = get_regime_name(int(tv_regime))
+        data["📐 算仓模式"] = get_regime_name(int(tv_regime))
     if tv_atr is not None and float(tv_atr or 0) > 0:
         data["📏 TV ATR"] = _p(f"`{float(tv_atr):.4f}`", P_MUTED)
     if tv_field_sources:
@@ -574,7 +583,7 @@ def report_recover_takeover(side, qty, entry, tv_tps, regime, radar_active, sl_p
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "📦 核实头寸": _p(f"**{qty}** {UNIT_LABEL} @ `{entry:.2f}`", P_MAIN),
-        "📊 恢复档位": get_regime_name(regime),
+        "📊 恢复模式": get_regime_name(regime),
     }
     if initial_qty and int(initial_qty) > int(qty):
         consumed_txt = ", ".join(f"TP{lv}" for lv in (tp_consumed_levels or [])) or "推断中"
@@ -621,14 +630,14 @@ def report_smart_same_dir_decision(side, decision, live_entry, tv_price, diff_pc
     if decision == "skip_duplicate_flat":
         title = "🧠 智能筛选：短时重复同向 · 已忽略"
         status = _p(
-            f"**5 分钟内** ATR 未变 ({atr_txt})，价差 **{diff_pct:.3f}%** < **{threshold_pct}%**，"
-            f"档位 **R{tv_regime}** → **未重复下单**。",
+            f"**5 分钟内** ATR 未变 ({atr_txt})，价差 **{diff_pct:.3f}%** < **{threshold_pct}%** "
+            f"→ **未重复下单**（RISK20）。",
             P_ACCENT,
         )
     elif decision.startswith("reentry_"):
         reason_map = {
             "reentry_atr_changed": f"**① ATR 变化** ({atr_txt}) → **先平后开** 刷新仓位",
-            "reentry_regime_changed": f"**② 档位** R{open_regime}→R{tv_regime} → **先平后开** 刷新仓位",
+            "reentry_regime_changed": f"**② 参数刷新** → **先平后开** 刷新仓位",
             "reentry_spread_ok": (
                 f"**③ 理论价差** **{diff_pct:.3f}%** ≥ **{threshold_pct}%** "
                 f"(ATR 未变 {atr_txt}) → **先平后开**"
@@ -640,7 +649,7 @@ def report_smart_same_dir_decision(side, decision, live_entry, tv_price, diff_pc
         title = "🧠 智能筛选：同向持仓 · 仅刷新止盈"
         status = _p(
             f"**① ATR 未变** ({atr_txt}) + **③ 价差** **{diff_pct:.3f}%** < **{threshold_pct}%** "
-            f"(档位 R{open_regime}) → **未再开仓**，已核实持仓并按新 TV 价刷新 TP123。",
+            f"→ **未再开仓**，已核实持仓并按新 TV 价刷新 TP123。",
             P_LIGHT,
         )
     data = {
@@ -653,7 +662,7 @@ def report_smart_same_dir_decision(side, decision, live_entry, tv_price, diff_pc
             P_ACCENT if atr_changed else P_MUTED,
         ),
         "📏 理论价差": _p(f"{diff_pct:.3f}% / 阈值 {threshold_pct}%", P_ACCENT),
-        "🔢 档位": _p(f"开仓 R{open_regime} · TV R{tv_regime}", P_MUTED),
+        "📐 算仓模式": get_regime_name(tv_regime or open_regime or 3),
         "📦 持有": _p(f"**{qty}** {UNIT_LABEL}" if qty > 0 else "无持仓", P_ACCENT),
     }
     if tp_audit:
@@ -694,38 +703,8 @@ def report_radar_regime_cap_trim(side, old_qty, new_qty, target_qty, regime, mar
                                  tp_audit=None, verify_note="",
                                  principal_balance=None, margin_usdt=None, leverage=None,
                                  trim_qty=None):
-    lev = leverage or DEFAULT_LEVERAGE
-    excess = max(0.0, float(old_qty) - float(target_qty))
-    data = {
-        "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
-        "📊 TV 档位上限": _p(
-            f"**R{regime}** 档 · VPS有效风险 **{margin_pct:.1%}** · 允许持仓 **{target_qty}** {UNIT_LABEL}",
-            P_ACCENT,
-        ),
-        "📐 核算公式": _p(
-            _format_sizing_basis(
-                principal_balance or 0, margin_pct, lev, margin_usdt,
-            ) if principal_balance else "本金快照 × 档位% × 杠杆（详见核实明细）",
-            P_LIGHT,
-        ),
-        "⚖️ 超标情况": _p(
-            f"实盘 **{old_qty}** {UNIT_LABEL} 超出目标 **{excess:.3f}** {UNIT_LABEL}"
-            + (f" · 本次裁减 **{trim_qty}** {UNIT_LABEL}" if trim_qty else ""),
-            P_ACCENT,
-        ),
-        "✂️ 裁减结果": _p(f"`{old_qty}` ➔ `{new_qty}` {UNIT_LABEL}", P_MAIN),
-        "🕸️ TP123 重挂": _p(
-            _format_tp_audit(tp_audit, None) if tp_audit else "已按新仓位重挂",
-            P_MAIN,
-        ),
-        "✅ 纠偏结果": _p(
-            "雷达最高权限：超标裁减至档位额度 → TP123 已对齐 · 移动止损逻辑不变",
-            P_MAIN,
-        ),
-    }
-    if verify_note:
-        data["🔍 核实明细"] = _p(verify_note, P_MUTED)
-    send_alert("📡 雷达守护 · 档位限额强制对齐", data, P_TITLE)
+    """已废除 CAP_ALIGN：不再推送档位裁减钉钉（RISK20 无 R1-R4 限额文案）。"""
+    return
 
 
 def report_tv_signal_received(action, entry_type="", price=0, regime=3, atr=0,
@@ -753,7 +732,7 @@ def report_tv_signal_received(action, entry_type="", price=0, regime=3, atr=0,
     data = {
         "📡 信号类型": _p(f"**{act}** · {type_txt}", P_ACCENT),
         "💹 TV价格": _p(f"`{float(price or 0):.2f}` USDT", P_MUTED),
-        "📊 档位": get_regime_name(regime),
+        "📐 算仓模式": get_regime_name(regime),
         "📡 ATR": _p(f"`{float(atr or 0):.2f}`", P_MUTED),
     }
     if tv_sl and float(tv_sl) > 0:
@@ -808,7 +787,7 @@ def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "📦 保护头寸": _p(f"**{live_qty}** {UNIT_LABEL}", P_MAIN),
         "💰 开仓成本": _p(f"`{entry:.2f}` USDT", P_MUTED),
-        "📊 档位": get_regime_name(regime),
+        "📐 算仓模式": get_regime_name(regime),
         "📡 TV底线 tv_sl": _p(f"**{tv_sl:.2f}** USDT", P_ACCENT),
         "🔒 交易所止损": _p(f"**{exchange_stop:.2f}** USDT", P_LIGHT),
         "📡 雷达状态": _p(
@@ -851,7 +830,7 @@ def report_tv_tp_updated(side, live_qty, entry, old_tps=None, new_tps=None,
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "📦 保护头寸": _p(f"**{live_qty}** {UNIT_LABEL}", P_MAIN),
         "💰 开仓成本": _p(f"`{float(entry or 0):.2f}` USDT", P_MUTED),
-        "📊 档位": get_regime_name(regime),
+        "📐 算仓模式": get_regime_name(regime),
         "📉 原 TP123": _p(_fmt(old_tps), P_MUTED),
         "🚀 新 TP123": _p(_fmt(new_tps), P_ACCENT),
         "📌 新挂档数": _p(f"**{int(placed or 0)}** 笔限价止盈", P_LIGHT),
@@ -888,9 +867,9 @@ def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entr
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "📡 加仓类型": _p(type_label, P_ACCENT),
-        "📊 档位": get_regime_name(regime),
+        "📐 算仓模式": get_regime_name(regime),
         "🕸️ TP123 比例": _p(
-            f"开仓 R{int(open_regime or regime)} → **{tp_ratio_label or format_regime_tp_ratios_label(open_regime or regime)}%**",
+            f"**{tp_ratio_label or format_regime_tp_ratios_label(open_regime or regime)}%** (固定分腿·RISK20)",
             P_LIGHT,
         ),
         "➕ 追加数量": _p(f"**+{add_qty}** {UNIT_LABEL}", P_MAIN),
@@ -994,24 +973,36 @@ def report_shield_disarmed(side, live_qty, entry, cancelled_count, reason="",
 
 
 def report_radar_activated(side, qty, entry, new_sl, radar_progress=1.0, regime=3,
-                           shield_cleared=True, verify_note="", verified=True):
+                           shield_cleared=True, verify_note="", verified=True,
+                           breathing_coefficient=None, trail_dist=None,
+                           symbol=None, open_kind=None, activation_frac=None,
+                           activation_price=None, trigger_gate="", tier=None):
+    """与币安单系统对齐：启动门槛=TP1-TP2中点（首次）/ TP2（重入）；硬止损不撤销。"""
+    kind = str(open_kind or "").strip() or "首次开仓"
+    attempt_reentry = ("重入" in kind) or (
+        activation_frac is not None and float(activation_frac) >= 1.0
+    )
+    gate_lab = "TP2绝对价" if attempt_reentry else "TP1-TP2中点"
+    act_px = float(activation_price or 0)
+    coeff = float(breathing_coefficient or 0)
+    trail_v = float(trail_dist or 0)
     data = {
         "🎛️ 实盘方向": _p(side, P_LIGHT if side == "LONG" else P_DEEP),
         "📦 利润头寸": _p(f"**{qty}** {UNIT_LABEL} @ `{entry:.2f}`", P_MAIN),
-        "📊 恢复档位": get_regime_name(regime),
-        "📡 雷达进度": _p(f"**{radar_progress:.0%}** (达 TP1 激活比)", P_ACCENT),
-        "🗑️ 硬止损": _p("已撤销" if shield_cleared else "清理中", P_MAIN),
-        "🔒 保本止损": _p(f"**{new_sl:.2f}** USDT (触发止损)", P_LIGHT),
+        "开仓类型": _p(f"**{kind}**", P_MAIN),
+        "启动门槛": _p(f"**{gate_lab}**", P_ACCENT),
+        "激活价": _p(f"**{act_px:.2f}**" if act_px > 0 else "—", P_MAIN),
+        "📊 恢复模式": get_regime_name(regime),
+        "📡 雷达进度": _p(f"**{radar_progress:.0%}**", P_ACCENT),
+        "🔒 雷达止损": _p(f"**{new_sl:.2f}** USDT", P_LIGHT),
+        "🛡️ 硬止损": _p("永久共存（不因雷达激活撤销）", P_MAIN),
         "✅ 风控动作": _p(
-            "先撤 TV 硬止损 → 挂雷达移动保本 → 专注推升止损防利润回吐",
+            "雷达接管跟踪；永久硬止损仍在盘口",
             P_MAIN,
         ),
-        "📡 实盘核查": _verify_line(
-            verify_note if not verified else "",
-            f"{VERIFY_TAG} | 雷达移动保本已启动",
-            f"⏳ 止损已提交，{VERIFY_DELAY_MARK} | 雷达已启动",
-        ),
     }
+    if trigger_gate:
+        data["触发"] = _p(str(trigger_gate)[:120], P_MUTED)
     if verify_note:
         data["🔍 核实明细"] = _p(verify_note, P_MUTED)
-    send_alert("📡 雷达 · 移动保本已激活", data, P_DEEP)
+    send_alert(f"📡 雷达激活 · {kind} · {gate_lab}", data, P_DEEP)

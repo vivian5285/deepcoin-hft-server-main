@@ -18,11 +18,20 @@ from tv_seq import (
     is_open_action,
     SAME_BAR_SETTLE_SEC,
 )
+from breath_stop import (
+    calculate_breath_stop,
+    order_stop_price,
+    initial_stop_price,
+    get_breathing_coefficient,
+    STOP_EXEC_BUFFER_USD,
+)
+from atr_1h import get_atr_1h_engine
 from webhook_parser import (
     enrich_signal_fields,
     enrich_entry_tp_prices,
     format_tv_field_sources,
     fetch_eth_atr_14_public,
+    fetch_binance_klines,
     classify_tv_close,
     compute_vps_open_qty,
     compute_vps_add_qty,
@@ -63,7 +72,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.77.0-sentinel-05"
+DEEPCOIN_SUPERVISOR_VERSION = "v13.80.0-radar-tp12-gate"
+
+# 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
+LATE_CLOSE_SUPPRESS_SEC = 5.0
 SENTINEL_POLL_NORMAL = 0.5
 SENTINEL_POLL_ARMING = 0.5
 SENTINEL_POLL_RADAR = 0.5
@@ -118,10 +130,20 @@ OPEN_JOURNAL = "logs/deepcoin_open_journal.jsonl"
 class PositionSupervisor:
     def __init__(self, symbol="ETH-USDT-SWAP"):
         from symbol_config import resolve_deepcoin_symbol
+        from breath_profiles import get_breath_profile
         meta = resolve_deepcoin_symbol(symbol)
         self.symbol = meta["symbol"]
         self.unit_label = meta.get("unit") or "张"
+        self.tag = meta.get("tag") or ("ETH" if "ETH" in self.symbol else "XAU")
+        self.breath_profile = meta.get("breath_profile") or get_breath_profile(self.symbol, "deepcoin")
         self.face_value = float(meta.get("face_value") or 0.1)
+        try:
+            prec = int(meta.get("price_precision") or 2)
+            if self.breath_profile:
+                self.breath_profile = dict(self.breath_profile)
+                self.breath_profile["tick_size"] = 10 ** (-prec)
+        except Exception:
+            pass
         try:
             info = deepcoin_client.get_instrument_info(self.symbol)
             ct = float(info.get("ctVal") or info.get("contractVal") or 0)
@@ -165,6 +187,13 @@ class PositionSupervisor:
         self._sentinel_active = False
         self.open_regime = 3
         self.open_atr = 30.0
+        self.initial_stop = 0.0
+        self.breathing_coefficient = 1.0
+        self._breath_ratio_history = []
+        self.breakeven_phase = False
+        self._last_open_exec_ts = 0.0
+        self._close_open_chain_active = False
+        self._last_close_bar_index = None
         self._last_entry_signal = None
         self._recover_in_progress = False
         self._recover_tp_unconfirmed = False
@@ -202,6 +231,9 @@ class PositionSupervisor:
         self.base_qty = 0
         self.add_count = 0
         self._last_idle_takeover_ts = 0.0
+        self.early_be_done = False
+        self.breathing_coefficient = 1.0
+        self._breath_ratio_history = []
 
         self.state_file = os.path.join(
             _BASE_DIR, f'deepcoin_vps_state_{self.symbol.replace("-", "_")}.json'
@@ -610,7 +642,7 @@ class PositionSupervisor:
                         pass
 
     def _annotate_close_open_chain(self, batch):
-        """同秒开+平 → 钉钉标明强制先平后开。"""
+        """同K线同时开+平 → 标记先平后开链（late close 抑制豁免）。"""
         by_bar = {}
         for p in batch or []:
             bi, sq = extract_seq_meta(p or {})
@@ -633,6 +665,9 @@ class PositionSupervisor:
             logger.info(
                 f"📬 [{self.symbol}] 同秒强制先平后开 | 执行序 {exec_chain} | TV {tv_by_seq}"
             )
+            if bi is not None:
+                self._close_open_chain_active = True
+                self._last_close_bar_index = int(bi)
             try:
                 dingtalk.report_system_alert(
                     title=f"先平后开链·同秒开平 [{self.symbol}]",
@@ -1516,6 +1551,17 @@ class PositionSupervisor:
                     "last_tv_signal": self.last_tv_signal,
                     "open_regime": self.open_regime,
                     "open_atr": self.open_atr,
+                    "initial_stop": float(getattr(self, "initial_stop", 0) or 0),
+                    "breathing_coefficient": float(
+                        getattr(self, "breathing_coefficient", 1.0) or 1.0
+                    ),
+                    "breath_ratio_history": list(
+                        getattr(self, "_breath_ratio_history", []) or []
+                    ),
+                    "breakeven_phase": bool(getattr(self, "breakeven_phase", False)),
+                    "last_open_exec_ts": float(
+                        getattr(self, "_last_open_exec_ts", 0) or 0
+                    ),
                     "shield_active": getattr(self, "shield_active", False),
                     "shield_tiers_consumed": list(getattr(self, "shield_tiers_consumed", []) or []),
                     "tp_levels_consumed": list(getattr(self, "tp_levels_consumed", []) or []),
@@ -2729,6 +2775,109 @@ class PositionSupervisor:
             tv_sl_ref=ref_px, source=source or "TV参考",
         )
 
+    def _locked_initial_atr(self):
+        """开仓 ATR 锁定：优先 webhook open_atr，全程固定。"""
+        atr = float(getattr(self, "open_atr", 0) or 0)
+        if atr > 0:
+            return atr
+        atr = float(getattr(self, "current_atr", 0) or 0)
+        return atr if atr > 0 else 0.0
+
+    def _atr_1h_engine(self):
+        sym = str(getattr(self, "atr_fallback_symbol", None) or "ETHUSDT").upper()
+        return get_atr_1h_engine(sym, fetch_binance_klines)
+
+    def _refresh_breathing_coefficient(self, force=False):
+        """用 Binance 1h ATR / initial_atr 更新呼吸系数（3 次平滑）。"""
+        init = float(getattr(self, "open_atr", 0) or 0)
+        if init <= 0:
+            return float(getattr(self, "breathing_coefficient", 1.0) or 1.0)
+        eng = self._atr_1h_engine()
+        eng.ratio_history = list(getattr(self, "_breath_ratio_history", None) or [])
+        profile = getattr(self, "breath_profile", None)
+        coeff, meta = eng.breathing_coefficient(init, force_refresh=force, profile=profile)
+        self.breathing_coefficient = float(coeff or 1.0)
+        self._breath_ratio_history = list(meta.get("ratio_history") or [])
+        self._breath_coeff_meta = meta
+        return self.breathing_coefficient
+
+    def _should_ignore_late_close(self, payload=None):
+        """
+        开仓成交后 LATE_CLOSE_SUPPRESS_SEC 内的迟到 CLOSE → 忽略。
+        同窗先平后开链（_close_open_chain_active）不忽略。
+        """
+        if getattr(self, "_close_open_chain_active", False):
+            return False
+        last_ts = float(getattr(self, "_last_open_exec_ts", 0) or 0)
+        if last_ts <= 0:
+            return False
+        age = time.time() - last_ts
+        if age < 0 or age > float(LATE_CLOSE_SUPPRESS_SEC):
+            return False
+        pos = self._get_active_position()
+        if not pos or float(pos.get("size") or 0) <= 0:
+            return False
+        return True
+
+    def _apply_breath_stop_tick(self, curr_px=0.0):
+        """雷达/止损 tick：呼吸系数追踪（非 ADX）。"""
+        entry = float(self.watched_entry or 0)
+        side = str(self.current_side or "").strip().upper()
+        if entry <= 0 or side not in ("LONG", "SHORT"):
+            return None
+        atr = self._locked_initial_atr()
+        init = float(getattr(self, "initial_stop", 0) or 0)
+        profile = getattr(self, "breath_profile", None)
+        if init <= 0 and atr > 0:
+            init = initial_stop_price(side, entry, atr, profile=profile)
+            self.initial_stop = init
+        cur = float(getattr(self, "current_sl", 0) or 0) or init
+        best = float(getattr(self, "best_price", 0) or 0) or entry
+        px = float(curr_px or 0) or best
+        phase = bool(getattr(self, "breakeven_phase", False))
+        early = bool(getattr(self, "early_be_done", False))
+        coeff = float(self._refresh_breathing_coefficient(force=False) or 1.0)
+        if coeff <= 0:
+            coeff = 1.0
+
+        out = calculate_breath_stop(
+            side,
+            px,
+            entry,
+            atr,
+            init,
+            cur,
+            best,
+            phase,
+            breathing_coefficient=coeff,
+            profile=profile,
+            early_be_done=early,
+        )
+        new_stop = float(out["stop"] or 0)
+        new_best = float(out["best"] or best)
+        new_phase = bool(out["breakeven_phase"])
+        self.early_be_done = bool(out.get("early_be_done") or early)
+        meta = out.get("meta") or {}
+        meta["breathing_coefficient"] = coeff
+
+        if new_best > 0:
+            self.best_price = new_best
+        if new_stop > 0:
+            if side == "LONG":
+                self.current_sl = max(cur, new_stop) if cur > 0 else new_stop
+            else:
+                self.current_sl = min(cur, new_stop) if cur > 0 else new_stop
+        was_phase = phase
+        self.breakeven_phase = new_phase
+        return {
+            "stop": float(self.current_sl or 0),
+            "best": float(self.best_price or 0),
+            "breakeven_phase": new_phase,
+            "early_be_done": bool(self.early_be_done),
+            "meta": meta,
+            "phase_entered": bool(new_phase and not was_phase),
+        }
+
     def _clamp_radar_to_tv_floor(self, radar_sl):
         """雷达保本线不得低于 TV 硬止损底线"""
         if not radar_sl:
@@ -3154,7 +3303,7 @@ class PositionSupervisor:
         if not self._should_radar_trail(curr_px):
             return False
 
-        new_sl = self._compute_radar_sl()
+        new_sl = self._compute_radar_sl(curr_px)
         if new_sl is None:
             return False
 
@@ -3201,6 +3350,8 @@ class PositionSupervisor:
             return False
 
         if had_tv_shield:
+            # TODO(v13.81+): 币安单系统已禁止雷达激活时撤 tv_sl/硬止损（永久硬止损并行）。
+            # Deepcoin 仍 _disarm_shield — 勿在未测双 STOP 槽位前改，避免裸仓窗口。
             self._disarm_shield("雷达交棒 · 保本已挂", notify=False)
 
         logger.info(
@@ -3230,7 +3381,9 @@ class PositionSupervisor:
         return 1 if ok else 0
 
     def _should_disarm_shield_for_favorable(self, curr_px):
-        """TP1 成交且雷达已激活 → 才撤 tv_sl 交棒移动保本（TP1 前保留宽硬止损）"""
+        """TP1 成交且雷达已激活 → 才撤 tv_sl 交棒移动保本（TP1 前保留宽硬止损）
+        TODO(v13.81+): 币安 _should_disarm_shield_for_favorable 已恒 False（不撤硬止损）；
+        本函数仍 True 时会走 _perform_radar_handoff → _disarm_shield，待对齐规格再改。"""
         if not self._tp1_filled_verified():
             return False
         stop_px = self._shield_stop_price()
@@ -3790,9 +3943,10 @@ class PositionSupervisor:
             tp = tier_prices[idx]
             if q <= 0:
                 continue
-            limit_px = tp * (0.9995 if close_side == "sell" else 1.0005)
+            exchange_tp = float(order_stop_price(self.current_side, tp, profile=getattr(self, "breath_profile", None)) or tp)
+            limit_px = exchange_tp * (0.9995 if close_side == "sell" else 1.0005)
             res = deepcoin_client.place_trigger_order(
-                self.symbol, close_side, pos_side, q, tp,
+                self.symbol, close_side, pos_side, q, exchange_tp,
                 order_type="limit", price=limit_px,
                 td_mode="cross", mrg_position="merge",
             )
@@ -3800,7 +3954,7 @@ class PositionSupervisor:
                 placed += 1
                 logger.info(
                     f"🛡️ TV硬止损: "
-                    f"{q} 张 @ {tp:.2f} 全平 (实盘 {live_qty} 张)"
+                    f"{q} 张 @ {exchange_tp:.2f} 全平 (理论 {tp:.2f} · 实盘 {live_qty} 张)"
                 )
             time.sleep(0.35)
 
@@ -3965,7 +4119,8 @@ class PositionSupervisor:
         return self._has_trigger_sl_near(clamped)
 
     def _report_radar_first_activation(self, real_amt, curr_px, new_sl, sl_placed):
-        """雷达首次激活：核实实盘后推送（硬止损已撤 + 保本止损已挂）"""
+        """雷达首次激活：核实实盘后推送（保本止损已挂；shield_cleared 文案仍反映旧交棒逻辑）
+        TODO(v13.81+): 币安已不发「撤硬止损」交棒钉钉；shield_cleared=True 待改为并行硬止损语义。"""
         if getattr(self, "_radar_activation_notified", False):
             return
         if not self._tp1_filled_verified(real_amt, curr_px):
@@ -4001,6 +4156,11 @@ class PositionSupervisor:
             return
         if not verified:
             verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
+        breath_meta = getattr(self, "_breath_coeff_meta", None) or {}
+        trail_dist = float(
+            (getattr(self, "open_atr", 0) or 0)
+            * float(getattr(self, "breathing_coefficient", 1.0) or 1.0)
+        )
         self._call_dingtalk(
             dingtalk.report_radar_activated,
             side=self.current_side,
@@ -4012,6 +4172,10 @@ class PositionSupervisor:
             shield_cleared=True,
             verify_note=verify_note,
             verified=verified,
+            breathing_coefficient=float(
+                getattr(self, "breathing_coefficient", 1.0) or 1.0
+            ),
+            trail_dist=trail_dist,
         )
         self._radar_activation_notified = True
 
@@ -4654,8 +4818,9 @@ class PositionSupervisor:
         close_side = "sell" if self.current_side == "LONG" else "buy"
         pos_side = "long" if self.current_side == "LONG" else "short"
         sl_qty = self._resolve_live_qty(live_qty)
+        exchange_sl = float(order_stop_price(self.current_side, sl_price, profile=getattr(self, "breath_profile", None)) or sl_price)
         deepcoin_client.place_trigger_order(
-            self.symbol, close_side, pos_side, sl_qty, sl_price,
+            self.symbol, close_side, pos_side, sl_qty, exchange_sl,
             order_type="market", td_mode="cross", mrg_position="merge",
         )
 
@@ -4974,7 +5139,7 @@ class PositionSupervisor:
         max_level = max(f["level"] for f in tp_fills)
         tp3 = self.tv_tps[2] if len(self.tv_tps) > 2 else 0.0
         self._radar_armed_after_tp1 = True
-        new_sl = self._compute_radar_sl()
+        new_sl = self._compute_radar_sl(curr_px)
         floor_px = self._radar_breakeven_floor()
         if new_sl is not None:
             if self.current_side == "LONG":
@@ -5563,6 +5728,26 @@ class PositionSupervisor:
                 raw_action in ("CLOSE", "CLOSE_PROTECT", "CLOSE_TP3", "CLOSE_STOPLOSS")
                 or raw_action.startswith("CLOSE")
             )
+            if is_close and self._should_ignore_late_close(payload):
+                age = time.time() - float(
+                    getattr(self, "_last_open_exec_ts", 0) or 0
+                )
+                logger.warning(
+                    f"🛡️ [{self.symbol}] 迟到平仓已忽略 | {raw_action} "
+                    f"开仓后 {age:.2f}s < {LATE_CLOSE_SUPPRESS_SEC}s · 保持开仓"
+                )
+                try:
+                    dingtalk.report_system_alert(
+                        f"迟到平仓已忽略·保持开仓 [{self.symbol}]",
+                        f"{raw_action} 距开仓成交仅 {age:.2f}s "
+                        f"(窗={LATE_CLOSE_SUPPRESS_SEC}s) → 不执行平仓，"
+                        f"防刚开又平；同窗先平后开链不受影响",
+                        level="警告",
+                        suggestion="若确需平仓请人工或等待抑制窗结束后再发 CLOSE",
+                    )
+                except Exception:
+                    pass
+                return
             if is_close:
                 self.monitoring = False
             if raw_action == "CLOSE_PROTECT" or raw_action.startswith("CLOSE_PROTECT"):
@@ -5808,6 +5993,7 @@ class PositionSupervisor:
                 "先平后开中止 · 平仓未归零",
                 "强平后盘口仍有持仓，已拒绝新开仓，请人工核查 Deepcoin 盘口",
             )
+            self._close_open_chain_active = False
             return
         if not self._wait_verify(self._verify_flat, retries=8, delay=0.5):
             logger.error("❌ 先平后开中止：空仓核查未通过")
@@ -5815,6 +6001,7 @@ class PositionSupervisor:
                 "先平后开中止 · 空仓核查失败",
                 "平仓指令已发但 REST 仍显示持仓，已拒绝叠仓开仓",
             )
+            self._close_open_chain_active = False
             return
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
@@ -5835,6 +6022,7 @@ class PositionSupervisor:
         except Exception:
             pass
         self._open_position(action, curr_px)
+        self._close_open_chain_active = False
 
     def _handle_manual_flat_detected(self, reason, close_meta=None, curr_px=0.0):
         """人工全平 / 止盈吃满 / 止损触发：智能复位账本 + 四标签收网钉钉"""
@@ -6212,10 +6400,26 @@ class PositionSupervisor:
 
             self.current_side = action
             self.open_regime = self.regime
-            self.open_atr = self.current_atr
+            payload_atr = self._safe_float((payload or {}).get("atr"), 0.0)
+            if payload_atr <= 0:
+                try:
+                    dingtalk.report_system_alert(
+                        f"[{getattr(self, 'tag', '?')}] 开仓拒绝·缺TV atr",
+                        f"{self.symbol} webhook 无 atr → 拒绝开仓",
+                        level="紧急",
+                        suggestion="检查 TV get_entry_json 是否传 atr",
+                    )
+                except Exception:
+                    pass
+                logger.error(f"拒绝开仓缺 TV atr [{self.symbol}]")
+                return
+            self.open_atr = payload_atr
+            self.current_atr = payload_atr
+            self.early_be_done = False
             self.initial_qty = real_qty
             self.base_qty = int(real_qty)
             self.add_count = 0
+            self._last_open_exec_ts = time.time()
             self._protect_and_monitor(
                 real_qty, pos['entry_price'],
                 budget_note=f"[{self.symbol}] {budget_txt} | ",
@@ -6238,6 +6442,19 @@ class PositionSupervisor:
         self.shield_active = False
         self.shield_tiers_consumed = []
         self.tp_levels_consumed = []
+        self.breathing_coefficient = 1.0
+        self._breath_ratio_history = []
+        self.breakeven_phase = False
+        open_atr = float(getattr(self, "open_atr", None) or self.current_atr or 0)
+        if open_atr > 0 and entry_price > 0 and self.current_side:
+            self.initial_stop = initial_stop_price(self.current_side, entry_price, open_atr, profile=getattr(self, "breath_profile", None))
+        else:
+            self.initial_stop = 0.0
+        try:
+            self._atr_1h_engine().reset_ratio_history()
+        except Exception:
+            pass
+        self._refresh_breathing_coefficient(force=True)
         if hasattr(self, "_radar_stage_last"):
             self._radar_stage_last = 0
         self._radar_activation_notified = False
@@ -6351,6 +6568,24 @@ class PositionSupervisor:
         return self.current_atr * 1.5
 
     def _radar_activation_price(self):
+        """
+        与币安单系统对齐（规格 §5.1）：绝对价锚定。
+          首次 = (TP1+TP2)/2 ；重入 = TP2。
+        """
+        try:
+            from reentry_profiles import radar_gate_price_from_tps
+            tps = list(getattr(self, "tv_tps", None) or [0, 0, 0])
+            tp1 = float(tps[0] or 0) if len(tps) > 0 else 0.0
+            tp2 = float(tps[1] or 0) if len(tps) > 1 else 0.0
+            attempt = int(getattr(self, "reentry_attempt", 0) or 0)
+            if float(getattr(self, "radar_activation_frac", 0) or 0) >= 1.0:
+                attempt = max(attempt, 1)
+            gate = radar_gate_price_from_tps(tp1, tp2, reentry_attempt=attempt)
+            if gate > 0:
+                return gate
+        except Exception as e:
+            logger.debug(f"radar_gate_price_from_tps 回退: {e}")
+        # 无完整 TP12 时回退旧 regime×TP1距（仅兜底）
         activation_ratio = self.regime_settings[self.regime]["activation"]
         tp1_dist = self._tp1_distance()
         if self.current_side == "LONG":
@@ -6369,9 +6604,19 @@ class PositionSupervisor:
             return curr_px >= self._radar_activation_price()
         return curr_px <= self._radar_activation_price()
 
-    def _compute_radar_sl(self):
+    def _compute_radar_sl(self, curr_px=0.0):
         if not self.watched_entry or self.best_price <= 0:
             return None
+        if self._is_radar_active():
+            tick = self._apply_breath_stop_tick(curr_px)
+            if tick and float(tick.get("stop") or 0) > 0:
+                sl = float(tick["stop"])
+                floor_px = self._radar_breakeven_floor()
+                if self.current_side == "LONG":
+                    return max(sl, floor_px)
+                if self.current_side == "SHORT":
+                    return min(sl, floor_px)
+                return sl
         trail_offset = self._radar_trail_offset_price()
         floor_px = self._radar_breakeven_floor()
         if self.current_side == "LONG":
@@ -6384,7 +6629,7 @@ class PositionSupervisor:
         """TP 重对齐前刷新内存止损位，避免把旧止损重新挂回交易所"""
         if not self._should_radar_trail(curr_px):
             return self.current_sl
-        new_sl = self._compute_radar_sl()
+        new_sl = self._compute_radar_sl(curr_px)
         if new_sl is None:
             return self.current_sl
         if self.current_side == "LONG" and new_sl > self.current_sl:
@@ -6473,9 +6718,17 @@ class PositionSupervisor:
                 real_amt, curr_px, reason="雷达激活 · 移动保本",
             )
 
-        new_sl = self._compute_radar_sl()
-        if new_sl is None:
-            return False
+        tick = self._apply_breath_stop_tick(curr_px)
+        new_sl = float((tick or {}).get("stop") or 0)
+        if new_sl <= 0:
+            trail_offset = self._radar_trail_offset_price()
+            floor_px = self._radar_breakeven_floor()
+            if self.current_side == "LONG":
+                new_sl = max(round(self.best_price - trail_offset, 2), floor_px)
+            elif self.current_side == "SHORT":
+                new_sl = min(round(self.best_price + trail_offset, 2), floor_px)
+            else:
+                return False
         new_sl = self._clamp_radar_sl_for_market(curr_px, new_sl)
         if not self._can_safely_place_radar_sl(curr_px, new_sl):
             return False
@@ -6789,6 +7042,17 @@ class PositionSupervisor:
                     self.last_tv_signal = s.get("last_tv_signal")
                     self.open_regime = int(s.get("open_regime", s.get("regime", 3)) or 3)
                     self.open_atr = float(s.get("open_atr", s.get("current_atr", 30.0)) or 30.0)
+                    self.initial_stop = float(s.get("initial_stop", 0) or 0)
+                    self.breathing_coefficient = float(
+                        s.get("breathing_coefficient", 1.0) or 1.0
+                    )
+                    self._breath_ratio_history = list(
+                        s.get("breath_ratio_history", []) or []
+                    )
+                    self.breakeven_phase = bool(s.get("breakeven_phase", False))
+                    self._last_open_exec_ts = float(
+                        s.get("last_open_exec_ts", 0) or 0
+                    )
                     self.shield_active = bool(s.get("shield_active", False))
                     self.shield_tiers_consumed = list(s.get("shield_tiers_consumed", []) or [])
                     self.tp_levels_consumed = list(s.get("tp_levels_consumed", []) or [])
