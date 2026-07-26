@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TV Webhook 时序：bar_index + seq
+TV Webhook 时序：bar_index + seq + 缓存窗口
+- 缓存窗口：同 symbol 首包后 **固定 1.0s** settle，到期统一处理（不无限等待）
 - 排序：先 bar_index 升序；同 bar 内 **动作优先**（CLOSE → UPDATE → OPEN），再 seq
-- 铁律：同 bar / 同秒同时收到开仓+平仓时，**永远先平后开**，最终状态必须是开仓
-  （即使 TV 把 OPEN 标成 seq=1、CLOSE 标成 seq=2，也强制重排；禁止先开后秒平）
-- 同秒聚合：同 bar 首包到达后短暂 settle，攒齐同时发出的开/平再冲刷
+- 铁律：同窗有平仓时 **一律先平后开**（平仓一次 + 最新开仓）；禁止先开后秒平
+- 折叠：平仓消息幂等只执行一次；开仓只执行窗口内最新一条
 - 幂等：symbol_bar_index_seq_action（Redis 优先，否则本地文件 TTL）
 - CLOSE 后释放开仓幂等键，允许同 bar 再开（刷新仓位）
 - 乱序：前置 seq 缺失时暂存等待，超时报警后按已有顺序执行
@@ -24,10 +24,17 @@ logger = logging.getLogger(__name__)
 
 SEQ_IDEMPOTENCY_TTL_SEC = int(os.getenv("TV_SEQ_IDEMPOTENCY_TTL", "86400"))  # 24h
 SEQ_PENDING_WAIT_SEC = float(os.getenv("TV_SEQ_PENDING_WAIT", "3.0"))  # 2~5s 窗口
-# 同 bar 首包后短停，等待同秒并发的开/平警报聚齐（再强制先平后开）
-SAME_BAR_SETTLE_SEC = float(os.getenv("TV_SAME_BAR_SETTLE", "1.0"))
+# 缓存窗口固定 1.0s（需求锁定；忽略环境变量漂移）
+SAME_BAR_SETTLE_SEC = 1.0
+LEGACY_SETTLE_SEC = 1.0
+# 仅开仓先到：最多再等一会，给迟到平仓拼进同窗（先平后开）
+OPEN_ALONE_MAX_WAIT_SEC = 2.5
+MAX_PAIR_WAIT_SEC = 3.0
 SEQ_STORE_FILE = os.getenv("TV_SEQ_STORE_FILE", "logs/tv_seq_idempotency.json")
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
+
+# P0 反转保护平仓（市价全平）；P1 = LONG/SHORT
+FLATTEN_PRIORITY_ACTIONS = frozenset({"CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT"})
 
 
 def action_exec_rank(action: Any) -> int:
@@ -51,6 +58,11 @@ def is_close_action(action: Any) -> bool:
 
 def is_open_action(action: Any) -> bool:
     return str(action or "").strip().upper() in ("LONG", "SHORT")
+
+
+def is_flatten_action(action: Any) -> bool:
+    """P0：反转保护快平（CLOSE_QUICK_EXIT / CLOSE_RSI_EXIT）。"""
+    return str(action or "").strip().upper() in FLATTEN_PRIORITY_ACTIONS
 
 
 def sort_same_bar_items(items: List[Tuple[int, dict]]) -> List[Tuple[int, dict]]:
@@ -246,7 +258,7 @@ class TVSeqBuffer:
     """
     按品种缓冲：收到消息后按 (bar_index, seq) 排序弹出。
     若 seq>1 且前置缺失 → 暂存至 pending_wait 超时，再按已有顺序冲刷并报警。
-    无 bar_index/seq 的旧信号：立即 FIFO 旁路（兼容）。
+    无 bar_index/seq 的旧信号：同样走 LEGACY_SETTLE_SEC 缓存窗口再冲刷。
     同 bar 先平后开：CLOSE 后 call release_bar_for_reentry() 再收 OPEN。
     """
 
@@ -264,6 +276,7 @@ class TVSeqBuffer:
         self._bars: Dict[int, List[Tuple[int, dict]]] = defaultdict(list)
         self._bar_first_ts: Dict[int, float] = {}
         self._legacy: List[dict] = []
+        self._legacy_first_ts: Optional[float] = None
         self._cv = threading.Condition(self._lock)
 
     def _depth_unlocked(self) -> int:
@@ -289,7 +302,32 @@ class TVSeqBuffer:
         bi, sq = extract_seq_meta(payload)
         if bi is None or sq is None:
             with self._cv:
+                # 窗口内相同 action+price 合并为一条
+                act = str((payload or {}).get("action", "") or "").strip().upper()
+                try:
+                    px = round(float((payload or {}).get("price") or 0), 2)
+                except (TypeError, ValueError):
+                    px = 0.0
+                for existing in self._legacy:
+                    ex_act = str((existing or {}).get("action", "") or "").strip().upper()
+                    try:
+                        ex_px = round(float((existing or {}).get("price") or 0), 2)
+                    except (TypeError, ValueError):
+                        ex_px = 0.0
+                    if ex_act == act and ex_px == px:
+                        logger.warning(
+                            f"📬 [{self.symbol}] legacy 窗口内相同消息合并 "
+                            f"action={act} px={px}"
+                        )
+                        return "duplicate"
+                if not self._legacy:
+                    self._legacy_first_ts = time.time()
                 self._legacy.append(dict(payload))
+                logger.info(
+                    f"📬 [{self.symbol}] legacy 入缓存窗口 action={act} "
+                    f"| 深度 {self._depth_unlocked()} "
+                    f"| settle={LEGACY_SETTLE_SEC:.1f}s"
+                )
                 self._cv.notify_all()
             return "legacy"
 
@@ -336,11 +374,41 @@ class TVSeqBuffer:
         have = set(seqs)
         return [i for i in range(1, mx + 1) if i not in have]
 
+    def _flush_legacy_locked(self, now: float) -> List[dict]:
+        """无时序消息：首包后 settle；仅开仓时延长等待，拼迟到平仓。"""
+        if not self._legacy:
+            return []
+        age = now - float(self._legacy_first_ts or now)
+        acts = [
+            str((m or {}).get("action", "") or "").strip().upper()
+            for m in self._legacy
+        ]
+        has_close = any(a in FLATTEN_PRIORITY_ACTIONS or a.startswith("CLOSE") for a in acts)
+        has_open = any(a in ("LONG", "SHORT") for a in acts)
+        coalesced = has_close and has_open
+        only_open = has_open and not has_close
+        if coalesced or age >= MAX_PAIR_WAIT_SEC:
+            settle_done = True
+        elif only_open and age < OPEN_ALONE_MAX_WAIT_SEC:
+            settle_done = False
+        elif age >= LEGACY_SETTLE_SEC:
+            settle_done = True
+        else:
+            settle_done = False
+        if not settle_done:
+            return []
+        out = list(self._legacy)
+        self._legacy = []
+        self._legacy_first_ts = None
+        logger.info(
+            f"📬 [{self.symbol}] legacy 缓存到期冲刷 n={len(out)} "
+            f"age={age:.2f}s coalesced={coalesced} only_open={only_open}"
+        )
+        return out
+
     def _flush_ready_locked(self, now: float) -> List[dict]:
         out: List[dict] = []
-        if self._legacy:
-            out.extend(self._legacy)
-            self._legacy = []
+        out.extend(self._flush_legacy_locked(now))
 
         for bar in sorted(self._bars.keys()):
             items = self._bars[bar]
@@ -350,14 +418,24 @@ class TVSeqBuffer:
             missing = self._missing_prefix(bar, seqs)
             age = now - float(self._bar_first_ts.get(bar, now))
             wait_done = age >= self.pending_wait
-            # 同秒并发：首包后短停攒齐；已同时有开+平则可提前冲刷
             coalesced = bar_has_close_and_open(items)
-            settle_done = age >= SAME_BAR_SETTLE_SEC or coalesced
+            only_open = (
+                any(is_open_action((pl or {}).get("action")) for _, pl in items)
+                and not any(is_close_action((pl or {}).get("action")) for _, pl in items)
+            )
+            if coalesced or age >= MAX_PAIR_WAIT_SEC:
+                settle_done = True
+            elif only_open and age < OPEN_ALONE_MAX_WAIT_SEC:
+                # 开仓先到：再等一会儿拼迟到平仓，避免先开后秒平
+                settle_done = False
+            elif age >= SAME_BAR_SETTLE_SEC:
+                settle_done = True
+            else:
+                settle_done = False
 
             if missing and not wait_done:
                 break
             if not settle_done:
-                # 尚未攒齐同秒警报 → 暂不冲刷本 bar（也不越过到更新 bar）
                 break
 
             if missing and wait_done:
@@ -430,3 +508,91 @@ def sort_webhooks_by_seq(messages: List[dict]) -> List[dict]:
 def reorder_batch_close_then_open(messages: List[dict]) -> List[dict]:
     """消费侧二次保险：同 bar 开平并存时重排为永远先平后开。"""
     return sort_webhooks_by_seq(list(messages or []))
+
+
+def collapse_batch_for_execution(messages: List[dict]) -> List[dict]:
+    """
+    缓存窗口到期后折叠执行集（无论到达顺序）：
+    1. P0 平仓（CLOSE_QUICK_EXIT / CLOSE_RSI_EXIT）→ 只保留一条（幂等）
+    2. 其它非开仓消息（RECONCILE 等）按原序保留
+    3. P1 开仓（LONG/SHORT）→ 只保留最新一条（msgs[-1]）
+    最终顺序：平仓 → 其它 → 开仓（至多一条）
+    """
+    msgs = list(messages or [])
+    if not msgs:
+        return []
+
+    exit_msgs: List[dict] = []
+    entry_msgs: List[dict] = []
+    other_msgs: List[dict] = []
+    seen_exit_fp = set()
+    seen_entry_fp = set()
+    seen_other_fp = set()
+
+    def _fp(m: dict) -> Tuple[str, str, float]:
+        a = str((m or {}).get("action", "") or "").strip().upper()
+        sym = str(
+            (m or {}).get("symbol") or (m or {}).get("ticker") or ""
+        ).strip().upper()
+        try:
+            px = round(float((m or {}).get("price") or 0), 2)
+        except (TypeError, ValueError):
+            px = 0.0
+        return (a, sym, px)
+
+    for m in msgs:
+        act = str((m or {}).get("action", "") or "").strip().upper()
+        fp = _fp(m)
+        if is_flatten_action(act):
+            if fp in seen_exit_fp:
+                continue  # 窗口内相同平仓合并
+            seen_exit_fp.add(fp)
+            exit_msgs.append(m)
+        elif is_open_action(act):
+            if fp in seen_entry_fp:
+                # 同键重复开仓：丢掉旧的，保留最新到达
+                entry_msgs = [x for x in entry_msgs if _fp(x) != fp]
+            seen_entry_fp.add(fp)
+            entry_msgs.append(m)
+        else:
+            if fp in seen_other_fp:
+                continue
+            seen_other_fp.add(fp)
+            other_msgs.append(m)
+
+    out: List[dict] = []
+    if exit_msgs:
+        # 只执行一次平仓：优先 QUICK，否则取首条
+        preferred = next(
+            (
+                m
+                for m in exit_msgs
+                if str((m or {}).get("action", "")).upper() == "CLOSE_QUICK_EXIT"
+            ),
+            exit_msgs[0],
+        )
+        out.append(preferred)
+        if len(exit_msgs) > 1:
+            acts = ",".join(
+                str((m or {}).get("action", "")).upper() for m in exit_msgs
+            )
+            logger.info(
+                f"📬 缓存折叠：{len(exit_msgs)} 条平仓 → 只执行 "
+                f"{str((preferred or {}).get('action', '')).upper()}（丢弃重复: {acts}）"
+            )
+
+    out.extend(other_msgs)
+
+    if entry_msgs:
+        entry = entry_msgs[-1]
+        out.append(entry)
+        if len(entry_msgs) > 1:
+            acts = " → ".join(
+                str((m or {}).get("action", "")).upper() for m in entry_msgs
+            )
+            logger.info(
+                f"📬 缓存折叠：{len(entry_msgs)} 条开仓 → 只执行最新 "
+                f"{str((entry or {}).get('action', '')).upper()}（序列: {acts}）"
+            )
+
+    return out

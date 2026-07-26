@@ -798,8 +798,8 @@ def fetch_eth_atr_14_public(period=14, symbol="ETHUSDT"):
     return fetch_symbol_atr_14_public(symbol or "ETHUSDT", period=period)
 
 
-def fetch_symbol_atr_14_public(symbol="ETHUSDT", period=14):
-    """Public Binance futures ATR for any USDT-M symbol."""
+def fetch_binance_klines(symbol="ETHUSDT", interval="1h", limit=100):
+    """Public Binance USDT-M klines — ATR/1h 呼吸系数专用。"""
     sym = str(symbol or "ETHUSDT").upper().replace(".P", "")
     if ":" in sym:
         sym = sym.split(":")[-1]
@@ -807,11 +807,28 @@ def fetch_symbol_atr_14_public(symbol="ETHUSDT", period=14):
         import requests
         resp = requests.get(
             "https://fapi.binance.com/fapi/v1/klines",
-            params={"symbol": sym, "interval": "15m", "limit": period + 20},
+            params={
+                "symbol": sym,
+                "interval": str(interval or "1h"),
+                "limit": int(limit or 100),
+            },
             timeout=8,
         )
         resp.raise_for_status()
-        return compute_atr_from_klines(resp.json(), period)
+        return resp.json() or []
+    except Exception as e:
+        logger.warning(f"Binance klines fetch failed [{sym} {interval}]: {e}")
+        return []
+
+
+def fetch_symbol_atr_14_public(symbol="ETHUSDT", period=14):
+    """Public Binance futures ATR for any USDT-M symbol."""
+    sym = str(symbol or "ETHUSDT").upper().replace(".P", "")
+    if ":" in sym:
+        sym = sym.split(":")[-1]
+    try:
+        kl = fetch_binance_klines(sym, "15m", period + 20)
+        return compute_atr_from_klines(kl, period)
     except Exception as e:
         logger.warning(f"Public ATR fetch failed [{sym}]: {e}")
         return 0.0

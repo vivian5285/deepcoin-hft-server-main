@@ -9,20 +9,24 @@ BINANCE_SYMBOL_META = {
     "ETHUSDT": {
         "symbol": "ETHUSDT",
         "unit": "ETH",
+        "tag": "ETH",
         "qty_step": 0.001,
         "min_qty": 0.001,
         "dust_qty": 0.004,
         "price_precision": 2,
         "atr_fallback_symbol": "ETHUSDT",
+        "breath": "ETH",
     },
     "XAUUSDT": {
         "symbol": "XAUUSDT",
         "unit": "XAU",
+        "tag": "XAU",
         "qty_step": 0.001,
         "min_qty": 0.001,
         "dust_qty": 0.001,
         "price_precision": 2,
         "atr_fallback_symbol": "XAUUSDT",
+        "breath": "XAU",
     },
 }
 
@@ -32,6 +36,8 @@ DEEPCOIN_SYMBOL_META = {
         "symbol": "ETH-USDT-SWAP",
         "binance_mark": "ETHUSDT",
         "unit": "张",
+        "tag": "ETH",
+        "breath": "ETH",
         "face_value": 0.1,
         "qty_step": 1,
         "min_qty": 1,
@@ -43,6 +49,8 @@ DEEPCOIN_SYMBOL_META = {
         "symbol": "XAU-USDT-SWAP",
         "binance_mark": "XAUUSDT",
         "unit": "张",
+        "tag": "XAU",
+        "breath": "XAU",
         "face_value": 0.01,  # 启动后以 instruments 实盘覆盖
         "qty_step": 1,
         "min_qty": 1,
@@ -96,6 +104,10 @@ def _clean_ticker(raw):
 
 
 def resolve_binance_symbol(raw, default="ETHUSDT"):
+    """
+    归一化 TV ticker → 币安合约。
+    default=\"\" 时未识别返回 symbol=\"\"（禁止静默落到 ETH）。
+    """
     key = _clean_ticker(raw)
     sym = _BINANCE_ALIASES.get(key) or _BINANCE_ALIASES.get(
         re.sub(r"[^A-Z0-9]", "", key), None
@@ -103,8 +115,15 @@ def resolve_binance_symbol(raw, default="ETHUSDT"):
     if not sym and key.endswith("USDT") and key in BINANCE_SYMBOL_META:
         sym = key
     if not sym:
+        if default == "" or default is None:
+            return {"symbol": "", "unit": "?", "qty_step": 0.001, "min_qty": 0.001}
         sym = default
     meta = dict(BINANCE_SYMBOL_META.get(sym, BINANCE_SYMBOL_META["ETHUSDT"]))
+    try:
+        from breath_profiles import get_breath_profile
+        meta["breath_profile"] = get_breath_profile(meta.get("symbol") or sym, "binance")
+    except Exception:
+        meta["breath_profile"] = None
     return meta
 
 
@@ -123,6 +142,11 @@ def resolve_deepcoin_symbol(raw, default="ETH-USDT-SWAP"):
         else:
             sym = default
     meta = dict(DEEPCOIN_SYMBOL_META.get(sym, DEEPCOIN_SYMBOL_META["ETH-USDT-SWAP"]))
+    try:
+        from breath_profiles import get_breath_profile
+        meta["breath_profile"] = get_breath_profile(meta.get("symbol") or sym, "deepcoin")
+    except Exception:
+        meta["breath_profile"] = None
     return meta
 
 
@@ -149,7 +173,7 @@ def active_deepcoin_symbols():
 
 
 def extract_symbol_from_payload(data):
-    """从 TV / webhook 载荷提取 ticker。"""
+    """从 TV / webhook 载荷提取 ticker（字段优先，全文扫描兜底）。"""
     if not isinstance(data, dict):
         return ""
     for key in (
@@ -159,4 +183,16 @@ def extract_symbol_from_payload(data):
         val = data.get(key)
         if val:
             return str(val).strip()
+    # 兜底：扫描 JSON 文本中的已知合约（优先 XAU，避免误判 ETH）
+    try:
+        import json
+        blob = json.dumps(data, ensure_ascii=False).upper()
+    except Exception:
+        blob = str(data).upper()
+    for token in (
+        "XAUUSDT.P", "BINANCE:XAUUSDT", "XAUUSDT", "XAU-USDT-SWAP", "XAUUSD",
+        "ETHUSDT.P", "BINANCE:ETHUSDT", "ETHUSDT", "ETH-USDT-SWAP",
+    ):
+        if token in blob:
+            return token
     return ""
