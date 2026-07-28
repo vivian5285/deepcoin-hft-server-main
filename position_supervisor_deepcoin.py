@@ -10,6 +10,8 @@ import queue
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from deepcoin_client import deepcoin_client, CLIENT_VERSION
+from pipeline_bridge import PipelineBridgeMixin
+from pipeline_ledger import Role
 import dingtalk
 from tv_seq import (
     reorder_batch_close_then_open,
@@ -71,14 +73,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v13.81.0-tv-atr-no-tp3"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.10.0-spec-v1-aligned"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
-SENTINEL_POLL_NORMAL = 0.5
-SENTINEL_POLL_ARMING = 0.5
-SENTINEL_POLL_RADAR = 0.5
-IDLE_PATROL_INTERVAL_SEC = 12
+# v13.90.2：哨兵从 0.5s 拉到慢速，杜绝 Deepcoin API 限流
+SENTINEL_POLL_NORMAL = 25.0
+SENTINEL_POLL_ARMING = 20.0
+SENTINEL_POLL_RADAR = 20.0
+IDLE_PATROL_INTERVAL_SEC = 300
+IDLE_PATROL_BACKOFF_SEC = 900
 IDLE_TAKEOVER_COOLDOWN_SEC = 30
 DUST_ORPHAN_CONTRACTS = 1
 TP_COMPLETE_RESIDUAL_RATIO = 0.12
@@ -126,7 +130,7 @@ TV_JOURNAL = "logs/deepcoin_tv_journal.jsonl"
 OPEN_JOURNAL = "logs/deepcoin_open_journal.jsonl"
 
 
-class PositionSupervisor:
+class PositionSupervisor(PipelineBridgeMixin):
     def __init__(self, symbol="ETH-USDT-SWAP"):
         from symbol_config import resolve_deepcoin_symbol
         from breath_profiles import get_breath_profile
@@ -186,6 +190,7 @@ class PositionSupervisor:
         self._sentinel_active = False
         self.open_regime = 3
         self.open_atr = 30.0
+
         self.initial_stop = 0.0
         self.breathing_coefficient = 1.0
         self._breath_ratio_history = []
@@ -234,6 +239,20 @@ class PositionSupervisor:
         self.breathing_coefficient = 1.0
         self._breath_ratio_history = []
 
+        # 自动重入相关字段（v1.0 规格对齐）
+        self.adx_tier = 1
+        self.radar_tier = 1
+        self.radar_activation_frac = 0.78
+        self.radar_pending_arm = True
+        self.reentry_active = False
+        self.reentry_attempt = 0
+        self.reentry_limit_order_id = None
+        self.reentry_limit_px = 0.0
+        self.reentry_limit_deadline_ts = 0.0
+        self.reentry_window_deadline_ts = 0.0
+        self.reentry_order_tag = None
+        self.tp_levels_consumed = []  # 确保已初始化
+
         self.state_file = os.path.join(
             _BASE_DIR, f'deepcoin_vps_state_{self.symbol.replace("-", "_")}.json'
         )
@@ -249,12 +268,17 @@ class PositionSupervisor:
                 logger.info(f"📦 已迁移旧状态 → {self.state_file}")
             except Exception as e:
                 logger.warning(f"旧状态迁移失败: {e}")
+        try:
+            self._pipeline_boot(exchange="deepcoin")
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] pipeline boot: {e}")
         logger.info(
             f"🧠 深币 VPS [{DEEPCOIN_SUPERVISOR_VERSION}/{CLIENT_VERSION}] "
-            f"{self.symbol} 军师已加载：双品种 · {self.leverage}x"
+            f"{self.symbol} 军师已加载：双品种 · {self.leverage}x · pipeline"
         )
         self._start_signal_worker()
         self._start_idle_flat_patrol()
+        self._init_reentry_runtime()
 
     def _start_idle_flat_patrol(self):
         """空仓待命时激进实盘巡检：反向强平 / 同向接管 / 人工异动 / 漏报全平 / 蚂蚁扫尾"""
@@ -1085,6 +1109,33 @@ class PositionSupervisor:
         self.tp_levels_consumed = []
         self.shield_tiers_consumed = []
         self._radar_activation_notified = False
+
+        # v13.91.0: freeze ADX activation ratio/price on open/dormant begin
+        try:
+            from reentry_profiles import (
+                radar_activation_ratio_from_adx,
+                radar_activation_price_adx,
+            )
+            _adx = float(getattr(self, "last_adx", 0) or getattr(self, "radar_activation_adx", 0) or 25.0)
+            _ratio = radar_activation_ratio_from_adx(_adx)
+            self.radar_activation_frac = float(_ratio)
+            self.radar_activation_adx = float(_adx)
+            _entry = float(getattr(self, "watched_entry", 0) or getattr(self, "cycle_entry", 0) or 0)
+            _atr = float(getattr(self, "open_atr", 0) or getattr(self, "cycle_open_atr", 0) or 0)
+            if _atr <= 0:
+                try:
+                    _atr = float(self._get_locked_initial_atr() or 0)
+                except Exception:
+                    _atr = 0.0
+            if _entry > 0 and _atr > 0:
+                _px = radar_activation_price_adx(
+                    getattr(self, "current_side", None), _entry, _atr, adx=_adx, ratio=_ratio,
+                )
+                if _px > 0:
+                    self.radar_activation_price = float(_px)
+        except Exception as _e:
+            logger.debug(f"radar ADX freeze skip: {_e}")
+
         self._shield_handoff_notified = False
         self.shield_active = False
         self.shield_sized_qty = 0.0
@@ -1586,6 +1637,9 @@ class PositionSupervisor:
                     "open_settled_qty": int(
                         getattr(self, "_open_settled_qty", 0) or 0
                     ),
+                    "pipeline": self._pipeline_state_blob(),
+                    # 自动重入字段（v1.0 规格对齐）
+                    "reentry_state": self._reentry_state_dict(),
                 }, f)
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
@@ -2088,6 +2142,309 @@ class PositionSupervisor:
             closed_qty=meta.get("closed_qty"),
             live_exit_px=meta.get("live_exit_px"),
         )
+        # 自动重入评估（v1.0 规格对齐）
+        self._maybe_evaluate_smart_reentry(reason=reason, close_meta=meta, curr_px=curr_px)
+
+    def _maybe_evaluate_smart_reentry(self, reason="", close_meta=None, curr_px=0.0):
+        """
+        平仓后评估是否启动智能重入（v1.0 规格）。
+
+        触发条件：
+        1. 非硬止损出局（hard_sl / vps_hard_sl）
+        2. 未超过最大重入次数（max=1）
+        3. TP1 未成交（tp1_ever_filled=False）
+        4. 当前趋势档位为强（adx_tier=2）
+
+        重入方式：限价挂单（雷达保本）
+        """
+        try:
+            from smart_reentry_engine import evaluate_flat_for_reentry, open_reentry_window
+            from reentry_profiles import reentry_enabled, tier_label
+        except ImportError:
+            return
+
+        if not reentry_enabled(self.symbol):
+            return
+
+        # 硬止损出局 → 禁止重入
+        hard_sources = ("vps_hard_sl", "hard_sl", "VPS_HARD_SL")
+        if reason and any(s in str(reason) for s in hard_sources):
+            logger.info(f"🚫 [{self.symbol}] 硬止损出局，禁止重入")
+            self._clear_reentry_state()
+            return
+
+        meta = close_meta or {}
+        side = str(meta.get("side") or getattr(self, "current_side", "") or "").upper()
+        entry_px = float(meta.get("entry_px") or 0)
+        exit_px = float(meta.get("live_exit_px") or curr_px or 0)
+        atr = float(meta.get("atr") or getattr(self, "open_atr", 0) or 0)
+        attempt = int(getattr(self, "reentry_attempt", 0) or 0)
+
+        # 检查 TP1 是否已成交
+        tp1_filled = bool(getattr(self, "_tp1_filled_hint", False) or
+                         getattr(self, "_ws_tp1_fill_hint", False) or
+                         (1 in (getattr(self, "tp_levels_consumed", []) or [])))
+
+        # 检查 ADX 档位
+        adx_tier = int(getattr(self, "adx_tier", 1) or 1)
+
+        window_ts = open_reentry_window(self.symbol)
+        self.reentry_window_deadline_ts = window_ts
+
+        ok, why = evaluate_flat_for_reentry(
+            exit_source=str(reason or ""),
+            side=side,
+            entry=entry_px,
+            exit_px=exit_px,
+            atr=atr,
+            reentry_attempt=attempt,
+            symbol=self.symbol,
+            window_deadline_ts=window_ts,
+            tp1_ever_filled=tp1_filled,
+            adx_tier=adx_tier,
+        )
+
+        if not ok:
+            logger.info(
+                f"🚫 [{self.symbol}] 不启动重入: {why} | "
+                f"src={reason} exit={exit_px:.2f} attempt={attempt} "
+                f"tp1_filled={tp1_filled} tier={adx_tier}"
+            )
+            self._clear_reentry_state()
+            return
+
+        # 无菌确认后启动重入
+        if self._ensure_sterile_for_reentry(reason="智能重入"):
+            self._start_smart_reentry_limit(
+                side=side, entry=entry_px, exit_px=exit_px,
+                atr=atr, attempt=attempt, tp1_filled=tp1_filled,
+                adx_tier=adx_tier, reason=reason,
+            )
+
+    def _clear_reentry_state(self):
+        """清空重入状态"""
+        self.reentry_active = False
+        self.reentry_limit_order_id = None
+        self.reentry_limit_px = 0.0
+        self.reentry_limit_deadline_ts = 0.0
+        self.reentry_order_tag = None
+
+    def _ensure_sterile_for_reentry(self, reason="") -> bool:
+        """确保仓位归零且无挂单"""
+        try:
+            deepcoin_client.cancel_all_open_orders(self.symbol)
+        except Exception:
+            pass
+        time.sleep(0.5)
+        pos = self._get_active_position()
+        if not pos:
+            return True
+        qty = self._safe_qty(pos.get("size"))
+        return qty <= 0
+
+    def _start_smart_reentry_limit(self, side, entry, exit_px, atr, attempt, tp1_filled, adx_tier, reason=""):
+        """挂限价单启动重入"""
+        try:
+            from smart_reentry_engine import plan_reentry_limit
+        except ImportError:
+            return False
+
+        side_str = "LONG" if side.upper() in ("LONG", "BUY") else "SHORT"
+        open_side = "buy" if side_str == "LONG" else "sell"
+        pos_side = "long" if side_str == "LONG" else "short"
+        tv_price = float(getattr(self, "cycle_tv_price", 0) or 0)
+
+        # 拉 K 线计算限价
+        k5 = deepcoin_client.fetch_klines(self.symbol, interval="5m", limit=3) if hasattr(deepcoin_client, 'fetch_klines') else None
+        k3 = deepcoin_client.fetch_klines(self.symbol, interval="3m", limit=3) if hasattr(deepcoin_client, 'fetch_klines') else None
+
+        plan, why = plan_reentry_limit(
+            side=side_str, tv_price=tv_price, symbol=self.symbol,
+            klines_5m=k5, klines_3m=k3,
+        )
+
+        if not plan:
+            logger.warning(f"🚫 [{self.symbol}] 重入限价中止: {why}")
+            return False
+
+        lim = float(plan["limit_px"])
+        qty = int(getattr(self, "base_qty", 0) or 1)
+        if qty <= 0:
+            qty = 1
+
+        tag = f"reentry_{self.symbol}_{int(time.time())}"
+        self.reentry_order_tag = tag
+
+        order = deepcoin_client.place_limit_order(
+            self.symbol, open_side, pos_side, lim, qty, cl_ord_id=tag,
+        )
+
+        if not order or not deepcoin_client._is_success(order):
+            logger.warning(f"⚠️ [{self.symbol}] 重入限价挂单失败")
+            self.reentry_order_tag = None
+            return False
+
+        oid = (order.get("data") or {}).get("ordId", "") or order.get("order_id", "")
+        self.reentry_active = True
+        self.reentry_limit_order_id = oid
+        self.reentry_limit_px = lim
+        self.reentry_limit_deadline_ts = float(plan["deadline_ts"])
+
+        logger.info(
+            f"📥 [{self.symbol}] 智能重入限价已挂 {side_str} {qty}@{lim:.2f} "
+            f"attempt={attempt} tag={tag}"
+        )
+
+        # 钉钉通知
+        try:
+            self._call_dingtalk(
+                dingtalk.report_system_alert,
+                title=f"智能重入限价已挂 [{self.symbol}]",
+                detail=(
+                    f"{side_str} attempt={attempt} limit@{lim:.2f} "
+                    f"TV@{tv_price:.2f} exit={reason}@{exit_px:.2f} "
+                    f"tp1_filled={tp1_filled} tier={adx_tier}"
+                ),
+                level="提示",
+            )
+        except Exception:
+            pass
+
+        self._save_state()
+        return True
+
+    def _reentry_state_dict(self) -> dict:
+        """获取重入状态字典（用于持久化）"""
+        from smart_reentry_engine import blank_reentry_state
+        base = blank_reentry_state()
+        return {
+            "reentry_attempt": int(getattr(self, "reentry_attempt", 0) or 0),
+            "radar_tier": int(getattr(self, "radar_tier", 0) or 0),
+            "adx_tier": int(getattr(self, "adx_tier", 1) or 1),
+            "reentry_active": bool(getattr(self, "reentry_active", False)),
+            "reentry_limit_order_id": getattr(self, "reentry_limit_order_id", None),
+            "reentry_limit_px": float(getattr(self, "reentry_limit_px", 0) or 0),
+            "reentry_limit_deadline_ts": float(getattr(self, "reentry_limit_deadline_ts", 0) or 0),
+            "reentry_window_deadline_ts": float(getattr(self, "reentry_window_deadline_ts", 0) or 0),
+            "reentry_order_tag": getattr(self, "reentry_order_tag", None),
+            "radar_pending_arm": bool(getattr(self, "radar_pending_arm", True)),
+        }
+
+    def _reentry_tick(self):
+        """重入订单 Tick：检查成交/TTL刷新"""
+        if not getattr(self, "reentry_active", False):
+            return
+
+        pos = self._get_active_position()
+        if not pos:
+            return
+
+        qty = self._safe_qty(pos.get("size"))
+        if qty > 0:
+            # 成交！启动新开仓流程
+            self._on_reentry_filled(pos)
+            return
+
+        # 检查 TTL
+        now = time.time()
+        deadline = float(getattr(self, "reentry_limit_deadline_ts", 0) or 0)
+        if deadline > 0 and now >= deadline:
+            logger.info(f"⏰ [{self.symbol}] 重入限价 TTL 到期，重新挂单")
+            self._cancel_reentry_limit(reason="TTL刷新")
+            side = str(getattr(self, "cycle_tv_side", "") or "").upper()
+            self._start_smart_reentry_limit(
+                side=side,
+                entry=float(getattr(self, "cycle_entry", 0) or 0),
+                exit_px=float(getattr(self, "last_exit_px", 0) or 0),
+                atr=float(getattr(self, "cycle_open_atr", 0) or 0),
+                attempt=int(getattr(self, "reentry_attempt", 0) or 0),
+                tp1_filled=False,
+                adx_tier=int(getattr(self, "adx_tier", 1) or 1),
+                reason="TTL刷新",
+            )
+
+    def _cancel_reentry_limit(self, reason=""):
+        """撤销重入限价单"""
+        oid = getattr(self, "reentry_limit_order_id", None)
+        if oid:
+            try:
+                deepcoin_client.cancel_order(self.symbol, order_id=oid)
+                logger.info(f"🗑️ [{self.symbol}] 撤重入限价 id={oid} | {reason}")
+            except Exception as e:
+                logger.debug(f"撤单失败: {e}")
+        self._clear_reentry_state()
+
+    def _on_reentry_filled(self, pos):
+        """重入订单成交处理"""
+        side_str = str(pos.get("posSide", "") or "").lower()
+        side = "LONG" if side_str == "long" else "SHORT"
+        entry = float(pos.get("avgPx") or pos.get("entry_price", 0) or 0)
+        qty = self._safe_qty(pos.get("size"))
+
+        if entry <= 0 or qty <= 0:
+            return
+
+        logger.info(f"✅ [{self.symbol}] 重入成交 {side} {qty}@{entry:.2f}")
+
+        # 更新 attempt
+        prev_attempt = int(getattr(self, "reentry_attempt", 0) or 0)
+        self.reentry_attempt = prev_attempt + 1
+        self._clear_reentry_state()
+
+        # 恢复开仓状态
+        self.current_side = side
+        self.watched_entry = entry
+        self.watched_qty = qty
+        self.initial_qty = qty
+        self.monitoring = True
+        self.tp_levels_consumed = []
+
+        # 挂硬止损 + TP12
+        try:
+            self._arm_temp_stop_and_tp12_for_reentry(qty, entry, side)
+        except Exception as e:
+            logger.error(f"[{self.symbol}] 重入后防线挂单失败: {e}")
+
+        self._save_state()
+
+    def _arm_temp_stop_and_tp12_for_reentry(self, qty, entry, side):
+        """重入成交后挂硬止损 + TP12"""
+        from breath_stop import initial_stop_price
+
+        atr = float(getattr(self, "open_atr", 0) or 0)
+        profile = getattr(self, "breath_profile", None) or {}
+
+        init = initial_stop_price(side, entry, atr, profile=profile)
+        if init <= 0:
+            init = entry * 0.98 if side == "LONG" else entry * 1.02
+
+        self.initial_stop = init
+        self.current_sl = init
+        self.tv_sl = init
+
+        # 挂硬止损
+        pos_side = "long" if side == "LONG" else "short"
+        deepcoin_client.place_trigger_order(
+            self.symbol, "sell" if side == "LONG" else "buy",
+            pos_side, qty, init, order_type="market",
+        )
+
+        # 挂 TP1/TP2 限价
+        tps = list(getattr(self, "tv_tps", [0, 0, 0]) or [])
+        if len(tps) >= 1 and tps[0] > 0:
+            tp1 = tps[0]
+            tp1_side = "sell" if side == "LONG" else "buy"
+            deepcoin_client.place_limit_order(
+                self.symbol, tp1_side, pos_side, tp1, qty // 3,
+            )
+        if len(tps) >= 2 and tps[1] > 0:
+            tp2 = tps[1]
+            tp2_side = "sell" if side == "LONG" else "buy"
+            deepcoin_client.place_limit_order(
+                self.symbol, tp2_side, pos_side, tp2, qty // 3,
+            )
+
+        logger.info(f"📌 [{self.symbol}] 重入防线已挂: 硬止损@{init:.2f} TP1/TP2")
 
     def _sweep_dust_and_finalize(self, reason):
         """哨兵检测：止盈后蚂蚁仓/无 TP 残张 → 撤单 + reduceOnly 扫尾 + 收网钉钉"""
@@ -4393,6 +4750,8 @@ class PositionSupervisor:
         if not disarmed:
             return False
         self._radar_activation_notified = False
+
+
         self._shield_handoff_notified = False
         self._radar_armed_after_tp1 = False
         self._ws_tp1_fill_hint = False
@@ -5664,6 +6023,11 @@ class PositionSupervisor:
     def _process_signal(self, payload):
         raw_action = str(payload.get("action", "")).strip().upper()
         is_tp_sl_update = raw_action in ("UPDATE_TP", "UPDATE_SL")
+        try:
+            if raw_action in ("LONG", "SHORT"):
+                self._pipeline_signal_received(payload)
+        except Exception:
+            pass
 
         if not is_tp_sl_update or payload.get("regime") is not None:
             self.regime = self._safe_int(payload.get("regime"), self.regime or 3)
@@ -5995,10 +6359,18 @@ class PositionSupervisor:
     def _full_reentry(self, action, close_reason):
         """铁律：先平现有仓 → 净挂单 → 再开仓刷新；钉钉核实。"""
         reason = close_reason or "TV开仓·一律先平后开"
+        try:
+            self._pipeline_pending_clear(note=reason)
+        except Exception:
+            pass
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
         if not self._close_all(reason, reset_state=True):
             logger.error("❌ 先平后开中止：平仓未归零，拒绝叠仓开仓")
+            try:
+                self._pipeline_fail(Role.AUDITOR_POS, "CLEAR_FAIL")
+            except Exception:
+                pass
             dingtalk.report_system_alert(
                 "先平后开中止 · 平仓未归零",
                 "强平后盘口仍有持仓，已拒绝新开仓，请人工核查 Deepcoin 盘口",
@@ -6007,12 +6379,20 @@ class PositionSupervisor:
             return
         if not self._wait_verify(self._verify_flat, retries=8, delay=0.5):
             logger.error("❌ 先平后开中止：空仓核查未通过")
+            try:
+                self._pipeline_fail(Role.AUDITOR_POS, "CLEAR_VERIFY_FAIL")
+            except Exception:
+                pass
             dingtalk.report_system_alert(
                 "先平后开中止 · 空仓核查失败",
                 "平仓指令已发但 REST 仍显示持仓，已拒绝叠仓开仓",
             )
             self._close_open_chain_active = False
             return
+        try:
+            self._pipeline_cleared(note="sterile_ok")
+        except Exception:
+            pass
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
         curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
@@ -6041,6 +6421,10 @@ class PositionSupervisor:
             curr_px,
         )
         logger.info(f"📭 感知空仓: {meta.get('tv_reason') or reason}")
+        try:
+            self._pipeline_reset_flat(note=str(meta.get("tv_reason") or reason or "flat"))
+        except Exception:
+            pass
         self.monitoring = False
         self.watched_qty = 0
         self.initial_qty = 0
@@ -6379,9 +6763,17 @@ class PositionSupervisor:
             open_side = "buy" if action == "LONG" else "sell"
             pos_side = "long" if action == "LONG" else "short"
             logger.info(f"🚀 [唯一主仓] 极速开仓: {open_side} {qty} 张 | {self.symbol} | 档位 {self.regime}")
+            try:
+                self._pipeline_entry_submitted(action, qty)
+            except Exception:
+                pass
             res = deepcoin_client.place_market_order(self.symbol, open_side, pos_side, qty)
             if not res or not deepcoin_client._is_success(res):
                 logger.error("开仓失败：市价单未成交")
+                try:
+                    self._pipeline_fail(Role.EXECUTION, "ENTRY_SUBMIT_FAIL")
+                except Exception:
+                    pass
                 dingtalk.report_system_alert("开仓失败", f"TV {action} {qty} 张 市价单失败")
                 return
             time.sleep(2.0)
@@ -6389,6 +6781,10 @@ class PositionSupervisor:
             pos = self._get_active_position()
             if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
                 logger.error("开仓失败：成交后 REST 无持仓")
+                try:
+                    self._pipeline_fail(Role.EXECUTION, "ENTRY_CONFIRM_FAIL")
+                except Exception:
+                    pass
                 return
 
             real_qty = self._safe_qty(pos["size"])
@@ -6430,6 +6826,12 @@ class PositionSupervisor:
             self.base_qty = int(real_qty)
             self.add_count = 0
             self._last_open_exec_ts = time.time()
+            try:
+                self._pipeline_entry_confirmed(
+                    action, float(real_qty), float(pos.get("entry_price") or 0),
+                )
+            except Exception:
+                pass
             self._protect_and_monitor(
                 real_qty, pos['entry_price'],
                 budget_note=f"[{self.symbol}] {budget_txt} | ",
@@ -6468,6 +6870,33 @@ class PositionSupervisor:
         if hasattr(self, "_radar_stage_last"):
             self._radar_stage_last = 0
         self._radar_activation_notified = False
+
+        # v13.91.0: freeze ADX activation ratio/price on open/dormant begin
+        try:
+            from reentry_profiles import (
+                radar_activation_ratio_from_adx,
+                radar_activation_price_adx,
+            )
+            _adx = float(getattr(self, "last_adx", 0) or getattr(self, "radar_activation_adx", 0) or 25.0)
+            _ratio = radar_activation_ratio_from_adx(_adx)
+            self.radar_activation_frac = float(_ratio)
+            self.radar_activation_adx = float(_adx)
+            _entry = float(getattr(self, "watched_entry", 0) or getattr(self, "cycle_entry", 0) or 0)
+            _atr = float(getattr(self, "open_atr", 0) or getattr(self, "cycle_open_atr", 0) or 0)
+            if _atr <= 0:
+                try:
+                    _atr = float(self._get_locked_initial_atr() or 0)
+                except Exception:
+                    _atr = 0.0
+            if _entry > 0 and _atr > 0:
+                _px = radar_activation_price_adx(
+                    getattr(self, "current_side", None), _entry, _atr, adx=_adx, ratio=_ratio,
+                )
+                if _px > 0:
+                    self.radar_activation_price = float(_px)
+        except Exception as _e:
+            logger.debug(f"radar ADX freeze skip: {_e}")
+
         self._radar_armed_after_tp1 = False
         self._ws_tp1_fill_hint = False
         self._open_settled_qty = self._safe_qty(qty)
@@ -6526,6 +6955,21 @@ class PositionSupervisor:
             self._record_open_log(
                 self.current_side, vqty, verified["entry_price"], source="open",
             )
+            try:
+                hard_px = float(getattr(self, "tv_sl", 0) or getattr(self, "current_sl", 0) or 0)
+                ratios = list(
+                    (self.regime_settings.get(self._tp_split_regime()) or {}).get("ratios")
+                    or [0.10, 0.20, 0.70]
+                )
+                self._pipeline_orders_placed(
+                    hard_sl_px=hard_px,
+                    hard_sl_live=hard_px > 0,
+                    tp1={"px": float((tp_pxs or [0])[0] or 0), "qty": round(vqty * float(ratios[0]), 4), "filled": False},
+                    tp2={"px": float((tp_pxs or [0, 0])[1] or 0) if len(tp_pxs or []) > 1 else 0.0, "qty": round(vqty * float(ratios[1]), 4), "filled": False},
+                )
+                self._pipeline_run_chief_audit(source="deepcoin_open")
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] chief audit wire: {e}")
             self._call_dingtalk(
                 dingtalk.report_supervisor_open,
                 side=self.current_side,
@@ -6548,6 +6992,10 @@ class PositionSupervisor:
                 symbol=self.symbol,
                 unit_label=self.unit_label,
             )
+            try:
+                self._pipeline_reported(note="supervisor_open")
+            except Exception:
+                pass
             if expected > 0 and matched < expected:
                 self._open_tp_unconfirmed = True
                 dupes = [lv for lv in audit.get("levels", []) if lv.get("status") == "duplicate"]
@@ -6577,30 +7025,70 @@ class PositionSupervisor:
             return abs(self.tv_tps[0] - self.watched_entry)
         return self.current_atr * 1.5
 
+    def _radar_activation_ratio(self):
+        """返回冻结的 ADX 启动比例（0.70~0.90）。"""
+        from reentry_profiles import normalize_activation_ratio
+        frac = float(getattr(self, "radar_activation_frac", 0) or 0)
+        adx = float(
+            getattr(self, "radar_activation_adx", 0)
+            or getattr(self, "last_adx", 0)
+            or 25.0
+        )
+        ratio = normalize_activation_ratio(frac, adx)
+        if abs(ratio - frac) > 1e-9:
+            self.radar_activation_frac = ratio
+        return float(ratio)
+
     def _radar_activation_price(self):
         """
-        与币安单系统对齐（规格 §5.1）：绝对价锚定。
-          首次 = (TP1+TP2)/2 ；重入 = TP2。
+        v13.91.0 / 对齐币安 v16.7.0：ADX 70%~90% × 1.35×initial_atr。
+        优先账本冻结价；未激活仓迁移旧中点标记时按 ADX 重算并冻结。
         """
-        try:
-            from reentry_profiles import radar_gate_price_from_tps
-            tps = list(getattr(self, "tv_tps", None) or [0, 0, 0])
-            tp1 = float(tps[0] or 0) if len(tps) > 0 else 0.0
-            tp2 = float(tps[1] or 0) if len(tps) > 1 else 0.0
-            attempt = int(getattr(self, "reentry_attempt", 0) or 0)
-            if float(getattr(self, "radar_activation_frac", 0) or 0) >= 1.0:
-                attempt = max(attempt, 1)
-            gate = radar_gate_price_from_tps(tp1, tp2, reentry_attempt=attempt)
-            if gate > 0:
-                return gate
-        except Exception as e:
-            logger.debug(f"radar_gate_price_from_tps 回退: {e}")
-        # 无完整 TP12 时回退旧 regime×TP1距（仅兜底）
-        activation_ratio = self.regime_settings[self.regime]["activation"]
-        tp1_dist = self._tp1_distance()
-        if self.current_side == "LONG":
-            return self.watched_entry + tp1_dist * activation_ratio
-        return self.watched_entry - tp1_dist * activation_ratio
+        from reentry_profiles import (
+            normalize_activation_ratio,
+            radar_activation_price_adx,
+        )
+
+        frozen = float(getattr(self, "radar_activation_price", 0) or 0)
+        activated = bool(getattr(self, "radar_activated", False))
+        entry = float(self.watched_entry or getattr(self, "cycle_entry", 0) or 0)
+        atr = float(
+            getattr(self, "open_atr", 0)
+            or getattr(self, "cycle_open_atr", 0)
+            or 0
+        )
+        if atr <= 0:
+            try:
+                atr = float(self._get_locked_initial_atr() or 0)
+            except Exception:
+                atr = 0.0
+        ratio = self._radar_activation_ratio()
+        adx = float(
+            getattr(self, "radar_activation_adx", 0)
+            or getattr(self, "last_adx", 0)
+            or 25.0
+        )
+        # 已冻结且有效：持仓期不漂移（已激活也保留参考价）
+        if frozen > 0 and entry > 0:
+            # 旧中点价可能仍在账本：若与 ADX 公式偏差过大且未激活 → 重算
+            if not activated and atr > 0:
+                expect = radar_activation_price_adx(
+                    self.current_side, entry, atr, adx=adx, ratio=ratio,
+                )
+                if expect > 0 and abs(frozen - expect) / max(expect, 1e-9) > 0.15:
+                    self.radar_activation_price = expect
+                    return expect
+            return frozen
+        if entry > 0 and atr > 0:
+            px = radar_activation_price_adx(
+                self.current_side, entry, atr, adx=adx, ratio=ratio,
+            )
+            if px > 0:
+                self.radar_activation_price = px
+                self.radar_activation_frac = float(ratio)
+                self.radar_activation_adx = float(adx)
+                return px
+        return 0.0
 
     def _should_radar_trail(self, curr_px):
         """已激活后持续追踪；TP1 未成交前不做移动保本"""
@@ -6690,21 +7178,37 @@ class PositionSupervisor:
                 self.best_price = new_best
 
     def _radar_activation_progress(self, curr_px):
-        if curr_px <= 0 or not self.watched_entry:
+        """0~1：朝 ADX 激活绝对价推进；已激活后走阶段进度（若有）。"""
+        try:
+            if hasattr(self, "_radar_legitimately_armed") and (
+                self._radar_legitimately_armed(self.watched_qty, curr_px)
+                or self._is_radar_active()
+            ):
+                if hasattr(self, "_effective_radar_stage"):
+                    return min(1.0, self._effective_radar_stage(curr_px) / 5.0)
+                return 1.0
+        except Exception:
+            if self._is_radar_active():
+                return 1.0
+        if self._is_radar_active():
+            return 1.0
+        curr_px = float(curr_px or 0)
+        entry = float(self.watched_entry or 0)
+        gate = float(self._radar_activation_price() or 0)
+        if curr_px <= 0 or entry <= 0 or gate <= 0:
             return 0.0
-        tp1_dist = self._tp1_distance()
-        activation_ratio = self.regime_settings[self.regime]["activation"]
-        if self.current_side == "LONG":
-            required = self.watched_entry + tp1_dist * activation_ratio
-            span = required - self.watched_entry
+        side = str(self.current_side or "").upper()
+        if side == "LONG":
+            span = gate - entry
             if span <= 0:
-                return 0.0
-            return max(0.0, min(1.0, (curr_px - self.watched_entry) / span))
-        required = self.watched_entry - tp1_dist * activation_ratio
-        span = self.watched_entry - required
-        if span <= 0:
-            return 0.0
-        return max(0.0, min(1.0, (self.watched_entry - curr_px) / span))
+                return 1.0 if curr_px >= gate else 0.0
+            return max(0.0, min(1.0, (curr_px - entry) / span))
+        if side == "SHORT":
+            span = entry - gate
+            if span <= 0:
+                return 1.0 if curr_px <= gate else 0.0
+            return max(0.0, min(1.0, (entry - curr_px) / span))
+        return 0.0
 
     def _sentinel_poll_sec(self, curr_px=0.0):
         if self._is_radar_active():

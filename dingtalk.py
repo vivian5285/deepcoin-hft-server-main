@@ -259,7 +259,9 @@ def report_principal_snapshot(reason, principal, regime=None, margin_pct=None, t
 def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime, tv_tps=None,
                            verify_note="", tp_audit=None, verified=True,
                            principal_balance=None, margin_pct=None, margin_usdt=None, leverage=None,
-                           tv_field_sources=None, vps_sizing_meta=None, symbol=None, unit_label=None):
+                           tv_field_sources=None, vps_sizing_meta=None, symbol=None, unit_label=None,
+                           hard_sl_px=None, radar_act_px=None, radar_act_ratio=None,
+                           tier=None, adx=None, tier_source=""):
     side_str = _p("🟣 开多 (LONG)", P_LIGHT) if side == "LONG" else _p("🟪 开空 (SHORT)", P_DEEP)
     slip_txt = (
         f"{(entry_price - tv_price if side == 'LONG' else tv_price - entry_price):+.2f} 刀"
@@ -268,6 +270,13 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
     lev = leverage or DEFAULT_LEVERAGE
     unit = unit_label or UNIT_LABEL
     sym = str(symbol or "").strip() or "ETH-USDT-SWAP"
+    tier_line = ""
+    if tier is not None:
+        try:
+            from reentry_profiles import format_tier_notify_line
+            tier_line = format_tier_notify_line(int(tier), adx=adx, source=tier_source)
+        except Exception:
+            tier_line = f"T{tier}"
 
     data = {
         "🎛️ 品种": _p(f"**{sym}**", P_ACCENT),
@@ -287,10 +296,12 @@ def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr, regime
         "📡 TV字段": _p(format_tv_field_sources(tv_field_sources or {}), P_MUTED),
         "📡 哨兵状态": _verify_line(
             verify_note if not verified else "",
-            f"🟢 {VERIFY_TAG} | TP123已挂 · 雷达等TP1三角对账(价到+限价成交+量匹配)",
+            f"🟢 {VERIFY_TAG} | TP1+TP2已挂 · 雷达等ADX门槛激活",
             "⏳ 开仓已提交，REST 同步略延迟 | 哨兵待确认",
         ),
     }
+    if tier_line:
+        data["📊 趋势档位"] = _p(f"**{tier_line}**", P_ACCENT)
     if principal_balance and margin_pct is not None:
         if vps_sizing_meta:
             data["📐 仓位预算"] = _p(
@@ -977,12 +988,14 @@ def report_radar_activated(side, qty, entry, new_sl, radar_progress=1.0, regime=
                            breathing_coefficient=None, trail_dist=None,
                            symbol=None, open_kind=None, activation_frac=None,
                            activation_price=None, trigger_gate="", tier=None):
-    """与币安单系统对齐：启动门槛=TP1-TP2中点（首次）/ TP2（重入）；硬止损不撤销。"""
+    """与币安单系统对齐：启动门槛=ADX 70%~90% × 1.35×ATR（开仓冻结）；硬止损不撤销。"""
     kind = str(open_kind or "").strip() or "首次开仓"
-    attempt_reentry = ("重入" in kind) or (
-        activation_frac is not None and float(activation_frac) >= 1.0
-    )
-    gate_lab = "TP2绝对价" if attempt_reentry else "TP1-TP2中点"
+    # v13.91.0 / 对齐币安 v16.7.0：门槛为 ADX 比例，不再用中点/TP2
+    try:
+        from reentry_profiles import radar_gate_label_from_ratio
+        gate_lab = radar_gate_label_from_ratio(activation_frac)
+    except Exception:
+        gate_lab = "ADX启动 70%~90%×1.35ATR"
     act_px = float(activation_price or 0)
     coeff = float(breathing_coefficient or 0)
     trail_v = float(trail_dist or 0)
@@ -1001,6 +1014,14 @@ def report_radar_activated(side, qty, entry, new_sl, radar_progress=1.0, regime=
             P_MAIN,
         ),
     }
+    if tier is not None:
+        try:
+            from reentry_profiles import format_tier_notify_line
+            data["📊 趋势档位"] = _p(
+                f"**{format_tier_notify_line(int(tier))}**", P_ACCENT,
+            )
+        except Exception:
+            data["📊 趋势档位"] = _p(f"**T{tier}**", P_ACCENT)
     if trigger_gate:
         data["触发"] = _p(str(trigger_gate)[:120], P_MUTED)
     if verify_note:

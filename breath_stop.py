@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-呼吸止损引擎（开仓即工作 · TV initial_atr 基准 · 1h ATR 连续插值呼吸系数）
+呼吸止损引擎（马拉松雷达 · 被动跟随）
 
-两阶段：
-  阶段一：早保本 + initial_stop 基准阶梯（步长/跟进 = 固定 ×initial_atr，不乘系数）
-  阶段二：追踪距离 = initial_atr × trailDistanceMultiplier(smoothedRatio)
-
-呼吸系数 = 连续线性插值（见 breath_profiles.trail_distance_multiplier）；
-XAU 不再额外 ×0.8。
+边界：
+  · 雷达激活前不调用本引擎推进止损
+  · 激活臂 = 保本起步 entry ± tick ± fee_cover（禁止跳到 TP1 底线）
+  · 阶梯：step_trigger / step_advance × initial_atr（按 ADX 档）
+  · 分区呼吸：TP1–TP2 / TP2–TP3 / TP3+ 使用 breath_tp12 / breath_tp23 / trail(min~max)
+  · 取消 TP1/TP2 强制底线；浮盈≥phase_switch_atr(默认3) 切入阶段二
+  · 禁用早保本抢跑（early_be_atr=0）
 """
 from __future__ import annotations
 
@@ -21,20 +22,20 @@ from breath_profiles import (
     trail_distance_multiplier,
 )
 
-# ── ETH 默认常量（兼容旧 import / 测试）──────────────────────────────────────
-INITIAL_SL_ATR = float(BREATH_ETH["initial_sl_atr"])
+INITIAL_SL_ATR = float(BREATH_ETH.get("initial_sl_atr") or 0.0)
 STEP_TRIGGER_ATR = float(BREATH_ETH["step_trigger_atr"])
 STEP_ADVANCE_ATR = float(BREATH_ETH["step_advance_atr"])
-BREAKEVEN_TRIGGER_ATR = float(BREATH_ETH["phase_switch_atr"])  # 阶段切换（非早保本）
+BREAKEVEN_TRIGGER_ATR = float(BREATH_ETH["phase_switch_atr"])
 TP1_ATR = float(BREATH_ETH["tp1_atr"])
-TP1_FLOOR_ATR = float(BREATH_ETH["tp1_floor_atr"])
+TP1_FLOOR_ATR = float(BREATH_ETH.get("tp1_floor_atr") or 0.0)
 TP2_ATR = float(BREATH_ETH["tp2_atr"])
-TP2_FLOOR_ATR = float(BREATH_ETH["tp2_floor_atr"])
+TP2_FLOOR_ATR = float(BREATH_ETH.get("tp2_floor_atr") or 0.0)
 STOP_EXEC_BUFFER_USD = float(BREATH_ETH["stop_exec_buffer"])
+FEE_COVER_PCT = float(BREATH_ETH.get("fee_cover_pct") or 0.0008)
 
-# 兼容旧 import（阶段二已改呼吸系数，不再用 ADX 追踪）
-ADX_WEAK_BOUND = 15.0
-ADX_STRONG_BOUND = 35.0
+# 兼容旧 import
+ADX_WEAK_BOUND = 20.0
+ADX_STRONG_BOUND = 30.0
 TRAIL_DIST_WEAK_ATR = 1.2
 TRAIL_DIST_STRONG_ATR = 2.5
 ADX_FALLBACK = 25.0
@@ -47,14 +48,14 @@ def _profile(profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 
 def trail_distance_by_adx(adx_val: float) -> float:
-    """已废弃：阶段二改用呼吸系数。保留空壳供旧测试/静态检查。"""
+    """兼容旧测试：弱/强边界按白皮书 20/30。"""
     try:
         adx = float(adx_val)
     except (TypeError, ValueError):
         adx = ADX_FALLBACK
-    if adx <= ADX_WEAK_BOUND:
+    if adx < ADX_WEAK_BOUND:
         return TRAIL_DIST_WEAK_ATR
-    if adx >= ADX_STRONG_BOUND:
+    if adx > ADX_STRONG_BOUND:
         return TRAIL_DIST_STRONG_ATR
     ratio = (adx - ADX_WEAK_BOUND) / (ADX_STRONG_BOUND - ADX_WEAK_BOUND)
     return TRAIL_DIST_WEAK_ATR + ratio * (TRAIL_DIST_STRONG_ATR - TRAIL_DIST_WEAK_ATR)
@@ -66,14 +67,7 @@ def get_breathing_coefficient(
     ratio_history: Optional[List[float]] = None,
     profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, float, List[float]]:
-    """
-    连续插值呼吸系数（trailDistanceMultiplier）：
-      1) 采样 ratio = current_1h / initial_atr
-      2) 近 3 次 ratio 算术平均 → smoothedRatio
-      3) trail_distance_multiplier(smoothedRatio)
-    冷启动（0 次有效采样 / cur<=0 且 hist 空）：ratio=1.0 → 公式中间值。
-    返回 (coefficient, smooth_ratio, updated_history)
-    """
+    """TP3+ 动态追踪带宽系数（min_mult~max_mult 插值）。"""
     p = _profile(profile)
     init = float(initial_atr or 0)
     cur = float(current_atr_1h or 0)
@@ -102,20 +96,39 @@ def get_breathing_coefficient(
 def initial_stop_price(
     side: str,
     entry_price: float,
-    initial_atr: float,
+    initial_atr: float = 0.0,
     profile: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """理论 initialStop：多=entry-1.5ATR，空=entry+1.5ATR（不含执行缓冲）。"""
+    """
+    雷达激活臂（马拉松保本起步）：
+      多 = entry + tick + fee_cover
+      空 = entry − tick − fee_cover
+    initial_atr 保留签名兼容；不再用于跳到 ±0.5ATR。
+    """
+    _ = initial_atr
     p = _profile(profile)
     entry = float(entry_price or 0)
-    atr = float(initial_atr or 0)
-    mult = float(p.get("initial_sl_atr") or INITIAL_SL_ATR)
-    if entry <= 0 or atr <= 0:
+    if entry <= 0:
         return 0.0
     side = str(side or "").strip().upper()
+    # 旧路径：若 profile 仍带正 initial_sl_atr，保留兼容
+    mult = float(p.get("initial_sl_atr") or 0)
+    atr = float(initial_atr or 0)
+    if mult > 0 and atr > 0:
+        if side == "SHORT":
+            return round(entry + mult * atr, 2)
+        return round(entry - mult * atr, 2)
+    tick = _tick_size(p)
+    try:
+        fee_pct = abs(float(p.get("fee_cover_pct") or FEE_COVER_PCT))
+    except (TypeError, ValueError):
+        fee_pct = FEE_COVER_PCT
+    fee = entry * fee_pct
     if side == "SHORT":
-        return round(entry + mult * atr, 2)
-    return round(entry - mult * atr, 2)
+        return round(entry - tick - fee, 2)
+    if side == "LONG":
+        return round(entry + tick + fee, 2)
+    return 0.0
 
 
 def order_stop_price(
@@ -124,10 +137,7 @@ def order_stop_price(
     buffer_usd: Optional[float] = None,
     profile: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """
-    盘口挂单止损 = initialStop ± buffer 执行缓冲（向外扩）。
-    多单再减；空单再加。buffer 缺省取 profile.stop_exec_buffer。
-    """
+    """盘口挂单止损 = initialStop ± buffer 执行缓冲（向外扩）。"""
     p = _profile(profile)
     stop = float(initial_stop or 0)
     if buffer_usd is None:
@@ -150,6 +160,60 @@ def _tick_size(profile: Dict[str, Any]) -> float:
     return t if t > 0 else 0.01
 
 
+def _zone_trail_atr(
+    *,
+    side: str,
+    price: float,
+    entry: float,
+    atr: float,
+    profile: Dict[str, Any],
+    coeff: float,
+    tp1_px: float = 0.0,
+    tp2_px: float = 0.0,
+    tp3_px: float = 0.0,
+) -> Tuple[float, str]:
+    """
+    按价格相对 TP 进度返回呼吸空间（×ATR）与区名。
+    TP1–TP2 → breath_tp12；TP2–TP3 → breath_tp23；TP3+ → coeff(min~max)。
+    """
+    side_u = str(side or "").upper()
+    b12 = float(profile.get("breath_tp12") or 1.2)
+    b23 = float(profile.get("breath_tp23") or 1.6)
+    tp1_a = float(profile.get("tp1_atr") or TP1_ATR)
+    tp2_a = float(profile.get("tp2_atr") or TP2_ATR)
+
+    # 优先 TV 价；否则用 ATR 倍数估进度
+    if side_u == "LONG":
+        past_tp3 = (tp3_px > 0 and price >= tp3_px) or (
+            tp3_px <= 0 and price >= entry + (tp2_a + 1.0) * atr
+        )
+        past_tp2 = (tp2_px > 0 and price >= tp2_px) or (
+            tp2_px <= 0 and price >= entry + tp2_a * atr
+        )
+        past_tp1 = (tp1_px > 0 and price >= tp1_px) or (
+            tp1_px <= 0 and price >= entry + tp1_a * atr
+        )
+    else:
+        past_tp3 = (tp3_px > 0 and price <= tp3_px) or (
+            tp3_px <= 0 and price <= entry - (tp2_a + 1.0) * atr
+        )
+        past_tp2 = (tp2_px > 0 and price <= tp2_px) or (
+            tp2_px <= 0 and price <= entry - tp2_a * atr
+        )
+        past_tp1 = (tp1_px > 0 and price <= tp1_px) or (
+            tp1_px <= 0 and price <= entry - tp1_a * atr
+        )
+
+    if past_tp3:
+        return float(coeff), "tp3_plus"
+    if past_tp2:
+        return b23, "tp2_tp3"
+    if past_tp1:
+        return b12, "tp1_tp2"
+    # 激活后尚未到 TP1：用较宽的 tp12 空间，避免过紧
+    return b12, "pre_tp1"
+
+
 def calculate_stop_long(
     price: float,
     entry_price: float,
@@ -162,6 +226,9 @@ def calculate_stop_long(
     adx_val: float = ADX_FALLBACK,
     profile: Optional[Dict[str, Any]] = None,
     early_be_done: bool = False,
+    tp1_px: float = 0.0,
+    tp2_px: float = 0.0,
+    tp3_px: float = 0.0,
 ) -> Tuple[float, float, bool, int, bool]:
     """多单。返回：(新止损, 新最高, 新阶段, step_count, early_be_done)"""
     p = _profile(profile)
@@ -171,7 +238,6 @@ def calculate_stop_long(
     initial_stop = float(initial_stop or 0)
     current_stop = float(current_stop or 0)
     highest_price = float(highest_price or entry_price or 0)
-    breakeven_phase = bool(breakeven_phase)
     early_be_done = bool(early_be_done)
     coeff = float(breathing_coefficient or 1.0)
     if coeff <= 0:
@@ -179,52 +245,48 @@ def calculate_stop_long(
 
     step_trig = float(p.get("step_trigger_atr") or STEP_TRIGGER_ATR)
     step_adv = float(p.get("step_advance_atr") or STEP_ADVANCE_ATR)
-    phase_sw = float(p.get("phase_switch_atr") or BREAKEVEN_TRIGGER_ATR)
-    early_be = float(p.get("early_be_atr") or 0)
-    tp1_a = float(p.get("tp1_atr") or TP1_ATR)
-    tp1_f = float(p.get("tp1_floor_atr") or TP1_FLOOR_ATR)
-    tp2_a = float(p.get("tp2_atr") or TP2_ATR)
-    tp2_f = float(p.get("tp2_floor_atr") or TP2_FLOOR_ATR)
-    tick = _tick_size(p)
 
     new_highest = max(highest_price, price) if price > 0 else highest_price
     new_stop = current_stop
-    new_phase = breakeven_phase
     step_count = 0
 
     if entry_price <= 0 or initial_atr <= 0 or price <= 0:
-        return new_stop, new_highest, new_phase, step_count, early_be_done
+        return new_stop, new_highest, bool(breakeven_phase), step_count, early_be_done
 
-    # 阶段二：trail = initial_atr × trailDistanceMultiplier（无额外 ×0.8）
-    trail_dist = initial_atr * coeff
+    trail_mult, zone = _zone_trail_atr(
+        side="LONG", price=price, entry=entry_price, atr=initial_atr,
+        profile=p, coeff=coeff,
+        tp1_px=float(tp1_px or 0), tp2_px=float(tp2_px or 0), tp3_px=float(tp3_px or 0),
+    )
+    trail_dist = trail_mult * initial_atr
+    # 浮盈≥phase_switch → 阶段二；或已过 TP3
+    phase_sw = float(p.get("phase_switch_atr") or BREAKEVEN_TRIGGER_ATR or 3.0)
+    mfe_atr = (new_highest - entry_price) / initial_atr if initial_atr > 0 else 0.0
+    new_phase = zone == "tp3_plus" or (phase_sw > 0 and mfe_atr >= phase_sw)
 
-    # 早保本：价达 entry+early_be×ATR → stop ≥ entry+1tick
-    if early_be > 0 and price >= entry_price + early_be * initial_atr:
-        early_be_done = True
-        be_stop = round(entry_price + tick, 2)
-        new_stop = max(float(new_stop or 0), be_stop)
+    # 阶梯跟进：价格每涨 step_trigger，止损上移 step_advance（从保本位推进）
+    step_trigger = step_trig * initial_atr
+    step_count = max(0, int((price - entry_price) / step_trigger)) if step_trigger > 0 else 0
+    step_stop = initial_stop + step_count * step_adv * initial_atr
+    candidate = max(float(new_stop or 0), float(current_stop or 0), float(step_stop or 0))
 
-    if not new_phase:
-        # 阶梯：固定 ×initial_atr（文档总表；不乘呼吸系数）
-        step_trigger = step_trig * initial_atr
-        step_count = max(0, int((price - entry_price) / step_trigger)) if step_trigger > 0 else 0
-        step_stop = initial_stop + step_count * step_adv * initial_atr
-        candidate = max(float(new_stop or 0), float(current_stop or 0), step_stop)
-
-        if price >= entry_price + tp1_a * initial_atr:
-            candidate = max(candidate, entry_price + tp1_f * initial_atr)
-        if price >= entry_price + tp2_a * initial_atr:
-            candidate = max(candidate, entry_price + tp2_f * initial_atr)
-
-        new_stop = candidate
-
-        if price >= entry_price + phase_sw * initial_atr:
-            new_phase = True
-            new_stop = max(new_stop, new_highest - trail_dist)
+    # 分区呼吸：止损不得远落后于最高价超过 trail_dist
+    trail_floor = new_highest - trail_dist
+    if new_phase:
+        # 阶段二：连续追踪为主，阶梯不打断
+        candidate = max(candidate, trail_floor)
     else:
-        candidate = new_highest - trail_dist
-        new_stop = max(float(current_stop or 0), float(new_stop or 0), candidate)
+        candidate = max(candidate, trail_floor)
 
+    # 马拉松：禁止 TP1/TP2 强制底线抬升（floor_atr<=0 跳过）
+    f1 = float(p.get("tp1_floor_atr") or 0.0)
+    f2 = float(p.get("tp2_floor_atr") or 0.0)
+    if f2 > 0 and zone in ("tp2_tp3", "tp3_plus"):
+        candidate = max(candidate, entry_price + f2 * initial_atr)
+    elif f1 > 0 and zone == "tp1_tp2":
+        candidate = max(candidate, entry_price + f1 * initial_atr)
+
+    new_stop = candidate
     return (
         round(float(new_stop), 2),
         round(float(new_highest), 2),
@@ -246,8 +308,11 @@ def calculate_stop_short(
     adx_val: float = ADX_FALLBACK,
     profile: Optional[Dict[str, Any]] = None,
     early_be_done: bool = False,
+    tp1_px: float = 0.0,
+    tp2_px: float = 0.0,
+    tp3_px: float = 0.0,
 ) -> Tuple[float, float, bool, int, bool]:
-    """空单对称。返回：(新止损, 新最低, 新阶段, step_count, early_be_done)"""
+    """空单对称。"""
     p = _profile(profile)
     price = float(price or 0)
     entry_price = float(entry_price or 0)
@@ -255,7 +320,6 @@ def calculate_stop_short(
     initial_stop = float(initial_stop or 0)
     current_stop = float(current_stop or 0)
     lowest_price = float(lowest_price or entry_price or 0)
-    breakeven_phase = bool(breakeven_phase)
     early_be_done = bool(early_be_done)
     coeff = float(breathing_coefficient or 1.0)
     if coeff <= 0:
@@ -263,13 +327,6 @@ def calculate_stop_short(
 
     step_trig = float(p.get("step_trigger_atr") or STEP_TRIGGER_ATR)
     step_adv = float(p.get("step_advance_atr") or STEP_ADVANCE_ATR)
-    phase_sw = float(p.get("phase_switch_atr") or BREAKEVEN_TRIGGER_ATR)
-    early_be = float(p.get("early_be_atr") or 0)
-    tp1_a = float(p.get("tp1_atr") or TP1_ATR)
-    tp1_f = float(p.get("tp1_floor_atr") or TP1_FLOOR_ATR)
-    tp2_a = float(p.get("tp2_atr") or TP2_ATR)
-    tp2_f = float(p.get("tp2_floor_atr") or TP2_FLOOR_ATR)
-    tick = _tick_size(p)
 
     new_lowest = min(lowest_price, price) if (lowest_price > 0 and price > 0) else (
         price if price > 0 else lowest_price
@@ -277,46 +334,44 @@ def calculate_stop_short(
     if lowest_price <= 0 and price > 0:
         new_lowest = price
     new_stop = current_stop
-    new_phase = breakeven_phase
     step_count = 0
 
     if entry_price <= 0 or initial_atr <= 0 or price <= 0:
-        return new_stop, new_lowest, new_phase, step_count, early_be_done
+        return new_stop, new_lowest, bool(breakeven_phase), step_count, early_be_done
 
-    trail_dist = initial_atr * coeff
+    trail_mult, zone = _zone_trail_atr(
+        side="SHORT", price=price, entry=entry_price, atr=initial_atr,
+        profile=p, coeff=coeff,
+        tp1_px=float(tp1_px or 0), tp2_px=float(tp2_px or 0), tp3_px=float(tp3_px or 0),
+    )
+    trail_dist = trail_mult * initial_atr
+    phase_sw = float(p.get("phase_switch_atr") or BREAKEVEN_TRIGGER_ATR or 3.0)
+    mfe_atr = (entry_price - new_lowest) / initial_atr if initial_atr > 0 else 0.0
+    new_phase = zone == "tp3_plus" or (phase_sw > 0 and mfe_atr >= phase_sw)
 
-    if early_be > 0 and price <= entry_price - early_be * initial_atr:
-        early_be_done = True
-        be_stop = round(entry_price - tick, 2)
-        if new_stop <= 0:
-            new_stop = be_stop
-        else:
-            new_stop = min(new_stop, be_stop)
+    step_trigger = step_trig * initial_atr
+    step_count = max(0, int((entry_price - price) / step_trigger)) if step_trigger > 0 else 0
+    step_stop = initial_stop - step_count * step_adv * initial_atr
+    refs = [x for x in (current_stop, new_stop, step_stop) if x > 0]
+    candidate = min(refs) if refs else step_stop
 
-    if not new_phase:
-        step_trigger = step_trig * initial_atr
-        step_count = max(0, int((entry_price - price) / step_trigger)) if step_trigger > 0 else 0
-        step_stop = initial_stop - step_count * step_adv * initial_atr
-        if current_stop > 0 or new_stop > 0:
-            candidate = min(x for x in (current_stop, new_stop, step_stop) if x > 0)
-        else:
-            candidate = step_stop
-
-        if price <= entry_price - tp1_a * initial_atr:
-            candidate = min(candidate, entry_price - tp1_f * initial_atr)
-        if price <= entry_price - tp2_a * initial_atr:
-            candidate = min(candidate, entry_price - tp2_f * initial_atr)
-
-        new_stop = candidate
-
-        if price <= entry_price - phase_sw * initial_atr:
-            new_phase = True
-            new_stop = min(new_stop, new_lowest + trail_dist)
+    trail_ceil = new_lowest + trail_dist
+    if candidate <= 0:
+        candidate = trail_ceil
     else:
-        candidate = new_lowest + trail_dist
-        refs = [x for x in (current_stop, new_stop, candidate) if x > 0]
-        new_stop = min(refs) if refs else candidate
+        candidate = min(candidate, trail_ceil)
 
+    # 马拉松：禁止 TP1/TP2 强制底线（floor_atr<=0 跳过）
+    f1 = float(p.get("tp1_floor_atr") or 0.0)
+    f2 = float(p.get("tp2_floor_atr") or 0.0)
+    if f2 > 0 and zone in ("tp2_tp3", "tp3_plus"):
+        floor = entry_price - f2 * initial_atr
+        candidate = min(candidate, floor) if candidate > 0 else floor
+    elif f1 > 0 and zone == "tp1_tp2":
+        floor = entry_price - f1 * initial_atr
+        candidate = min(candidate, floor) if candidate > 0 else floor
+
+    new_stop = candidate
     return (
         round(float(new_stop), 2),
         round(float(new_lowest), 2),
@@ -339,6 +394,9 @@ def calculate_breath_stop(
     adx_val: float = ADX_FALLBACK,
     profile: Optional[Dict[str, Any]] = None,
     early_be_done: bool = False,
+    tp1_px: float = 0.0,
+    tp2_px: float = 0.0,
+    tp3_px: float = 0.0,
     **_kw,
 ):
     """
@@ -353,13 +411,18 @@ def calculate_breath_stop(
     coeff = float(breathing_coefficient or 1.0)
     if coeff <= 0:
         coeff = cold_start_multiplier(p)
+    trail_mult, zone = _zone_trail_atr(
+        side=side, price=px, entry=entry, atr=atr, profile=p, coeff=coeff,
+        tp1_px=float(tp1_px or 0), tp2_px=float(tp2_px or 0), tp3_px=float(tp3_px or 0),
+    )
     meta = {
-        "trail_atr": coeff,
+        "trail_atr": trail_mult,
         "breathing_coefficient": coeff,
         "phase2_trail_mult": 1.0,
         "profile": p.get("name") or "ETH",
         "adx": float(adx_val or 0),
-        "phase": "breakeven" if breakeven_phase else "ladder",
+        "zone": zone,
+        "phase": "trail" if zone == "tp3_plus" else "ladder",
         "step_count": 0,
         "early_be_done": bool(early_be_done),
     }
@@ -368,17 +431,19 @@ def calculate_breath_stop(
             px, entry, atr, initial_stop, current_stop, best_price,
             breakeven_phase, breathing_coefficient=coeff, profile=p,
             early_be_done=early_be_done,
+            tp1_px=tp1_px, tp2_px=tp2_px, tp3_px=tp3_px,
         )
     else:
         stop, best, phase, step_count, early = calculate_stop_long(
             px, entry, atr, initial_stop, current_stop, best_price,
             breakeven_phase, breathing_coefficient=coeff, profile=p,
             early_be_done=early_be_done,
+            tp1_px=tp1_px, tp2_px=tp2_px, tp3_px=tp3_px,
         )
     meta["step_count"] = int(step_count)
-    meta["phase"] = "breakeven" if phase else "ladder"
+    meta["phase"] = "trail" if phase else "ladder"
     meta["early_be_done"] = bool(early)
-    meta["trail_distance"] = round(atr * coeff, 4) if atr > 0 else 0.0
+    meta["trail_distance"] = round(atr * trail_mult, 4) if atr > 0 else 0.0
     return {
         "stop": stop,
         "best": best,

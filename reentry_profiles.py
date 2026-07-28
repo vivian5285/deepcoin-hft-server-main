@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-双币种雷达 + 智能再入场（规格 §5.1 绝对价锚定）。
+双币种雷达 + 智能再入场（v16.8.1 · 马拉松激活比例修复版）。
 
-- 档位 0/1/2：ADX <20 / 20–30 / >30（弱/中/强趋势）— 仅影响雷达步进/呼吸
-- 硬止损呼吸垫：统一 1.15（不分档）
-- 雷达启动（绝对价）：首次 = (TP1+TP2)/2；重入 = TP2（共用同一套 TP 绝对价）
-- 激活臂：entry ± 0.5×ATR
+- 档位 0/1/2：ADX <20 / 20–30 / >30（弱/中/强趋势）— 步进/呼吸 + 启动比例
+- 硬止损呼吸垫：统一 1.15（不分档）；硬止损独立于雷达，始终并存
+- 雷达启动（第一层）：ADX 三档离散 × 1.35×initial_atr
+  · 弱 ADX<20 → 68%（早激活保护微利）；中 20–30 → 78%；强 >30 → 88%（晚激活留呼吸）
+- 激活瞬间：保本起步 = entry ± tick ± fee_cover（禁止跳到 TP1 底线）
+- 取消 TP1/TP2 强制底线；TP 成交只缩量不改价
 - 重入最多 1 次；窗口 = K线根数（ETH 2×90m · XAU 3×45m）
 - 重入成功后雷达系数放宽一档（looser_tier）；不影响 TP 价量
+- 第二层 trail（ATR 比插值）见 breath_profiles，本文件不改
 - 双保险限价：多 min(5m低+tick, TV×0.997)；空 max(5m高−tick, TV×1.003)
 - 硬止损 / 亏损出局禁止重入；本地订单标签防狂挂
 """
@@ -21,19 +24,28 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 # ── 默认（config/reentry_tiers.json 可覆盖）────────────────────────────────
-# 兼容旧字段名：0=首次中点模式标记，1=重入TP2模式标记（不再表示×TP1距）
-_DEFAULT_ACTIVATION_FRAC = 0.0  # unused; kept for schema
-_DEFAULT_ACTIVATION_FRAC_REENTRY = 1.0
-_DEFAULT_ARM_SL_ATR = 0.5
+_DEFAULT_ARM_SL_ATR = 0.0  # 马拉松：激活臂不再用 ATR 跳价
+_DEFAULT_FEE_COVER_PCT = 0.0008  # 双边约 0.08% 手续费覆盖
 _DEFAULT_HARD_SL_BUFFER = 1.15
 _DEFAULT_ADX_WEAK_LT = 20.0
 _DEFAULT_ADX_STRONG_GT = 30.0
+# 第一层雷达启动（与档位 20/30 对齐 · 离散三档）
+_DEFAULT_RADAR_ACT_ADX_LO = 20.0
+_DEFAULT_RADAR_ACT_ADX_HI = 30.0
+# 带宽：弱早(低比例) … 强晚(高比例)
+_DEFAULT_RADAR_ACT_RATIO_LO = 0.68
+_DEFAULT_RADAR_ACT_RATIO_HI = 0.88
+_DEFAULT_ACT_RATIO_WEAK = 0.68   # 65%–70% 中值：弱趋势早激活
+_DEFAULT_ACT_RATIO_MID = 0.78    # 75%–80% 中值
+_DEFAULT_ACT_RATIO_STRONG = 0.88  # 85%–90% 中值：强趋势晚激活
+# v4.0 写反的离散值 → normalize 时若与 ADX 档不符则重算
+_INVERTED_LEGACY_RATIOS = frozenset({0.70, 0.85})
 
 _DEFAULT_ETH_TIERS: List[Dict[str, float]] = [
     {"step_trigger_atr": 0.40, "step_advance_atr": 0.25,
      "breath_tp12": 0.80, "breath_tp23": 1.00, "min_mult": 1.2, "max_mult": 1.5},
     {"step_trigger_atr": 0.50, "step_advance_atr": 0.35,
-     "breath_tp12": 1.20, "breath_tp23": 1.60, "min_mult": 2.0, "max_mult": 2.5},
+     "breath_tp12": 1.20, "breath_tp23": 1.60, "min_mult": 1.8, "max_mult": 2.5},
     {"step_trigger_atr": 0.60, "step_advance_atr": 0.40,
      "breath_tp12": 1.50, "breath_tp23": 2.00, "min_mult": 2.5, "max_mult": 3.5},
 ]
@@ -41,9 +53,9 @@ _DEFAULT_XAU_TIERS: List[Dict[str, float]] = [
     {"step_trigger_atr": 0.35, "step_advance_atr": 0.20,
      "breath_tp12": 0.70, "breath_tp23": 0.90, "min_mult": 1.0, "max_mult": 1.3},
     {"step_trigger_atr": 0.40, "step_advance_atr": 0.30,
-     "breath_tp12": 1.00, "breath_tp23": 1.40, "min_mult": 1.8, "max_mult": 2.2},
+     "breath_tp12": 1.00, "breath_tp23": 1.40, "min_mult": 1.5, "max_mult": 2.0},
     {"step_trigger_atr": 0.50, "step_advance_atr": 0.35,
-     "breath_tp12": 1.30, "breath_tp23": 1.80, "min_mult": 2.2, "max_mult": 3.0},
+     "breath_tp12": 1.30, "breath_tp23": 1.80, "min_mult": 2.0, "max_mult": 2.8},
 ]
 
 REENTRY_TIERS_JSON = os.path.join(
@@ -64,26 +76,62 @@ def _load_tiers_file() -> Dict[str, Any]:
 
 
 _CFG = _load_tiers_file()
-# 旧配置 activation_tp1_frac 仍可读，但激活价已改为 TP 绝对锚定（见 radar_gate_price_from_tps）
+# 默认启动比例（ADX 中档附近）；真实值开仓时按 ADX 冻结
 ACTIVATION_TP1_FRAC = float(
-    _CFG.get("activation_tp1_frac")
-    if _CFG.get("activation_tp1_frac") is not None
-    else 0.0
+    _CFG.get("radar_act_ratio_lo")
+    if _CFG.get("radar_act_ratio_lo") is not None
+    else (
+        _CFG.get("activation_tp1_frac")
+        if _CFG.get("activation_tp1_frac") is not None
+        else _DEFAULT_RADAR_ACT_RATIO_LO
+    )
 )
+# 兼容旧字段名（不再表示重入 TP2）
 ACTIVATION_TP1_FRAC_REENTRY = float(
-    _CFG.get("activation_tp1_frac_reentry")
-    if _CFG.get("activation_tp1_frac_reentry") is not None
-    else _DEFAULT_ACTIVATION_FRAC_REENTRY
+    _CFG.get("radar_act_ratio_hi")
+    if _CFG.get("radar_act_ratio_hi") is not None
+    else (
+        _CFG.get("activation_tp1_frac_reentry")
+        if _CFG.get("activation_tp1_frac_reentry") is not None
+        else _DEFAULT_RADAR_ACT_RATIO_HI
+    )
 )
-# 兼容：索引 0=首次，1=重入（语义见 activation_mode_for_attempt）
 ACTIVATION_FRACS: List[float] = [ACTIVATION_TP1_FRAC, ACTIVATION_TP1_FRAC_REENTRY]
-ACTIVATION_MODE_FIRST = "tp12_mid"
-ACTIVATION_MODE_REENTRY = "tp2"
+# 兼容旧常量名（语义已改为 adx_ratio）
+ACTIVATION_MODE_FIRST = "adx_ratio"
+ACTIVATION_MODE_REENTRY = "adx_ratio"
 ARM_SL_ATR = float(
     _CFG.get("arm_sl_atr")
     if _CFG.get("arm_sl_atr") is not None
     else _DEFAULT_ARM_SL_ATR
 )
+FEE_COVER_PCT = float(
+    _CFG.get("fee_cover_pct")
+    if _CFG.get("fee_cover_pct") is not None
+    else _DEFAULT_FEE_COVER_PCT
+)
+PHASE_SWITCH_ATR = float(
+    _CFG.get("phase_switch_atr")
+    if _CFG.get("phase_switch_atr") is not None
+    else 3.0
+)
+_ACT_RATIOS = _CFG.get("activation_ratios") or {}
+ACT_RATIO_WEAK = float(
+    _ACT_RATIOS.get("weak")
+    if _ACT_RATIOS.get("weak") is not None
+    else _DEFAULT_ACT_RATIO_WEAK
+)
+ACT_RATIO_MID = float(
+    _ACT_RATIOS.get("mid")
+    if _ACT_RATIOS.get("mid") is not None
+    else _DEFAULT_ACT_RATIO_MID
+)
+ACT_RATIO_STRONG = float(
+    _ACT_RATIOS.get("strong")
+    if _ACT_RATIOS.get("strong") is not None
+    else _DEFAULT_ACT_RATIO_STRONG
+)
+ARM_MODE = str(_CFG.get("arm_mode") or "breakeven_fee").strip().lower()
 LIMIT_DISCOUNT = float(_CFG.get("limit_discount") or 0.003)
 LIMIT_TTL_SEC = int(_CFG.get("limit_ttl_sec") or 300)
 MAX_REENTRIES = int(_CFG.get("max_reentries") or 1)
@@ -91,7 +139,7 @@ MAX_TIER_INDEX = 2  # ADX 档 0..2
 MAX_UNFILLED_REFRESHES = int(_CFG.get("max_unfilled_refreshes") or 5)
 DEFAULT_TICK = 0.01
 STERILE_MAX_RETRY = 3
-TP1_ATR_MULT = 1.35  # 仅当无 TV TP1 价时的距离回退
+TP1_ATR_MULT = 1.35  # 启动距离 = 1.35 × initial_atr
 HARD_SL_BUFFER_MULT = float(
     _CFG.get("hard_sl_buffer_mult")
     if _CFG.get("hard_sl_buffer_mult") is not None
@@ -102,6 +150,26 @@ _bounds = _CFG.get("adx_bounds") or {}
 ADX_WEAK_LT = float(_bounds.get("weak_lt") if _bounds.get("weak_lt") is not None else _DEFAULT_ADX_WEAK_LT)
 ADX_STRONG_GT = float(
     _bounds.get("strong_gt") if _bounds.get("strong_gt") is not None else _DEFAULT_ADX_STRONG_GT
+)
+RADAR_ACT_ADX_LO = float(
+    _CFG.get("radar_act_adx_lo")
+    if _CFG.get("radar_act_adx_lo") is not None
+    else _DEFAULT_RADAR_ACT_ADX_LO
+)
+RADAR_ACT_ADX_HI = float(
+    _CFG.get("radar_act_adx_hi")
+    if _CFG.get("radar_act_adx_hi") is not None
+    else _DEFAULT_RADAR_ACT_ADX_HI
+)
+RADAR_ACT_RATIO_LO = float(
+    _CFG.get("radar_act_ratio_lo")
+    if _CFG.get("radar_act_ratio_lo") is not None
+    else _DEFAULT_RADAR_ACT_RATIO_LO
+)
+RADAR_ACT_RATIO_HI = float(
+    _CFG.get("radar_act_ratio_hi")
+    if _CFG.get("radar_act_ratio_hi") is not None
+    else _DEFAULT_RADAR_ACT_RATIO_HI
 )
 # 兼容旧名：三档同值 1.15（白皮书 v3 废止分档）
 BUFFER_BY_TIER: List[float] = [HARD_SL_BUFFER_MULT, HARD_SL_BUFFER_MULT, HARD_SL_BUFFER_MULT]
@@ -141,7 +209,13 @@ REENTRY_ETH: Dict[str, Any] = {
     "enabled": True,
     "activation_tp1_frac": ACTIVATION_TP1_FRAC,
     "activation_tp1_frac_reentry": ACTIVATION_TP1_FRAC_REENTRY,
+    "radar_act_adx_lo": RADAR_ACT_ADX_LO,
+    "radar_act_adx_hi": RADAR_ACT_ADX_HI,
+    "radar_act_ratio_lo": RADAR_ACT_RATIO_LO,
+    "radar_act_ratio_hi": RADAR_ACT_RATIO_HI,
     "arm_sl_atr": ARM_SL_ATR,
+    "fee_cover_pct": FEE_COVER_PCT,
+    "arm_mode": ARM_MODE,
     "tiers": ETH_TIERS,
     "reentry_zone_atr": _ETH_ZONE,
     "reentry_window_bars": _ETH_WINDOW_BARS,
@@ -158,7 +232,13 @@ REENTRY_XAU: Dict[str, Any] = {
     "enabled": True,
     "activation_tp1_frac": ACTIVATION_TP1_FRAC,
     "activation_tp1_frac_reentry": ACTIVATION_TP1_FRAC_REENTRY,
+    "radar_act_adx_lo": RADAR_ACT_ADX_LO,
+    "radar_act_adx_hi": RADAR_ACT_ADX_HI,
+    "radar_act_ratio_lo": RADAR_ACT_RATIO_LO,
+    "radar_act_ratio_hi": RADAR_ACT_RATIO_HI,
     "arm_sl_atr": ARM_SL_ATR,
+    "fee_cover_pct": FEE_COVER_PCT,
+    "arm_mode": ARM_MODE,
     "tiers": XAU_TIERS,
     "reentry_zone_atr": _XAU_ZONE,
     "reentry_window_bars": _XAU_WINDOW_BARS,
@@ -223,6 +303,28 @@ def tier_label_short(tier: int) -> str:
     return f"T{clamp_tier(tier)}"
 
 
+def format_tier_notify_line(
+    tier: int,
+    adx: Optional[float] = None,
+    *,
+    source: str = "",
+) -> str:
+    """钉钉/TG 档位一行：弱/中/强 + ADX + 作用说明（硬止损不分档）。"""
+    t = clamp_tier(tier)
+    parts = [f"{tier_label(t)}（T{t}）"]
+    try:
+        a = float(adx or 0)
+    except (TypeError, ValueError):
+        a = 0.0
+    if a > 0:
+        parts.append(f"ADX={a:.1f}")
+    parts.append("仅影响雷达步进/呼吸 · 硬止损垫恒1.15")
+    src = str(source or "").strip()
+    if src:
+        parts.append(f"来源={src}")
+    return " · ".join(parts)
+
+
 def buffer_for_tier(tier: int = 0) -> float:
     """白皮书 v3.0：统一 1.15，tier 忽略。"""
     return float(HARD_SL_BUFFER_MULT)
@@ -233,51 +335,153 @@ def buffer_for_adx(adx: float = 0.0) -> float:
 
 
 def activation_mode_for_attempt(attempt: int = 0) -> str:
-    """首次开仓 → TP1/TP2 中点；重入 → TP2。"""
-    if int(attempt or 0) >= 1:
-        return ACTIVATION_MODE_REENTRY
+    """首次/重入均 ADX 比例启动（兼容旧名）。"""
+    _ = attempt
     return ACTIVATION_MODE_FIRST
+
+
+def is_legacy_activation_frac(frac: Optional[float]) -> bool:
+    """旧中点/TP2 模式标记 0.0/1.0，或越界值 → 需按 ADX 重算。
+    合法区间放宽到 0.65~0.95，兼容旧连续插值冻结的 0.70~0.90。
+    """
+    try:
+        f = float(frac)
+    except (TypeError, ValueError):
+        return True
+    if f <= 0.0 or f >= 0.999:
+        return True
+    return not (0.65 <= f <= 0.95)
+
+
+def radar_activation_ratio_from_adx(adx: Optional[float] = None) -> float:
+    """
+    第一层：ADX → 启动比例（马拉松离散三档 · 修复版）。
+    ADX<20 → 68%（早）；20≤ADX≤30 → 78%；ADX>30 → 88%（晚）。
+    弱趋势早激活防微利回吐；强趋势晚激活给深度回踩留呼吸空间。
+    """
+    try:
+        a = float(adx)
+    except (TypeError, ValueError):
+        a = 25.0
+    if a != a:  # NaN
+        a = 25.0
+    weak_lt = float(ADX_WEAK_LT)
+    strong_gt = float(ADX_STRONG_GT)
+    if a < weak_lt:
+        return round(float(ACT_RATIO_WEAK), 6)
+    if a > strong_gt:
+        return round(float(ACT_RATIO_STRONG), 6)
+    return round(float(ACT_RATIO_MID), 6)
+
+
+def normalize_activation_ratio(
+    frac: Optional[float] = None,
+    adx: Optional[float] = None,
+) -> float:
+    """账本 frac 合法则沿用；旧标记 / v4.0 翻转离散值按 ADX 重算。"""
+    expected = radar_activation_ratio_from_adx(adx)
+    if is_legacy_activation_frac(frac):
+        return expected
+    try:
+        f = round(float(frac), 6)
+    except (TypeError, ValueError):
+        return expected
+    # v4.0 写反：弱85%/强70% — 与当前 ADX 档偏差大则迁移
+    if round(f, 2) in _INVERTED_LEGACY_RATIOS and abs(f - expected) > 0.029:
+        return expected
+    return f
 
 
 def activation_frac_for_attempt(
     attempt: int = 0, profile: Optional[Dict[str, Any]] = None,
+    *,
+    adx: Optional[float] = None,
 ) -> float:
-    """
-    兼容旧调用：返回模式标记（首次 0.0 / 重入 1.0），不再表示 ×TP1 距离系数。
-    激活绝对价请用 radar_gate_price_from_tps。
-    """
+    """返回 ADX 启动比例（首次/重入同一公式；attempt 忽略）。"""
+    _ = attempt
     _ = profile
-    return 1.0 if int(attempt or 0) >= 1 else 0.0
+    return radar_activation_ratio_from_adx(adx)
 
 
 def activation_frac_fixed(profile: Optional[Dict[str, Any]] = None) -> float:
-    """兼容旧名：首次开仓模式标记。"""
-    return activation_frac_for_attempt(0, profile)
+    """兼容旧名：缺省 ADX=25 → 中间比例。"""
+    return activation_frac_for_attempt(0, profile, adx=25.0)
+
+
+def radar_activation_price_adx(
+    side: str,
+    entry: float,
+    initial_atr: float,
+    *,
+    adx: Optional[float] = None,
+    ratio: Optional[float] = None,
+    tp1_atr_mult: float = TP1_ATR_MULT,
+    tp1_dist: Optional[float] = None,
+) -> float:
+    """
+    启动价 = entry ± ratio × TP1距离。
+    TP1距离优先用真实 TV TP1（tp1_dist）；缺失时回退 1.35 × initial_atr。
+    ratio 优先；否则由 adx 计算。
+    """
+    side_u = str(side or "").strip().upper()
+    entry_f = float(entry or 0)
+    atr = float(initial_atr or 0)
+    if ratio is not None and not is_legacy_activation_frac(ratio):
+        r = float(ratio)
+    else:
+        r = radar_activation_ratio_from_adx(adx)
+    try:
+        base = abs(float(tp1_dist or 0))
+    except (TypeError, ValueError):
+        base = 0.0
+    if base <= 0:
+        base = tp1_distance(atr, tp1_atr_mult)
+    dist = base * float(r)
+    if entry_f <= 0 or dist <= 0 or side_u not in ("LONG", "SHORT"):
+        return 0.0
+    if side_u == "LONG":
+        return round(entry_f + dist, 4)
+    return round(entry_f - dist, 4)
 
 
 def radar_gate_price_from_tps(
     tp1: float,
     tp2: float,
     reentry_attempt: int = 0,
+    **kwargs,
 ) -> float:
     """
-    规格 §5.1：雷达激活绝对价（与成交价无关）。
-      首次开仓： (TP1 + TP2) / 2
-      重入开仓： TP2
+    【规格 v1.0 · 绝对价格锚定】
+    首次开仓：雷达激活价 = (TP1 + TP2) / 2
+    重入开仓：雷达激活价 = TP2（价格必须真正到达 TP2 才接管）
+    不再使用 ADX 比例 × TP1 距离的旧公式。
     """
     t1 = float(tp1 or 0)
     t2 = float(tp2 or 0)
+    attempt = int(reentry_attempt or 0)
     if t1 <= 0 or t2 <= 0:
         return 0.0
-    if int(reentry_attempt or 0) >= 1:
+    if attempt >= 1:
+        # 重入开仓：TP2 绝对价格
         return round(t2, 4)
-    return round((t1 + t2) / 2.0, 4)
+    else:
+        # 首次开仓：TP1-TP2 区间中点
+        return round((t1 + t2) / 2.0, 4)
 
 
-def radar_gate_label(reentry_attempt: int = 0) -> str:
-    if int(reentry_attempt or 0) >= 1:
-        return "TP2绝对价"
-    return "TP1-TP2中点"
+def radar_gate_label(reentry_attempt: int = 0, ratio: Optional[float] = None) -> str:
+    _ = reentry_attempt
+    return radar_gate_label_from_ratio(ratio)
+
+
+def radar_gate_label_from_ratio(ratio: Optional[float] = None) -> str:
+    try:
+        r = float(ratio)
+    except (TypeError, ValueError):
+        r = 0.0
+    if 0.65 <= r <= 0.95:
+        return f"ADX启动 {r:.0%}×1.35ATR"
+    return "ADX启动 65%~90%×1.35ATR"
 
 
 def tier_coeffs(tier: int, profile: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
@@ -318,29 +522,81 @@ def apply_tier_to_breath_profile(
     out["min_mult"] = coeffs["min_mult"]
     out["max_mult"] = coeffs["max_mult"]
     out["early_be_atr"] = 0.0
-    out["initial_sl_atr"] = float(
-        rp.get("arm_sl_atr") if rp.get("arm_sl_atr") is not None else ARM_SL_ATR
+    out["tp1_floor_atr"] = 0.0  # 马拉松：取消强制底线
+    out["tp2_floor_atr"] = 0.0
+    out["phase_switch_atr"] = float(PHASE_SWITCH_ATR)
+    # 激活臂：保本起步，不再用 ATR 跳价
+    out["initial_sl_atr"] = 0.0
+    out["fee_cover_pct"] = float(
+        rp.get("fee_cover_pct") if rp.get("fee_cover_pct") is not None else FEE_COVER_PCT
     )
     out["adx_tier"] = clamp_tier(tier)
     return out
 
 
+def breakeven_arm_price(
+    side: str,
+    entry: float,
+    *,
+    tick_size: float = DEFAULT_TICK,
+    fee_cover_pct: Optional[float] = None,
+) -> float:
+    """
+    马拉松激活瞬间保本位：
+      多 = entry + tick + fee_cover
+      空 = entry − tick − fee_cover
+    即使被扫也不亏（覆盖往返手续费）。
+    """
+    side_u = str(side or "").strip().upper()
+    e = float(entry or 0)
+    if e <= 0 or side_u not in ("LONG", "SHORT"):
+        return 0.0
+    try:
+        tick = abs(float(tick_size or 0))
+    except (TypeError, ValueError):
+        tick = DEFAULT_TICK
+    if tick <= 0:
+        tick = DEFAULT_TICK
+    try:
+        fee_pct = abs(float(
+            fee_cover_pct if fee_cover_pct is not None else FEE_COVER_PCT
+        ))
+    except (TypeError, ValueError):
+        fee_pct = _DEFAULT_FEE_COVER_PCT
+    fee = e * fee_pct
+    if side_u == "LONG":
+        return round(e + tick + fee, 2)
+    return round(e - tick - fee, 2)
+
+
 def arm_stop_price(
     side: str,
     entry: float,
-    initial_atr: float,
-    arm_atr: float = ARM_SL_ATR,
+    initial_atr: float = 0.0,
+    arm_atr: float = None,
+    *,
+    tick_size: float = DEFAULT_TICK,
+    fee_cover_pct: Optional[float] = None,
 ) -> float:
-    """雷达激活时初始止损：多 entry−0.5ATR；空 entry+0.5ATR。"""
-    side_u = str(side or "").strip().upper()
-    e = float(entry or 0)
-    atr = float(initial_atr or 0)
-    mult = abs(float(arm_atr if arm_atr is not None else ARM_SL_ATR))
-    if e <= 0 or atr <= 0 or side_u not in ("LONG", "SHORT"):
-        return 0.0
-    if side_u == "LONG":
-        return round(e - mult * atr, 2)
-    return round(e + mult * atr, 2)
+    """
+    雷达激活时初始止损（马拉松保本起步）。
+    默认：entry ± tick ± fee；旧 arm_atr>0 路径仅兼容测试。
+    """
+    _ = initial_atr
+    if arm_atr is not None and float(arm_atr or 0) > 0:
+        # 兼容旧测试/调用：显式传入正 arm_atr 时仍走 ATR 臂
+        side_u = str(side or "").strip().upper()
+        e = float(entry or 0)
+        atr = float(initial_atr or 0)
+        mult = abs(float(arm_atr))
+        if e <= 0 or atr <= 0 or side_u not in ("LONG", "SHORT"):
+            return 0.0
+        if side_u == "LONG":
+            return round(e - mult * atr, 2)
+        return round(e + mult * atr, 2)
+    return breakeven_arm_price(
+        side, entry, tick_size=tick_size, fee_cover_pct=fee_cover_pct,
+    )
 
 
 def tp1_distance(initial_atr: float, tp1_atr_mult: float = TP1_ATR_MULT) -> float:
@@ -351,58 +607,62 @@ def activation_price(
     side: str,
     entry: float,
     initial_atr: float,
-    frac: float = ACTIVATION_TP1_FRAC,
+    frac: float = None,
     tp1_atr_mult: float = TP1_ATR_MULT,
 ) -> float:
-    """雷达启动价（无 TV TP1 时）：多 = entry + frac×1.35ATR；空对称。"""
-    side_u = str(side or "").strip().upper()
-    entry_f = float(entry or 0)
-    dist = tp1_distance(initial_atr, tp1_atr_mult) * float(
-        frac if frac is not None else ACTIVATION_TP1_FRAC
+    """雷达启动价：多 = entry + ratio×1.35ATR；空对称。"""
+    r = frac
+    if r is None or is_legacy_activation_frac(r):
+        r = RADAR_ACT_RATIO_LO
+    return radar_activation_price_adx(
+        side, entry, initial_atr, ratio=float(r), tp1_atr_mult=tp1_atr_mult,
     )
-    if entry_f <= 0 or dist <= 0 or side_u not in ("LONG", "SHORT"):
-        return 0.0
-    if side_u == "LONG":
-        return round(entry_f + dist, 2)
-    return round(entry_f - dist, 2)
 
 
 def activation_price_from_tp1(
     side: str,
     entry: float,
     tp1: float,
-    frac: float = ACTIVATION_TP1_FRAC,
+    frac: float = None,
     *,
     tv_price: Optional[float] = None,
+    initial_atr: float = 0.0,
+    adx: Optional[float] = None,
 ) -> float:
     """
-    【已废弃路径】旧「成交价 + |TP1−TV|×frac」公式；仅当无 TP2 时回退。
-    现行规格请用 radar_gate_price_from_tps。
+    兼容旧签名：优先走 ADX比例 × 真实TP1距离；无 TP1 时回退 1.35ATR。
     """
     side_u = str(side or "").strip().upper()
     e = float(entry or 0)
     t = float(tp1 or 0)
-    f = float(frac if frac is not None else 0.85)
-    if f <= 0:
-        f = 0.85
+    ref = float(tv_price or 0) or e
+    real_dist = abs(t - ref) if t > 0 and ref > 0 else 0.0
+    atr = float(initial_atr or 0)
+    if atr > 0 or real_dist > 0:
+        return radar_activation_price_adx(
+            side, entry, atr, adx=adx, ratio=frac, tp1_dist=real_dist,
+        )
+    r = normalize_activation_ratio(frac, adx)
     if e <= 0 or t <= 0 or side_u not in ("LONG", "SHORT"):
         return 0.0
-    tv = float(tv_price) if tv_price is not None and float(tv_price) > 0 else e
-    dist = abs(t - tv) * f
+    dist = abs(t - e) * r
     if dist <= 0:
         return 0.0
     if side_u == "LONG":
-        return round(e + dist, 2)
-    return round(e - dist, 2)
+        return round(e + dist, 4)
+    return round(e - dist, 4)
 
 
 def next_activation_frac(
     current_frac: float, attempt_after_bump: int,
     profile: Optional[Dict[str, Any]] = None,
+    *,
+    adx: Optional[float] = None,
 ) -> float:
-    """重入后按 attempt 取模式标记（首次 0 / 重入 1）。"""
-    _ = current_frac
-    return activation_frac_for_attempt(int(attempt_after_bump or 0), profile)
+    """重入后沿用已冻结比例（合法）或按 ADX 重算。"""
+    _ = attempt_after_bump
+    _ = profile
+    return normalize_activation_ratio(current_frac, adx)
 
 
 def reentry_window_sec(symbol: str) -> float:

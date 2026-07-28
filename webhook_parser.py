@@ -705,7 +705,13 @@ def normalize_tv_payload(data):
     tv_tp1 = _to_float(src.get("tv_tp1") or src.get("tp1") or src.get("TP1"))
     tv_tp2 = _to_float(src.get("tv_tp2") or src.get("tp2") or src.get("TP2"))
     tv_tp3 = _to_float(src.get("tv_tp3") or src.get("tp3") or src.get("TP3"))
-    tv_sl = _to_float(src.get("tv_sl") or src.get("stop") or src.get("sl"))
+    tv_sl = _to_float(
+        src.get("tv_sl")
+        or src.get("stop_loss")
+        or src.get("stopLoss")
+        or src.get("stop")
+        or src.get("sl")
+    )
     entry_type = normalize_entry_type(src.get("entry_type") or src.get("entryType"))
     risk_pct = _to_float(src.get("risk_pct") or src.get("riskPct") or src.get("risk"))
     leverage = _to_float(src.get("leverage") or src.get("lev"))
@@ -914,7 +920,10 @@ def enrich_entry_tp_prices(action, price, atr, regime, payload=None):
 
 def enrich_signal_fields(payload, action, fetch_atr=None, fallback_regime=3, fallback_atr=30.0,
                          fallback_price=0.0):
-    """TV 全量字段优先；仅缺失项本地补全（regime/atr/tp/price）。"""
+    """
+    TV 全量字段优先；仅缺失项本地补全（regime/atr/tp/price）。
+    规格 v1.0 §6：禁止 VPS 独立拉取 ATR；fetch_atr 参数保留但不再调用。
+    """
     out = dict(payload or {})
     action = str(action or "").strip().upper()
 
@@ -936,10 +945,9 @@ def enrich_signal_fields(payload, action, fetch_atr=None, fallback_regime=3, fal
             out["_regime_source"] = "tv"
 
         if not _has_positive_float(out.get("atr")):
-            atr = 0.0
-            if callable(fetch_atr):
-                atr = float(fetch_atr() or 0)
-            out["atr"] = atr or float(fallback_atr or 30.0)
+            # 规格 v1.0 §6：VPS 不独立拉取 ATR，统一用 webhook atr 或本地 fallback
+            # 禁止调用 exchange API 获取 ATR
+            out["atr"] = float(fallback_atr or 30.0)
             out["_atr_source"] = "local"
         else:
             out["_atr_source"] = "tv"

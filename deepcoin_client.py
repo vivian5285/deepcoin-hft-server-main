@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 WS_PUBLIC_SWAP = "wss://stream.deepcoin.com/streamlet/trade/public/swap?platform=api&version=v2"
 WS_PRIVATE = "wss://stream.deepcoin.com/v1/private"
 
-CLIENT_VERSION = "v13.28.0"
+CLIENT_VERSION = "v13.90.2-rate-iron"
 # 公开 instruments 接口失败时的硬编码兜底
 SYMBOL_TICK_FALLBACK = {
     "ETH-USDT-SWAP": "0.01",
@@ -49,6 +49,23 @@ class DeepcoinClient:
         self._ws_running = False
         self._ws_callbacks = {}
         self._instrument_cache = {}
+        self._rest_lock = threading.Lock()
+        self._rest_last_ts = 0.0
+        # 任意两次 REST（含公开）硬间隔，默认 1.5s
+        try:
+            self._rest_min_gap = float(os.getenv("DEEPCOIN_REST_MIN_GAP_SEC", "1.5"))
+        except Exception:
+            self._rest_min_gap = 1.5
+
+    def _pace_rest(self):
+        """进程内硬间隔，防止并发打穿 Deepcoin 限流。"""
+        gap = float(getattr(self, "_rest_min_gap", 1.5) or 1.5)
+        with getattr(self, "_rest_lock", threading.Lock()):
+            now = time.time()
+            wait = max(0.0, gap - (now - float(self._rest_last_ts or 0)))
+            if wait > 0:
+                time.sleep(wait)
+            self._rest_last_ts = time.time()
 
     # ── 签名与请求 ──────────────────────────────────────────────
 
@@ -83,6 +100,16 @@ class DeepcoinClient:
         if not self.api_key or not self.secret_key:
             logger.error("Deepcoin API Key/Secret 未配置，请检查 .env")
             return None
+        # 账号级节流阀（与币安编制一致；限流后强制静默）
+        try:
+            from api_throttle import get_throttle
+            ok, detail = get_throttle("deepcoin").acquire("rest", symbol="")
+            if not ok:
+                logger.warning(f"🧊 [Deepcoin节流阀] 拒绝 REST ({detail})")
+                return None
+        except Exception as e:
+            logger.debug(f"deepcoin throttle skip: {e}")
+        self._pace_rest()
         endpoint = self._normalize_endpoint(endpoint)
         timestamp = self._get_timestamp()
         body_str = json.dumps(params, separators=(',', ':')) if params and method.upper() != "GET" else ""
@@ -104,6 +131,13 @@ class DeepcoinClient:
             if isinstance(data, dict) and str(data.get("code", "")) != "0":
                 msg = str(data.get("msg", ""))
                 logger.error(f"Deepcoin API 错误 {method} {request_path} | code={data.get('code')} msg={msg}")
+                low = msg.lower()
+                if any(k in low for k in ("rate", "too many", "429", "limit", "频繁")):
+                    try:
+                        from api_throttle import get_throttle
+                        get_throttle("deepcoin").enter_silence(reason="deepcoin_rate")
+                    except Exception:
+                        pass
                 # 签名/时间戳类错误自动重试一次
                 if _retry == 0 and any(k in msg.lower() for k in ("timestamp", "sign", "time", "expired")):
                     time.sleep(0.3)
@@ -114,11 +148,33 @@ class DeepcoinClient:
             return None
 
     def _public_request(self, endpoint: str, params: dict = None):
+        try:
+            from api_throttle import get_throttle
+            ok, detail = get_throttle("deepcoin").acquire("rest_public", symbol="")
+            if not ok:
+                logger.warning(f"🧊 [Deepcoin节流阀] 拒绝公开 REST ({detail})")
+                return None
+        except Exception as e:
+            logger.debug(f"deepcoin public throttle skip: {e}")
+        self._pace_rest()
         endpoint = self._normalize_endpoint(endpoint)
         qs = f"?{'&'.join(f'{k}={v}' for k, v in params.items())}" if params else ""
         try:
             resp = requests.get(f"{self.base_url}{endpoint}{qs}", timeout=10)
-            return resp.json()
+            data = resp.json()
+            if resp.status_code == 429 or (
+                isinstance(data, dict)
+                and any(
+                    k in str(data.get("msg", "")).lower()
+                    for k in ("rate", "too many", "limit", "频繁")
+                )
+            ):
+                try:
+                    from api_throttle import get_throttle
+                    get_throttle("deepcoin").enter_silence(reason="deepcoin_public_rate")
+                except Exception:
+                    pass
+            return data
         except Exception as e:
             logger.error(f"Deepcoin 公开接口失败 {endpoint}: {e}")
             return None
@@ -351,6 +407,51 @@ class DeepcoinClient:
         logger.warning(f"[合约规格] 无法拉取 {symbol} instruments，兜底 tickSz={fallback_tick}")
         return {"tickSz": fallback_tick, "instId": symbol}
 
+    def fetch_klines(self, symbol="ETH-USDT-SWAP", interval="5m", limit=100):
+        """
+        获取 K 线数据（用于重入时取最近已收盘极值）。
+        interval: 5m, 3m, 15m 等
+        返回格式兼容 binance: [timestamp, open, high, low, close, volume]
+        """
+        interval_map = {
+            "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
+            "30m": "30m", "1h": "1h", "2h": "2h", "4h": "4h",
+        }
+        dc_interval = interval_map.get(interval, "5m")
+        params = {
+            "instId": symbol,
+            "interval": dc_interval,
+            "limit": str(min(int(limit), 100)),
+        }
+        res = self._public_request("/market/candles", params)
+        if not res or str(res.get("code", "")) != "0":
+            logger.warning(f"[{symbol}] 拉K线失败: {res}")
+            return None
+        data = res.get("data") or []
+        if not isinstance(data, list) or len(data) == 0:
+            return []
+        out = []
+        for row in reversed(data):
+            try:
+                if not isinstance(row, (list, tuple)) or len(row) < 6:
+                    continue
+                ts_str = str(row[0])
+                try:
+                    open_time_ms = int(float(ts_str))
+                except (ValueError, TypeError):
+                    open_time_ms = 0
+                out.append([
+                    open_time_ms,
+                    float(row[1]),
+                    float(row[2]),
+                    float(row[3]),
+                    float(row[4]),
+                    float(row[5]),
+                ])
+            except (ValueError, TypeError, IndexError):
+                continue
+        return out
+
     def get_tick_size(self, symbol="ETH-USDT-SWAP") -> str:
         info = self.get_instrument_info(symbol)
         tick = str(info.get("tickSz", "") or "").strip()
@@ -500,7 +601,7 @@ class DeepcoinClient:
             params["reduceOnly"] = True
         return self.place_order(params)
 
-    def place_limit_order(self, symbol, side, pos_side, px, qty, reduce_only=False, td_mode="cross", mrg_position="merge"):
+    def place_limit_order(self, symbol, side, pos_side, px, qty, reduce_only=False, td_mode="cross", mrg_position="merge", cl_ord_id=None):
         px_variants = self._price_submit_variants(px, symbol)
         last_res = None
         for px_str in px_variants:
@@ -510,6 +611,8 @@ class DeepcoinClient:
             }
             if reduce_only:
                 params["reduceOnly"] = True
+            if cl_ord_id:
+                params["clOrdId"] = str(cl_ord_id)
             logger.info(f"[限价单提交] {side} {pos_side} {qty}张 px={px_str} (原始={px})")
             for attempt in range(2):
                 res = self.place_order(params)
