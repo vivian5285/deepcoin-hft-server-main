@@ -48,6 +48,7 @@ from webhook_parser import (
     resolve_tv_add_qty_ratio,
     LEG_TP_RATIOS,
     format_regime_tp_ratios_label,
+    get_regime_tp_ratios,
     EXCHANGE_LEVERAGE,
     validate_tp_prices_for_side,
     normalize_entry_type,
