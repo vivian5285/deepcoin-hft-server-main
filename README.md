@@ -29,7 +29,7 @@
 - **通知**：雷达激活文案区分「TP1-TP2中点 / TP2绝对价」  
 
 > **v13.81.0**：删 TP3 限价 + ATR 只信 TV（对齐币安 v16.4.0）。  
-> **v13.80.0**：雷达绝对价门 + `reentry_profiles.radar_gate_price_from_tps`；钉钉文案对齐币安。  
+> **v13.80.0**：雷达绝对价门 + `reentry_profiles.radar_gate_price_from_tps`（首次=(TP1+TP2)/2 · 重入=TP2）；钉钉文案对齐币安。  
 > 旧 Regime activation 92%/95% 仅作无 TP12 时的兜底，不再是主路径。
 
 ### 动态加仓档位（与币安同号）
