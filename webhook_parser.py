@@ -147,18 +147,29 @@ def close_type_display_label(close_type, fallback_reason=""):
     return label
 
 
-# Pine v6.9.93 四档 TP123 减仓比例 qty_percent（与 gemini止损_动态加仓 一致）
+# Pine v6.9.93 分腿比例（规格 v1.0 §6）：仓位概念仍 10%/20%/70%
+LEG_TP_RATIOS = [0.10, 0.20, 0.70]
 TV_REGIME_TP_RATIOS = {
-    1: [0.25, 0.35, 0.40],  # 25/35/40
-    2: [0.20, 0.35, 0.45],  # 20/35/45
-    3: [0.18, 0.32, 0.50],  # 18/32/50
-    4: [0.05, 0.20, 0.75],  # 5/20/75
+    1: list(LEG_TP_RATIOS),
+    2: list(LEG_TP_RATIOS),
+    3: list(LEG_TP_RATIOS),
+    4: list(LEG_TP_RATIOS),
 }
 
 
-def get_regime_tp_ratios(regime):
-    """返回某档位 TP123 比例列表 [tp1, tp2, tp3]"""
-    return list(TV_REGIME_TP_RATIOS.get(int(regime or 3), TV_REGIME_TP_RATIOS[3]))
+def get_regime_tp_ratios(regime=None):
+    """规格 v1.0 §6：固定 10/20/70（不再按档位）。"""
+    return list(LEG_TP_RATIOS)
+
+
+def format_regime_tp_ratios_label(regime=None):
+    """规格 v1.0 §6：固定 10/20/70。"""
+    return "10/20/70"
+
+
+def get_leg_tp_ratios(payload=None):
+    """默认 10/20/70。有 TV qty1/qty2 时按 qty 缩放挂单，不走本比例。"""
+    return list(LEG_TP_RATIOS)
 
 
 def format_regime_tp_ratios_label(regime):

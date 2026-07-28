@@ -12,6 +12,7 @@ from logging.handlers import RotatingFileHandler
 from deepcoin_client import deepcoin_client, CLIENT_VERSION
 from pipeline_bridge import PipelineBridgeMixin
 from pipeline_ledger import Role
+from radar_reentry_mixin import RadarReentryMixin
 import dingtalk
 from tv_seq import (
     reorder_batch_close_then_open,
@@ -27,6 +28,11 @@ from breath_stop import (
     get_breathing_coefficient,
     STOP_EXEC_BUFFER_USD,
 )
+from atr_scenario import (
+    hard_stop_price,
+    compute_hard_stop_distance,
+    TEMP_STOP_BUFFER_MULT,
+)
 from webhook_parser import (
     enrich_signal_fields,
     enrich_entry_tp_prices,
@@ -40,7 +46,7 @@ from webhook_parser import (
     VPS_RISK_PCT,
     get_regime_max_add_times,
     resolve_tv_add_qty_ratio,
-    get_regime_tp_ratios,
+    LEG_TP_RATIOS,
     format_regime_tp_ratios_label,
     EXCHANGE_LEVERAGE,
     validate_tp_prices_for_side,
@@ -53,10 +59,11 @@ from webhook_parser import (
     CLOSE_TYPE_VPS_SHIELD,
     check_total_notional_cap,
     MAX_TOTAL_NOTIONAL_MULT,
-    compute_vps_hard_sl,
-    compute_vps_hard_sl_distance,
-    get_vps_hard_sl_params,
-    format_tv_vps_sl_compare,
+)
+from order_idempotency import (
+    blank_ownership_state,
+    make_defense_client_order_id,
+    MAX_OPEN_ORDERS_HARD_CAP,
 )
 
 if not os.path.exists('logs'):
@@ -130,7 +137,7 @@ TV_JOURNAL = "logs/deepcoin_tv_journal.jsonl"
 OPEN_JOURNAL = "logs/deepcoin_open_journal.jsonl"
 
 
-class PositionSupervisor(PipelineBridgeMixin):
+class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
     def __init__(self, symbol="ETH-USDT-SWAP"):
         from symbol_config import resolve_deepcoin_symbol
         from breath_profiles import get_breath_profile
@@ -214,6 +221,16 @@ class PositionSupervisor(PipelineBridgeMixin):
         self.shield_active = False
         self.shield_tiers_consumed = []
         self.tp_levels_consumed = []
+        # 规格 v1.0 §5.0：提前保本检查点
+        self._early_be_checkpoint_done = False
+        # 规格 v1.0 §3：永久硬止损冻结价
+        self.frozen_hard_sl_px = 0.0
+        # 规格 v1.0 §8-9：防御单幂等标签 + 退出所有权
+        _own = blank_ownership_state()
+        self.exit_ownership = str(_own["exit_ownership"])
+        self.ownership_locked_at = float(_own["ownership_locked_at"] or 0)
+        self._pending_order_tags = dict(_own["pending_order_tags"] or {})
+        self._mutex_leg = ""
         self._last_shield_maintain_ts = 0.0
         self._shield_fail_streak = 0
         self._last_shield_fail_ts = 0.0
@@ -280,8 +297,7 @@ class PositionSupervisor(PipelineBridgeMixin):
         self._start_idle_flat_patrol()
 
     def _init_reentry_runtime(self):
-        """初始化重入运行时（保留接口）"""
-        pass
+        RadarReentryMixin._init_reentry_runtime(self)
 
     def _start_idle_flat_patrol(self):
         """空仓待命时激进实盘巡检：反向强平 / 同向接管 / 人工异动 / 漏报全平 / 蚂蚁扫尾"""
@@ -1640,6 +1656,15 @@ class PositionSupervisor(PipelineBridgeMixin):
                     "open_settled_qty": int(
                         getattr(self, "_open_settled_qty", 0) or 0
                     ),
+                    # 规格 v1.0 §3：永久硬止损冻结价
+                    "frozen_hard_sl_px": float(getattr(self, "frozen_hard_sl_px", 0) or 0),
+                    # 规格 v1.0 §5.0：提前保本检查点
+                    "_early_be_checkpoint_done": bool(getattr(self, "_early_be_checkpoint_done", False)),
+                    # 规格 v1.0 §8-9：防御单幂等标签 + 退出所有权
+                    "exit_ownership": str(getattr(self, "exit_ownership", "NONE") or "NONE"),
+                    "ownership_locked_at": float(getattr(self, "ownership_locked_at", 0) or 0),
+                    "pending_order_tags": dict(getattr(self, "_pending_order_tags", {}) or {}),
+                    "mutex_leg": str(getattr(self, "_mutex_leg", "") or ""),
                     "pipeline": self._pipeline_state_blob(),
                     # 自动重入字段（v1.0 规格对齐）
                     "reentry_state": self._reentry_state_dict(),
@@ -2317,21 +2342,8 @@ class PositionSupervisor(PipelineBridgeMixin):
         return True
 
     def _reentry_state_dict(self) -> dict:
-        """获取重入状态字典（用于持久化）"""
-        from smart_reentry_engine import blank_reentry_state
-        base = blank_reentry_state()
-        return {
-            "reentry_attempt": int(getattr(self, "reentry_attempt", 0) or 0),
-            "radar_tier": int(getattr(self, "radar_tier", 0) or 0),
-            "adx_tier": int(getattr(self, "adx_tier", 1) or 1),
-            "reentry_active": bool(getattr(self, "reentry_active", False)),
-            "reentry_limit_order_id": getattr(self, "reentry_limit_order_id", None),
-            "reentry_limit_px": float(getattr(self, "reentry_limit_px", 0) or 0),
-            "reentry_limit_deadline_ts": float(getattr(self, "reentry_limit_deadline_ts", 0) or 0),
-            "reentry_window_deadline_ts": float(getattr(self, "reentry_window_deadline_ts", 0) or 0),
-            "reentry_order_tag": getattr(self, "reentry_order_tag", None),
-            "radar_pending_arm": bool(getattr(self, "radar_pending_arm", True)),
-        }
+        """§8：从 RadarReentryMixin 继承完整的再入状态字典（含新字段）。"""
+        return RadarReentryMixin._reentry_state_dict(self)
 
     def _reentry_tick(self):
         """重入订单 Tick：检查成交/TTL刷新"""
@@ -2410,6 +2422,14 @@ class PositionSupervisor(PipelineBridgeMixin):
 
         self._save_state()
 
+    def _arm_temp_stop_and_tp12(self, live_qty, entry, side, source=""):
+        """Adapter: 统一雷达 mixin 的签名 → 内部已有 _arm_temp_stop_and_tp12_for_reentry。"""
+        return self._arm_temp_stop_and_tp12_for_reentry(live_qty, entry, side)
+
+    def _resolve_atr_scenario_after_open(self, entry, side, live_qty):
+        """Mixin 兼容：空操作（Deepcoin ATR 已在开仓时锁定）。"""
+        pass
+
     def _arm_temp_stop_and_tp12_for_reentry(self, qty, entry, side):
         """重入成交后挂硬止损 + TP12"""
         from breath_stop import initial_stop_price
@@ -2473,6 +2493,11 @@ class PositionSupervisor(PipelineBridgeMixin):
         self.tp_levels_consumed = []
         self.shield_active = False
         self.current_side = None
+        # 规格 v1.0 §8-9：平仓时清空幂等标签 + 退出所有权
+        self.exit_ownership = "NONE"
+        self.ownership_locked_at = 0.0
+        self._pending_order_tags = {}
+        self._mutex_leg = ""
         self._save_state()
         deepcoin_client.cancel_all_open_orders(self.symbol)
         self._report_flat_close(reason, swept_dust=True)
@@ -3078,7 +3103,10 @@ class PositionSupervisor(PipelineBridgeMixin):
 
     def _refresh_vps_hard_sl(self, entry=None, side=None, regime=None, atr=None,
                              tv_sl_ref=None, source=""):
-        """VPS 自主硬止损：开仓价 × 档位百分比；TV tv_sl 仅参考。"""
+        """
+        规格 v1.0 §3：硬止损 = |TV.price − TV.stop_loss| × 1.15。
+        不再使用开仓价×档位% 旧路径。
+        """
         entry = float(entry or self.watched_entry or self.tv_price or 0)
         side = (side or self.current_side or "").strip().upper()
         regime = int(regime if regime is not None else self.regime or 3)
@@ -3091,48 +3119,97 @@ class PositionSupervisor(PipelineBridgeMixin):
         if entry <= 0 or side not in ("LONG", "SHORT"):
             return False
 
-        vps_sl = compute_vps_hard_sl(side, entry, atr, regime)
-        if vps_sl <= 0:
+        hard = float(self._lock_frozen_hard_sl_from_tv(entry=entry, side=side, source=source))
+        if hard <= 0:
             return False
 
-        old = round(float(getattr(self, "tv_sl", 0) or 0), 2)
-        self.tv_sl = vps_sl
-        if abs(vps_sl - old) > SHIELD_STOP_TOLERANCE:
-            self._last_applied_tv_sl = 0.0
         self._save_state()
-
-        params = get_vps_hard_sl_params(regime)
-        dist = compute_vps_hard_sl_distance(entry, regime)
-        ref_txt = (
-            f" | {format_tv_vps_sl_compare(side, entry, atr, regime, tv_sl_ref=self.tv_sl_ref)}"
-            if getattr(self, "tv_sl_ref", 0) > 0 else ""
-        )
         logger.info(
-            f"🛡️ VPS硬止损 R{regime} 开仓×{params['pct_label']} | "
-            f"呼吸 {dist:.2f}U → {vps_sl:.2f}"
-            + (f" ({source})" if source else "")
-            + ref_txt
-            + (f" | 原 {old:.2f}" if old > 0 and abs(vps_sl - old) > SHIELD_STOP_TOLERANCE else "")
+            f"[{self.symbol}] VPS硬止损刷新@{hard:.2f} (source={source})"
         )
         return True
 
+    def _defense_buffer_mult(self):
+        """硬止损呼吸垫：统一 1.15（规格 3.4），与 adx_tier 无关。"""
+        return float(TEMP_STOP_BUFFER_MULT)
+
+    def _temp_hard_stop_from_tv(self, entry=None, side=None, tv_sl=None):
+        """
+        永久硬止损价（规格 v1.0 §3）：
+          dist = |TV价 − TV.SL| × 1.15（统一呼吸垫，不分档）
+          挂在成交价外侧。禁止 1.5×ATR / 滑点×2 旧路径。
+        """
+        fill = float(entry if entry is not None else (self.watched_entry or self.tv_price or 0))
+        side = str(side or self.current_side or "").strip().upper()
+        tv_sl = float(tv_sl if tv_sl is not None else (getattr(self, "tv_sl_ref", 0) or 0))
+        tv_entry = float(getattr(self, "tv_price", 0) or 0)
+        if tv_entry <= 0:
+            tv_entry = fill
+        buf = float(self._defense_buffer_mult())
+        return hard_stop_price(
+            side,
+            fill,
+            tv_sl,
+            buffer_mult=buf,
+            tv_entry=tv_entry,
+            fill_entry=fill,
+        )
+
+    def _lock_frozen_hard_sl_from_tv(self, entry=None, side=None, source=""):
+        """
+        规格 v1.0 §3.3：用 |TV.price−TV.stop_loss|×1.15 锁定 frozen_hard_sl_px。
+        已锁定则不覆盖。禁止用 0.5×ATR 雷达激活臂冒充永久硬止损。
+        """
+        cur = float(self._frozen_hard_px() or 0)
+        if cur > 0:
+            return cur
+        hard = float(self._temp_hard_stop_from_tv(entry=entry, side=side) or 0)
+        if hard <= 0:
+            logger.error(
+                f"[{self.symbol}] 无法锁定永久硬止损（缺 TV.stop_loss）| {source}"
+            )
+            return 0.0
+        self.frozen_hard_sl_px = float(hard)
+        try:
+            self._save_state()
+        except Exception:
+            pass
+        logger.info(
+            f"[{self.symbol}] 锁定永久硬止损@{hard:.2f} "
+            f"(TV.sl_ref={float(getattr(self, 'tv_sl_ref', 0) or 0):.2f} "
+            f"buffer={float(self._defense_buffer_mult()):.2f}) | {source}"
+        )
+        return float(hard)
+
+    def _frozen_hard_px(self):
+        return round(float(getattr(self, "frozen_hard_sl_px", 0) or 0), 2)
+
+    def _hard_stop_distance_meta(self, fill=None, tv_sl=None, tv_entry=None, atr=None):
+        """调试/钉钉：硬止损距离拆解。"""
+        fill = float(fill if fill is not None else (self.watched_entry or 0))
+        tv_entry = float(tv_entry if tv_entry is not None else (getattr(self, "tv_price", 0) or fill))
+        tv_sl = float(tv_sl if tv_sl is not None else (getattr(self, "tv_sl_ref", 0) or 0))
+        buf = float(self._defense_buffer_mult())
+        return compute_hard_stop_distance(tv_entry, tv_sl, fill, 0.0, tv_mult=buf)
+
     def _apply_tv_sl_from_payload(self, payload, source=""):
-        """TV tv_sl 仅参考；挂单价由 VPS 按 开仓价×档位% 重算"""
+        """
+        规格 v1.0 §3：TV.stop_loss 决定永久硬止损。
+        距离 = |TV.price − TV.stop_loss| × 1.15。
+        禁止再用开仓价×档位%的旧 VPS 自主路径。
+        """
         tv_ref = payload.get("tv_sl")
         if tv_ref is None or tv_ref == "":
-            return self._refresh_vps_hard_sl(source=source or "信号")
+            return self._lock_frozen_hard_sl_from_tv(source=source or "信号")
         ref_px = round(self._safe_float(tv_ref, 0), 2)
         if ref_px <= 0:
-            return False
+            return self._lock_frozen_hard_sl_from_tv(source=source or "TV空值")
         entry = float(self.tv_price or self.watched_entry or 0)
         side = str(payload.get("action") or payload.get("side") or self.current_side or "").upper()
         if side not in ("LONG", "SHORT"):
             side = self.current_side
-        return self._refresh_vps_hard_sl(
-            entry=entry, side=side,
-            regime=self.regime, atr=self.current_atr,
-            tv_sl_ref=ref_px, source=source or "TV参考",
-        )
+        self.tv_sl_ref = ref_px
+        return self._lock_frozen_hard_sl_from_tv(entry=entry, side=side, source=source or "TV参考")
 
     def _locked_initial_atr(self):
         """开仓 ATR 锁定：优先 webhook open_atr，全程固定。"""
@@ -3187,8 +3264,13 @@ class PositionSupervisor(PipelineBridgeMixin):
         if entry <= 0 or side not in ("LONG", "SHORT"):
             return None
         atr = self._locked_initial_atr()
-        init = float(getattr(self, "initial_stop", 0) or 0)
         profile = getattr(self, "breath_profile", None)
+        # §5.2/§5.3：档位分级呼吸参数叠加
+        try:
+            self._apply_tier_breath_overlay()
+        except Exception:
+            pass
+        init = float(getattr(self, "initial_stop", 0) or 0)
         if init <= 0 and atr > 0:
             init = initial_stop_price(side, entry, atr, profile=profile)
             self.initial_stop = init
@@ -3349,7 +3431,11 @@ class PositionSupervisor(PipelineBridgeMixin):
             )
 
     def _place_tp_levels_only(self, live_qty, retries=2):
-        """只挂未成交 TP 限价档，绝不触碰止损/雷达"""
+        """
+        规格 v1.0 §8-9：防御 TP 限价必须带 newClientOrderId（幂等标签）。
+        本地已有同档未完成标签 → 拒挂（宁可错过）。
+        仅挂 TP1+TP2；TP3 永不挂限价。
+        """
         close_side = "sell" if self.current_side == "LONG" else "buy"
         pos_side = "long" if self.current_side == "LONG" else "short"
         live_qty = self._resolve_live_qty(live_qty)
@@ -3357,25 +3443,49 @@ class PositionSupervisor(PipelineBridgeMixin):
             return 0
         placed = 0
         for lv in self._expected_tp_levels(live_qty):
-            if int(lv.get("level") or 0) >= 3:
+            level = int(lv.get("level") or 0)
+            if level >= 3:
                 continue  # TP3 永不挂限价
+            kind = f"TP{level}"
             q, px = float(lv["qty"] or 0), float(lv["price"] or 0)
             if q <= 0 or px <= 0:
                 continue
-            ok = False
+            # 幂等标签拦截
+            blocked, tag0, _ = self._has_open_pending_defense_tag(kind)
+            if blocked:
+                logger.warning(
+                    f"[{self.symbol}] 本地未完成标签 tag={tag0} kind={kind} "
+                    f"→ 拒挂 TP{level}（幂等拦截）"
+                )
+                continue
+            tag = make_defense_client_order_id(self.symbol, kind, px)
+            self._register_pending_defense_tag(tag, kind, price=px)
+            try:
+                self._save_state()
+            except Exception:
+                pass
+            last = None
             for attempt in range(max(1, retries + 1)):
                 res = deepcoin_client.place_limit_order(
-                    self.symbol, close_side, pos_side, px, q, reduce_only=True,
+                    self.symbol, close_side, pos_side, px, q,
+                    reduce_only=True, cl_ord_id=tag,
                 )
                 if res and deepcoin_client._is_success(res):
-                    ok = True
+                    last = res
                     break
                 time.sleep(0.2)
-            if ok:
-                placed += 1
-                logger.info(f"📈 UPDATE_TP 挂 TP{lv['level']} {q} @ {px:.2f}")
-            else:
-                logger.error(f"❌ UPDATE_TP 挂 TP{lv['level']} @ {px:.2f} 失败")
+            if not last:
+                self._complete_pending_defense_tag(tag=tag)
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
+                logger.error(f"[{self.symbol}] UPDATE_TP 挂 TP{level} @ {px:.2f} 失败（已释放标签）")
+                continue
+            oid = str(last.get("orderId") or last.get("algoId") or "")
+            self._register_pending_defense_tag(tag, kind, price=px, order_id=oid)
+            placed += 1
+            logger.info(f"📈 UPDATE_TP 挂 TP{level} {q} @ {px:.2f} tag={tag}")
             time.sleep(0.25)
         return placed
 
@@ -4404,6 +4514,163 @@ class PositionSupervisor(PipelineBridgeMixin):
             return self.current_sl < self.watched_entry
         return False
 
+    def _radar_is_dormant(self):
+        """雷达休眠：未激活且未武装。"""
+        return not self._is_radar_active() and not getattr(self, "radar_activated", False)
+
+    def _check_early_be_checkpoint(self, curr_px):
+        """
+        【规格 v1.0 · §5.0 提前保本检查点】
+        当价格到达 entry + tp1_distance × 0.5 时，将止损从当前值移动到保本位。
+        仅触发一次，触发后标记_done=True，不再重复。
+        不启动雷达，不影响雷达的激活状态判断。
+        """
+        if bool(getattr(self, "_early_be_checkpoint_done", False)):
+            return None
+        if bool(getattr(self, "radar_activated", False)):
+            return None
+        entry = float(self.watched_entry or 0)
+        side = str(self.current_side or "").strip().upper()
+        curr_px_f = float(curr_px or 0)
+        if entry <= 0 or side not in ("LONG", "SHORT") or curr_px_f <= 0:
+            return None
+        tps = list(getattr(self, "tv_tps", None) or [])
+        ref = float(getattr(self, "tv_price", 0) or entry)
+        tp1_px = float(tps[0] or 0) if len(tps) > 0 else 0.0
+        if tp1_px <= 0:
+            return None
+        tp1_dist = abs(tp1_px - ref)
+        if tp1_dist <= 0:
+            return None
+        trigger_px = entry + tp1_dist * 0.5
+        if side == "LONG" and curr_px_f < trigger_px:
+            return None
+        if side == "SHORT" and curr_px_f > trigger_px:
+            return None
+        current_sl = float(self.current_sl or 0)
+        tick = 0.01
+        fee_pct = 0.0008
+        fee = entry * fee_pct
+        if side == "LONG":
+            new_sl = max(entry + tick + fee, current_sl)
+        else:
+            new_sl = min(entry - tick - fee, current_sl)
+        if new_sl == current_sl:
+            self._early_be_checkpoint_done = True
+            return None
+        old_sl = current_sl
+        self.current_sl = new_sl
+        self._early_be_checkpoint_done = True
+        self._save_state()
+        logger.info(
+            f"[{self.symbol}] 规格 v1.0 §5.0 提前保本检查点触发 "
+            f"({side}) | entry={entry:.4f} trigger={trigger_px:.4f} "
+            f"old_sl={old_sl:.4f} → new_sl={new_sl:.4f}"
+        )
+
+    # ── 规格 v1.0 §8-9：防御单幂等标签 ────────────────────────────────────────
+
+    def _clear_pending_tags_for_kind(self, kind_prefix, save=False):
+        """释放某类防御单本地标签（TP1/TP2/HARD/RADAR）。"""
+        pref = str(kind_prefix or "").upper()
+        tags = dict(getattr(self, "_pending_order_tags", {}) or {})
+        changed = False
+        for tag, meta in list(tags.items()):
+            k = str((meta or {}).get("kind") or "").upper()
+            if pref and (k == pref or k.startswith(pref)):
+                tags.pop(tag, None)
+                changed = True
+        if changed:
+            self._pending_order_tags = tags
+            if save:
+                self._save_state()
+
+    def _gc_stale_pending_defense_tags(self, max_pending_age_sec=45.0, save=True):
+        """清理陈旧防御单本地标签（超时/已完成）。"""
+        tags = dict(getattr(self, "_pending_order_tags", {}) or {})
+        if not tags:
+            return 0
+        now = time.time()
+        dropped = []
+        for tag, meta in list(tags.items()):
+            meta = meta or {}
+            st = str(meta.get("status") or "open").lower()
+            oid = str(meta.get("order_id") or "").strip()
+            ts = float(meta.get("ts") or 0)
+            age = (now - ts) if ts > 0 else 9999.0
+            if st in ("done", "filled", "cancelled", "canceled"):
+                tags.pop(tag, None)
+                dropped.append(f"{tag}:done")
+                continue
+            if oid:
+                tags.pop(tag, None)
+                dropped.append(f"{tag}:acked")
+                continue
+            if st == "pending" and age >= float(max_pending_age_sec or 45.0):
+                tags.pop(tag, None)
+                dropped.append(f"{tag}:stale:{age:.0f}s")
+                continue
+        if not dropped:
+            return 0
+        self._pending_order_tags = tags
+        logger.warning(
+            f"[{self.symbol}] 清理陈旧防御标签 {len(dropped)} 个: "
+            f"{dropped[:6]}{'…' if len(dropped) > 6 else ''}"
+        )
+        if save:
+            try:
+                self._save_state()
+            except Exception:
+                pass
+        return len(dropped)
+
+    def _has_open_pending_defense_tag(self, kind=None):
+        """本地已有同档未完成标签 → 拒挂（宁可错过）。"""
+        self._gc_stale_pending_defense_tags(save=False)
+        want = str(kind or "").upper()
+        for tag, meta in dict(getattr(self, "_pending_order_tags", {}) or {}).items():
+            st = str((meta or {}).get("status") or "open").lower()
+            if st in ("done", "filled", "cancelled", "canceled", "acked"):
+                continue
+            k = str((meta or {}).get("kind") or "").upper()
+            if want and k != want and not k.startswith(want):
+                continue
+            oid = str((meta or {}).get("order_id") or "").strip()
+            if oid:
+                continue
+            if st == "pending":
+                return True, tag, meta
+        return False, "", {}
+
+    def _register_pending_defense_tag(self, tag, kind, price=0.0, order_id=""):
+        tags = dict(getattr(self, "_pending_order_tags", {}) or {})
+        oid = str(order_id or "")
+        tags[str(tag)] = {
+            "kind": str(kind or "").upper(),
+            "ts": time.time(),
+            "price": float(price or 0),
+            "order_id": oid,
+            "status": "acked" if oid else "pending",
+        }
+        self._pending_order_tags = tags
+
+    def _complete_pending_defense_tag(self, tag=None, kind=None, order_id=None):
+        tags = dict(getattr(self, "_pending_order_tags", {}) or {})
+        changed = False
+        for t, meta in list(tags.items()):
+            if tag and str(t) != str(tag):
+                continue
+            if kind and str((meta or {}).get("kind") or "").upper() != str(kind).upper():
+                if not (tag or order_id):
+                    continue
+            if order_id and str((meta or {}).get("order_id") or "") != str(order_id):
+                if not tag:
+                    continue
+            tags.pop(t, None)
+            changed = True
+        if changed:
+            self._pending_order_tags = tags
+
     def _radar_sl_to_pass(self):
         if not self._tp1_filled_verified():
             return None
@@ -4469,7 +4736,7 @@ class PositionSupervisor(PipelineBridgeMixin):
         logger.error("❌ 重启撤单未净：重复 TP 可能残留，非权限问题时请 APP 手动全撤后重启")
         return False
 
-    def _ensure_radar_sl(self, live_qty, sl_price):
+    def _ensure_radar_sl(self, sl_price, live_qty, for_handoff=False):
         if not sl_price:
             return False
         clamped = self._clamp_radar_to_tv_floor(sl_price)
@@ -6358,6 +6625,171 @@ class PositionSupervisor(PipelineBridgeMixin):
             threading.Thread(
                 target=self._sentinel_loop, daemon=True, name="sentinel",
             ).start()
+        # §6.2：启动私有 WS（部分成交动态同步）
+        if not getattr(self, "_deepcoin_private_ws_started", False):
+            self._start_deepcoin_private_ws()
+
+    def _start_deepcoin_private_ws(self):
+        """§6.2：订阅 Deepcoin 私有 WebSocket → 实时成交回报 → 触发数量重同步。"""
+        self._deepcoin_private_ws_started = True
+        self._ws_hard_sl_fill_hint = None
+        self._ws_tp1_fill_hint = False
+        self._ws_tp_fill_levels = set()
+        try:
+            deepcoin_client.start_private_ws(on_message=self._on_deepcoin_ws_message)
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] 私有WS启动失败（稍后重试）: {e}")
+            self._deepcoin_private_ws_started = False
+
+    def _on_deepcoin_ws_message(self, data):
+        """§6.2：Deepcoin 私有 WS 事件 → TP 成交提示 + 部分成交数量重同步。"""
+        if not isinstance(data, dict):
+            return
+        table = str(data.get("table") or "").lower()
+        if table not in ("order", "position", "trade", "triggerorder"):
+            return
+        # 脉冲哨兵
+        self._ws_defense_pulse = True
+        self._ws_fast_poll = True
+
+        if table == "trade":
+            self._handle_deepcoin_trade_event(data)
+        elif table == "order":
+            self._handle_deepcoin_order_event(data)
+
+    def _handle_deepcoin_trade_event(self, data):
+        """Trade 成交事件：记录 TP1 成交提示（用于雷达提前武装）。"""
+        rows = data.get("data") or []
+        if not isinstance(rows, list):
+            rows = [rows]
+        for row in rows:
+            sym = str(row.get("instrument_id") or row.get("symbol") or "").upper()
+            if sym and sym != self.symbol.upper():
+                continue
+            side = str(row.get("side") or "").upper()
+            if side not in ("BUY", "SELL"):
+                continue
+            px_str = str(row.get("price") or "0")
+            try:
+                px = float(px_str)
+            except (ValueError, TypeError):
+                px = 0.0
+            # 非反向成交 → TP 方向
+            if px <= 0:
+                continue
+            # 尝试匹配 TP 档位
+            tps = list(getattr(self, "tv_tps", None) or [])
+            for lv in (1, 2):
+                tp_px = float(tps[lv - 1] or 0) if lv <= len(tps) else 0.0
+                if tp_px <= 0:
+                    continue
+                tol = max(1.5, tp_px * 0.0012)
+                if abs(px - tp_px) <= tol:
+                    if lv == 1:
+                        self._ws_tp1_fill_hint = True
+                    levels = getattr(self, "_ws_tp_fill_levels", None)
+                    if not isinstance(levels, set):
+                        levels = set()
+                    levels.add(lv)
+                    self._ws_tp_fill_levels = levels
+
+    def _handle_deepcoin_order_event(self, data):
+        """Order 事件：FILLED/PARTIALLY_FILLED → 触发部分成交重同步。"""
+        rows = data.get("data") or []
+        if not isinstance(rows, list):
+            rows = [rows]
+        for row in rows:
+            sym = str(row.get("instrument_id") or row.get("symbol") or "").upper()
+            if sym and sym != self.symbol.upper():
+                continue
+            status = str(row.get("status") or "").upper()
+            if status in ("FILLED", "PARTIALLY_FILLED"):
+                self._schedule_partial_fill_resize(source=f"dc_ws_{status.lower()}")
+            elif status in ("CANCELED", "CANCELLED"):
+                self._handle_unilateral_order_cancel(row)
+
+    def _handle_unilateral_order_cancel(self, order):
+        """§12.3：非本地发起的取消 → 异常取消告警 + 强制对账。"""
+        try:
+            sym = str(order.get("instrument_id") or order.get("symbol") or "").upper()
+            if sym and sym != self.symbol.upper():
+                return
+            oid = order.get("orderId") or order.get("algoId") or ""
+            status = str(order.get("status") or "").upper()
+            logger.warning(
+                f"🚨 [{self.symbol}] 外部撤单 event: id={oid} status={status} | "
+                f"触发强制对账"
+            )
+            self._ws_defense_pulse = True
+            self._ws_fast_poll = True
+        except Exception as e:
+            logger.debug(f"外部撤单解析跳过: {e}")
+
+    def _purge_all_defense_orders_on_flat(self, reason="", max_rounds=6):
+        """§6.2：空仓时撤掉所有防御单（TP + 雷达 STOP）。"""
+        cancelled = 0
+        for rnd in range(max_rounds):
+            deepcoin_client.cancel_all_open_orders(self.symbol)
+            remaining = self._collect_tp_limit_orders()
+            if not remaining:
+                break
+            for _o in remaining:
+                try:
+                    oid = _o.get("orderId")
+                    if oid:
+                        deepcoin_client.cancel_order(self.symbol, order_id=oid)
+                        cancelled += 1
+                except Exception:
+                    pass
+                time.sleep(0.2)
+            if not self._collect_tp_limit_orders():
+                break
+            time.sleep(0.3)
+        if cancelled:
+            logger.info(f"🧹 [{self.symbol}] 空仓撤防：{cancelled} 张 | {reason}")
+        return cancelled
+
+    def _schedule_partial_fill_resize(self, source=""):
+        """§6.2：TP/减仓成交后按实时头寸同步硬/雷达数量（防超卖变反向）。"""
+        if getattr(self, "api_monitor_only", False) or getattr(self, "trading_paused", False):
+            return
+        if not getattr(self, "monitoring", False):
+            return
+        now = time.time()
+        last = float(getattr(self, "_last_partial_resize_ts", 0) or 0)
+        if now - last < 0.75:
+            setattr(self, "_partial_resize_pending", True)
+            return
+        self._last_partial_resize_ts = now
+        self._partial_resize_pending = False
+        try:
+            pos = self._get_active_position(prefer_ws=True)
+            if pos == "QUERY_FAILED":
+                self._partial_resize_pending = True
+                logger.warning(
+                    f"⏳ [{self.symbol}] 部分成交核算跳过·持仓不可读 | {source}"
+                )
+                return
+            live = float((pos or {}).get("size") or 0)
+            if live <= 0:
+                logger.info(
+                    f"🧹 [{self.symbol}] WS成交后已空仓 → 清挂单 | {source}"
+                )
+                self._purge_all_defense_orders_on_flat(f"WS成交空仓|{source}")
+                return
+            if self._is_dust_qty(live):
+                logger.warning(
+                    f"🐜 [{self.symbol}] 部分成交后零头={live} → 市价扫尾 | {source}"
+                )
+                self._sweep_dust_and_finalize(f"partial_fill_dust|{source}")
+                return
+            self.watched_qty = live
+            ep = float((pos or {}).get("entry_price") or 0)
+            if ep > 0:
+                self.watched_entry = ep
+            self._save_state()
+        except Exception as e:
+            logger.error(f"[{self.symbol}] partial_fill_resize: {e}")
 
     def _full_reentry(self, action, close_reason):
         """铁律：先平现有仓 → 净挂单 → 再开仓刷新；钉钉核实。"""
@@ -6825,6 +7257,7 @@ class PositionSupervisor(PipelineBridgeMixin):
             self.open_atr = payload_atr
             self.current_atr = payload_atr
             self.early_be_done = False
+            self._early_be_checkpoint_done = False
             self.initial_qty = real_qty
             self.base_qty = int(real_qty)
             self.add_count = 0
@@ -6845,13 +7278,11 @@ class PositionSupervisor(PipelineBridgeMixin):
             self._open_in_progress = False
 
     def _protect_and_monitor(self, qty, entry_price, budget_note="", target_qty=0, sizing_meta=None):
-        tp_pxs = self.tv_tps
-        self._refresh_vps_hard_sl(
-            entry=entry_price, side=self.current_side, regime=self.regime,
-            atr=self.current_atr, tv_sl_ref=getattr(self, "tv_sl_ref", 0) or None,
-            source="开仓后",
+        """规格 v1.0 §3：永久硬止损 = |TV.price − TV.stop_loss| × 1.15。"""
+        self._lock_frozen_hard_sl_from_tv(
+            entry=entry_price, side=self.current_side, source="开仓后",
         )
-        hard_sl = float(getattr(self, "tv_sl", 0) or 0)
+        hard_sl = float(self._frozen_hard_px() or 0)
         self.current_sl = hard_sl if hard_sl > 0 else 0.0
         self.best_price = entry_price
         self.shield_active = False
@@ -6860,6 +7291,8 @@ class PositionSupervisor(PipelineBridgeMixin):
         self.breathing_coefficient = 1.0
         self._breath_ratio_history = []
         self.breakeven_phase = False
+        self.radar_activated = False
+        self._early_be_checkpoint_done = False
         open_atr = float(getattr(self, "open_atr", None) or self.current_atr or 0)
         if open_atr > 0 and entry_price > 0 and self.current_side:
             self.initial_stop = initial_stop_price(self.current_side, entry_price, open_atr, profile=getattr(self, "breath_profile", None))
@@ -6874,31 +7307,16 @@ class PositionSupervisor(PipelineBridgeMixin):
             self._radar_stage_last = 0
         self._radar_activation_notified = False
 
-        # v13.91.0: freeze ADX activation ratio/price on open/dormant begin
+        # 规格 v1.0：冻结雷达激活价格（使用 TP1/TP2 绝对锚点）
         try:
-            from reentry_profiles import (
-                radar_activation_ratio_from_adx,
-                radar_activation_price_adx,
-            )
-            _adx = float(getattr(self, "last_adx", 0) or getattr(self, "radar_activation_adx", 0) or 25.0)
-            _ratio = radar_activation_ratio_from_adx(_adx)
-            self.radar_activation_frac = float(_ratio)
-            self.radar_activation_adx = float(_adx)
-            _entry = float(getattr(self, "watched_entry", 0) or getattr(self, "cycle_entry", 0) or 0)
-            _atr = float(getattr(self, "open_atr", 0) or getattr(self, "cycle_open_atr", 0) or 0)
-            if _atr <= 0:
-                try:
-                    _atr = float(self._get_locked_initial_atr() or 0)
-                except Exception:
-                    _atr = 0.0
-            if _entry > 0 and _atr > 0:
-                _px = radar_activation_price_adx(
-                    getattr(self, "current_side", None), _entry, _atr, adx=_adx, ratio=_ratio,
-                )
-                if _px > 0:
-                    self.radar_activation_price = float(_px)
-        except Exception as _e:
-            logger.debug(f"radar ADX freeze skip: {_e}")
+            from reentry_profiles import radar_gate_price_from_tps
+            tps = list(getattr(self, "tv_tps", None) or [])
+            tp1_px = float(tps[0] or 0) if len(tps) > 0 else 0.0
+            tp2_px = float(tps[1] or 0) if len(tps) > 1 else 0.0
+            if tp1_px > 0 and tp2_px > 0:
+                self.radar_activation_price = radar_gate_price_from_tps(tp1_px, tp2_px)
+        except Exception:
+            pass
 
         self._radar_armed_after_tp1 = False
         self._ws_tp1_fill_hint = False
@@ -7044,52 +7462,34 @@ class PositionSupervisor(PipelineBridgeMixin):
 
     def _radar_activation_price(self):
         """
-        v13.91.0 / 对齐币安 v16.7.0：ADX 70%~90% × 1.35×initial_atr。
-        优先账本冻结价；未激活仓迁移旧中点标记时按 ADX 重算并冻结。
+        【规格 v1.0 · 绝对价格锚定】
+        首次开仓：雷达激活价 = (TP1 + TP2) / 2（TP1/TP2 为 webhook 原始信号价格）
+        重入开仓：雷达激活价 = TP2（价格必须真正到达 TP2 才接管）
+        不再使用 ADX 比例 × TP1 距离的旧公式。
         """
-        from reentry_profiles import (
-            normalize_activation_ratio,
-            radar_activation_price_adx,
-        )
+        from reentry_profiles import radar_gate_price_from_tps
 
         frozen = float(getattr(self, "radar_activation_price", 0) or 0)
         activated = bool(getattr(self, "radar_activated", False))
-        entry = float(self.watched_entry or getattr(self, "cycle_entry", 0) or 0)
-        atr = float(
-            getattr(self, "open_atr", 0)
-            or getattr(self, "cycle_open_atr", 0)
-            or 0
-        )
-        if atr <= 0:
-            try:
-                atr = float(self._get_locked_initial_atr() or 0)
-            except Exception:
-                atr = 0.0
-        ratio = self._radar_activation_ratio()
-        adx = float(
-            getattr(self, "radar_activation_adx", 0)
-            or getattr(self, "last_adx", 0)
-            or 25.0
-        )
-        # 已冻结且有效：持仓期不漂移（已激活也保留参考价）
-        if frozen > 0 and entry > 0:
-            # 旧中点价可能仍在账本：若与 ADX 公式偏差过大且未激活 → 重算
-            if not activated and atr > 0:
-                expect = radar_activation_price_adx(
-                    self.current_side, entry, atr, adx=adx, ratio=ratio,
-                )
-                if expect > 0 and abs(frozen - expect) / max(expect, 1e-9) > 0.15:
+        tps = list(getattr(self, "tv_tps", None) or [])
+        tp1_px = float(tps[0] or 0) if len(tps) > 0 else 0.0
+        tp2_px = float(tps[1] or 0) if len(tps) > 1 else 0.0
+        attempt = int(getattr(self, "reentry_attempt", 0) or 0)
+
+        # 已冻结且有效：持仓期不漂移
+        if frozen > 0 and tp1_px > 0 and tp2_px > 0:
+            if not activated:
+                expect = radar_gate_price_from_tps(tp1_px, tp2_px, attempt)
+                if expect > 0 and abs(frozen - expect) / max(expect, 1e-9) > 0.002:
                     self.radar_activation_price = expect
                     return expect
             return frozen
-        if entry > 0 and atr > 0:
-            px = radar_activation_price_adx(
-                self.current_side, entry, atr, adx=adx, ratio=ratio,
-            )
+
+        # 首次计算
+        if tp1_px > 0 and tp2_px > 0:
+            px = radar_gate_price_from_tps(tp1_px, tp2_px, attempt)
             if px > 0:
                 self.radar_activation_price = px
-                self.radar_activation_frac = float(ratio)
-                self.radar_activation_adx = float(adx)
                 return px
         return 0.0
 
@@ -7389,6 +7789,10 @@ class PositionSupervisor(PipelineBridgeMixin):
                         if curr_px <= 0:
                             continue
 
+                        # 规格 v1.0 §5.0：提前保本检查点（在雷达激活判断之前独立检查）
+                        if self._radar_is_dormant() and curr_px > 0:
+                            self._check_early_be_checkpoint(curr_px)
+
                         self._process_directional_defenses(real_amt, curr_px)
                         progress = self._radar_activation_progress(curr_px)
                         if (
@@ -7598,6 +8002,16 @@ class PositionSupervisor(PipelineBridgeMixin):
                     self._open_settled_qty = int(
                         s.get("open_settled_qty", s.get("initial_qty", 0)) or 0
                     )
+                    # 规格 v1.0 §3：永久硬止损冻结价
+                    self.frozen_hard_sl_px = float(s.get("frozen_hard_sl_px", 0) or 0)
+                    # 规格 v1.0 §5.0：提前保本检查点
+                    self._early_be_checkpoint_done = bool(s.get("_early_be_checkpoint_done", False))
+                    # 规格 v1.0 §8-9：防御单幂等标签 + 退出所有权
+                    self.exit_ownership = str(s.get("exit_ownership", "NONE") or "NONE")
+                    self.ownership_locked_at = float(s.get("ownership_locked_at", 0) or 0)
+                    raw_tags = s.get("pending_order_tags") or {}
+                    self._pending_order_tags = dict(raw_tags) if isinstance(raw_tags, dict) else {}
+                    self._mutex_leg = str(s.get("mutex_leg", "") or "")
                     if self.sizing_principal <= 0:
                         eq = deepcoin_client.get_principal_wallet_balance()
                         if eq > 0:
