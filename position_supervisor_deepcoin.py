@@ -278,7 +278,10 @@ class PositionSupervisor(PipelineBridgeMixin):
         )
         self._start_signal_worker()
         self._start_idle_flat_patrol()
-        self._init_reentry_runtime()
+
+    def _init_reentry_runtime(self):
+        """初始化重入运行时（保留接口）"""
+        pass
 
     def _start_idle_flat_patrol(self):
         """空仓待命时激进实盘巡检：反向强平 / 同向接管 / 人工异动 / 漏报全平 / 蚂蚁扫尾"""
