@@ -6157,7 +6157,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if live != fallback_qty:
                 logger.info(f"📐 实盘张数校正: 账本 {fallback_qty} → 交易所 {live}")
             return live
-        return fallback_qty
+        # 规格 §9.6 平仓幂等性：无持仓直接返回0，不使用fallback避免幽灵单
+        logger.warning(f"📐 实盘张数归零: 账本 {fallback_qty} → 交易所 0")
+        return 0
 
     def handle_signal(self, payload):
         """兼容旧调用路径"""
