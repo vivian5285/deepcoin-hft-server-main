@@ -19,25 +19,25 @@ from typing import Any, Dict, List, Optional
 RATIO_FLOOR = 0.6
 RATIO_CEILING = 2.2
 
-# ETH 基线（中趋势档会 overlay）
+# ETH 基线（中趋势档作为基线，对齐规格 §5.3）
 BREATH_ETH: Dict[str, Any] = {
     "name": "ETH",
     "initial_sl_atr": 0.0,  # 马拉松：激活用保本位，不用 ATR 臂
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.50,
-    "step_advance_atr": 0.35,
+    "step_trigger_atr": 0.50,  # 中趋势基线
+    "step_advance_atr": 0.35,  # 中趋势基线
     "phase_switch_atr": 3.0,  # 浮盈≥3×ATR → 阶段二连续追踪
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,  # 取消强制底线
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 1.20,
-    "breath_tp23": 1.60,
+    "breath_tp12": 1.20,  # 中趋势基线（规格 §5.3）
+    "breath_tp23": 1.60,  # 中趋势基线（规格 §5.3）
     "phase2_trail_mult": 1.0,
-    "min_mult": 1.8,
-    "max_mult": 2.5,
+    "min_mult": 2.0,   # 中趋势 TP3+ 基线
+    "max_mult": 2.5,   # 中趋势 TP3+ 基线
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
@@ -45,25 +45,25 @@ BREATH_ETH: Dict[str, Any] = {
     "exit_score": 2,
 }
 
-# XAU 基线
+# XAU 基线（中趋势档作为基线，对齐规格 §5.3）
 BREATH_XAU: Dict[str, Any] = {
     "name": "XAU",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.5,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.40,
-    "step_advance_atr": 0.30,
+    "step_trigger_atr": 0.40,  # 中趋势基线
+    "step_advance_atr": 0.30,  # 中趋势基线
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 1.00,
-    "breath_tp23": 1.40,
+    "breath_tp12": 1.00,  # 中趋势基线（规格 §5.3）
+    "breath_tp23": 1.40,  # 中趋势基线（规格 §5.3）
     "phase2_trail_mult": 1.0,
-    "min_mult": 1.5,
-    "max_mult": 2.0,
+    "min_mult": 1.8,   # 中趋势 TP3+ 基线
+    "max_mult": 2.2,   # 中趋势 TP3+ 基线
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,

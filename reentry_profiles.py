@@ -45,7 +45,7 @@ _DEFAULT_ETH_TIERS: List[Dict[str, float]] = [
     {"step_trigger_atr": 0.40, "step_advance_atr": 0.25,
      "breath_tp12": 0.80, "breath_tp23": 1.00, "min_mult": 1.2, "max_mult": 1.5},
     {"step_trigger_atr": 0.50, "step_advance_atr": 0.35,
-     "breath_tp12": 1.20, "breath_tp23": 1.60, "min_mult": 1.8, "max_mult": 2.5},
+     "breath_tp12": 1.20, "breath_tp23": 1.60, "min_mult": 2.0, "max_mult": 2.5},
     {"step_trigger_atr": 0.60, "step_advance_atr": 0.40,
      "breath_tp12": 1.50, "breath_tp23": 2.00, "min_mult": 2.5, "max_mult": 3.5},
 ]
@@ -53,9 +53,9 @@ _DEFAULT_XAU_TIERS: List[Dict[str, float]] = [
     {"step_trigger_atr": 0.35, "step_advance_atr": 0.20,
      "breath_tp12": 0.70, "breath_tp23": 0.90, "min_mult": 1.0, "max_mult": 1.3},
     {"step_trigger_atr": 0.40, "step_advance_atr": 0.30,
-     "breath_tp12": 1.00, "breath_tp23": 1.40, "min_mult": 1.5, "max_mult": 2.0},
+     "breath_tp12": 1.00, "breath_tp23": 1.40, "min_mult": 1.8, "max_mult": 2.2},
     {"step_trigger_atr": 0.50, "step_advance_atr": 0.35,
-     "breath_tp12": 1.30, "breath_tp23": 1.80, "min_mult": 2.0, "max_mult": 2.8},
+     "breath_tp12": 1.30, "breath_tp23": 1.80, "min_mult": 2.2, "max_mult": 3.0},
 ]
 
 REENTRY_TIERS_JSON = os.path.join(

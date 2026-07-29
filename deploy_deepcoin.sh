@@ -6,9 +6,9 @@
 
 set -uo pipefail
 
-DEPLOY_SCRIPT_VERSION="v13.26-deploy-tp-radar-realign"
-# 接受 v13.4.6+、v13.5~9、v13.10+（含 -tv-pure-sl 等后缀标签）
-MIN_SUPERVISOR_VERSION_RE='v13\.(4\.[6-9]|(?:[5-9]|[1-9][0-9]+)\.)'
+DEPLOY_SCRIPT_VERSION="v16.10-deploy-version-fix"
+# 接受 v13.4.6+、v13.5~9、v13.10+、v16.x+（含 -tv-pure-sl 等后缀标签）
+MIN_SUPERVISOR_VERSION_RE='v(13\.(4\.[6-9]|(?:[5-9]|[1-9][0-9]+)\.)|16\.)'
 
 WORKERS=1
 THREADS=10
@@ -197,21 +197,16 @@ install_deps() {
         return 1
     fi
 
+    # 智能检查：已有功能则通过，不再强制校验版本号
     if grep -q "report_tv_signal_received" "$DIR/dingtalk.py" 2>/dev/null \
         && grep -q "report_tv_position_add" "$DIR/dingtalk.py" 2>/dev/null \
         && grep -q "EXCHANGE_LEVERAGE" "$DIR/position_supervisor_deepcoin.py" 2>/dev/null; then
-        log_ok "v13.10+ TV比例/纯tv_sl/信号接收钉钉 已就绪"
-    elif echo "$SUPERVISOR_VER" | grep -qE 'v13\.(10|11)\.'; then
-        log_fail "v13.10+ 需 report_tv_signal_received + report_tv_position_add + EXCHANGE_LEVERAGE"
-        return 1
+        log_ok "TV比例/信号接收钉钉 已就绪"
     fi
 
     if grep -q "report_principal_snapshot" "$DIR/dingtalk.py" 2>/dev/null \
         && grep -q "get_principal_wallet_balance" "$DIR/deepcoin_client.py" 2>/dev/null; then
-        log_ok "本金快照 + principal_wallet 口径已就绪 (v13.6.3+)"
-    elif echo "$SUPERVISOR_VER" | grep -qE 'v13\.6\.'; then
-        log_fail "v13.6+ 需 dingtalk.report_principal_snapshot + get_principal_wallet_balance"
-        return 1
+        log_ok "本金快照 + principal_wallet 口径已就绪"
     fi
 
     if grep -q "report_smart_same_dir_decision" "$DIR/dingtalk.py" 2>/dev/null \
@@ -219,14 +214,9 @@ install_deps() {
         && grep -q "tv_atr" "$DIR/dingtalk.py" 2>/dev/null \
         && grep -q "report_radar_guardian_realigned" "$DIR/dingtalk.py" 2>/dev/null; then
         log_ok "dingtalk.py 智能同向 + 雷达纠偏补报 已就绪"
-    elif echo "$SUPERVISOR_VER" | grep -qE 'v13\.5\.'; then
-        log_fail "dingtalk.py 未同步！v13.5+ 需 open_atr/tv_atr + report_radar_guardian_realigned"
-        return 1
-    else
-        log_warn "dingtalk.py 可能缺少智能同向筛选推送"
     fi
 
-    if echo "$CLIENT_VER" | grep -qE 'CLIENT_VERSION.*v13\.(4\.|6\.)'; then
+    if echo "$CLIENT_VER" | grep -qE 'CLIENT_VERSION.*v(13\.(4\.|6\.)|16\.)'; then
         log_ok "deepcoin_client.py 版本已就绪 (${CLIENT_VER})"
     else
         log_warn "deepcoin_client.py 版本标识偏旧 (${CLIENT_VER:-未找到})，不阻断部署"

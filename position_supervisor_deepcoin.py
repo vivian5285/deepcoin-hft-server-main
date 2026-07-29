@@ -1695,31 +1695,41 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return default
 
     def _get_active_position(self):
-        res = deepcoin_client.get_position_info(self.symbol)
-        if res and 'data' in res:
-            for p in res['data']:
-                if self._safe_qty(p.get("pos")) > 0:
-                    return {
-                        "size": self._safe_qty(p.get("pos")),
-                        "entry_price": round(float(p.get("avgPx", p.get("price", 0)) or 0), 2),
-                        "posSide": p.get("posSide", "long").lower(),
-                    }
+        # 限流重试：关键持仓查询增加重试，避免静默期返回None导致开仓失败
+        for attempt in range(3):
+            res = deepcoin_client.get_position_info(self.symbol)
+            if res and 'data' in res:
+                for p in res['data']:
+                    if self._safe_qty(p.get("pos")) > 0:
+                        return {
+                            "size": self._safe_qty(p.get("pos")),
+                            "entry_price": round(float(p.get("avgPx", p.get("price", 0)) or 0), 2),
+                            "posSide": p.get("posSide", "long").lower(),
+                        }
+                return None
+            if attempt < 2:
+                time.sleep(0.5)
         return None
 
     def _get_all_positions(self):
         """获取所有方向的持仓（对冲模式下可能同时有多空持仓）"""
-        positions = []
-        res = deepcoin_client.get_position_info(self.symbol)
-        if res and 'data' in res:
-            for p in res['data']:
-                qty = self._safe_qty(p.get("pos"))
-                if qty > 0:
-                    positions.append({
-                        "size": qty,
-                        "entry_price": round(float(p.get("avgPx", p.get("price", 0)) or 0), 2),
-                        "posSide": p.get("posSide", "long").lower(),
-                    })
-        return positions
+        # 限流重试
+        for attempt in range(3):
+            positions = []
+            res = deepcoin_client.get_position_info(self.symbol)
+            if res and 'data' in res:
+                for p in res['data']:
+                    qty = self._safe_qty(p.get("pos"))
+                    if qty > 0:
+                        positions.append({
+                            "size": qty,
+                            "entry_price": round(float(p.get("avgPx", p.get("price", 0)) or 0), 2),
+                            "posSide": p.get("posSide", "long").lower(),
+                        })
+                return positions
+            if attempt < 2:
+                time.sleep(0.5)
+        return []
 
     def _verify_flat(self):
         """验证所有方向的持仓都已清空（对冲模式兼容）"""
@@ -7987,13 +7997,44 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         for lv in self._expected_tp_levels(live_qty):
             q, px = lv["qty"], lv["price"]
+            kind = f"TP{int(lv.get('level', 0))}"
             if q > 0 and px > 0:
-                res = deepcoin_client.place_limit_order(
-                    self.symbol, close_side, pos_side, px, q, reduce_only=True,
-                )
-                if res and deepcoin_client._is_success(res):
-                    placed += 1
-                time.sleep(0.35)
+                # 幂等标签拦截（规格 v1.0 §8-9）
+                blocked, tag0, _ = self._has_open_pending_defense_tag(kind)
+                if blocked:
+                    logger.warning(
+                        f"[{self.symbol}] 本地未完成标签 tag={tag0} kind={kind} "
+                        f"→ 拒挂 TP{int(lv.get('level', 0))}（幂等拦截）"
+                    )
+                    continue
+                tag = make_defense_client_order_id(self.symbol, kind, px)
+                self._register_pending_defense_tag(tag, kind, price=px)
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
+                last = None
+                for attempt in range(2):
+                    res = deepcoin_client.place_limit_order(
+                        self.symbol, close_side, pos_side, px, q,
+                        reduce_only=True, cl_ord_id=tag,
+                    )
+                    if res and deepcoin_client._is_success(res):
+                        last = res
+                        oid = str(last.get("orderId") or last.get("algoId") or "")
+                        self._register_pending_defense_tag(tag, kind, price=px, order_id=oid)
+                        placed += 1
+                        logger.info(f"📈 TP{int(lv.get('level', 0))} {q} @ {px:.2f} tag={tag}")
+                        break
+                    time.sleep(0.2)
+                if not last:
+                    self._complete_pending_defense_tag(tag=tag)
+                    try:
+                        self._save_state()
+                    except Exception:
+                        pass
+                    logger.error(f"[{self.symbol}] TP{int(lv.get('level', 0))} @ {px:.2f} 失败（已释放标签）")
+                time.sleep(0.25)
 
         curr_px = deepcoin_client.get_current_price(self.symbol)
         self._maintain_hard_shield(live_qty, curr_px, force=True)
