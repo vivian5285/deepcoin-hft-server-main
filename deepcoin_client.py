@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 WS_PUBLIC_SWAP = "wss://stream.deepcoin.com/streamlet/trade/public/swap?platform=api&version=v2"
 WS_PRIVATE = "wss://stream.deepcoin.com/v1/private"
 
-CLIENT_VERSION = "v16.10.0-aligned"
+CLIENT_VERSION = "v16.10.1-query-fix"
 # 公开 instruments 接口失败时的硬编码兜底
 SYMBOL_TICK_FALLBACK = {
     "ETH-USDT-SWAP": "0.01",
@@ -222,7 +222,7 @@ class DeepcoinClient:
             "avail_bal": 0.0,
             "frozen_bal": 0.0,
         }
-        res = self._request("GET", "/account/balances", {"instType": "SWAP"})
+        res = self._request("GET", "/account/balances", {"instType": "SWAP"}, _throttle_kind="rest_query")
         if isinstance(res, dict) and "data" in res:
             for item in res["data"]:
                 if item.get("ccy") != ccy:
@@ -524,7 +524,8 @@ class DeepcoinClient:
         return variants
 
     def get_position_info(self, symbol="ETH-USDT-SWAP"):
-        return self._request("GET", "/account/positions", {"instType": "SWAP", "instId": symbol})
+        """持仓查询：静默期等待，不阻塞开仓流程（v16.10.1修复）"""
+        return self._request("GET", "/account/positions", {"instType": "SWAP", "instId": symbol}, _throttle_kind="rest_query")
 
     def get_all_swap_position_notionals(self):
         """
@@ -701,7 +702,7 @@ class DeepcoinClient:
             params["clOrdId"] = cl_ord_id
         else:
             return None
-        return self._request("GET", "/trade/order", params)
+        return self._request("GET", "/trade/order", params, _throttle_kind="rest_query")
 
     def batch_close_position(self, symbol):
         """POST /deepcoin/trade/batch-close-position — 批量平仓指定产品所有仓位"""
@@ -738,7 +739,7 @@ class DeepcoinClient:
         """GET /deepcoin/trade/trigger-orders-pending — 未触发条件单"""
         res = self._request("GET", "/trade/trigger-orders-pending", {
             "instType": "SWAP", "instId": symbol, "limit": 100,
-        })
+        }, _throttle_kind="rest_query")
         if res and isinstance(res.get("data"), list):
             return res["data"]
         return []

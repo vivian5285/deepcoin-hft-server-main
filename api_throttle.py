@@ -5,7 +5,9 @@
 
 原则：
 - 账本优先；节流阀是所有 REST 的唯一关卡
-- 触发交易所限流后进入强制静默，静默期内一律拒绝（含巡检）
+- 触发交易所限流后进入强制静默
+- v16.10.1：静默期内查询类操作（rest_query/rest_public）等待后放行，写操作严格拒绝
+  - 原因：静默期拒绝持仓查询导致开仓流程死锁，修复后可保证基本功能正常运行
 - v16.6.2：默认预算收紧（同 IP 双品种 + Deepcoin 公网 K 线共用配额）
 """
 from __future__ import annotations
@@ -91,25 +93,39 @@ class AccountThrottle:
     ) -> Tuple[bool, str]:
         """
         请求放行检查。
-        kind: rest | rest_probe | rest_trade | rest_public
+        kind: rest | rest_probe | rest_trade | rest_public | rest_query
         force: 仅紧急平仓等可绕过预算（仍不能绕过静默，除非 PIPELINE_THROTTLE_FORCE_BYPASS=1）
         返回 (ok, detail)。ok=False 时调用方不得打交易所。
+        
+        v16.10.1 修复：
+        - rest_query（持仓/订单查询）在静默期等待后仍可执行，保证系统基本功能
+        - rest_public 在静默期等待后仍可执行
+        - rest_trade（下单操作）静默期严格拒绝，防止被限流
+        - rest/rest_probe 静默期等待后执行
         """
         bypass = str(os.getenv("PIPELINE_THROTTLE_FORCE_BYPASS", "0")).strip() in (
             "1", "true", "TRUE",
         )
         gap_wait = 0.0
+        silence_wait = 0.0
         with self._lock:
             rem = max(0.0, float(self._silence_until) - time.time())
+            # v16.10.1：查询类操作在静默期等待，写操作静默期严格拒绝
+            is_query = kind in ("rest_query", "rest_public")
             if rem > 0 and not (force and bypass):
-                return False, f"silence:{rem:.1f}s"
+                if is_query:
+                    # 查询类操作：静默期等待后放行（不等会死锁）
+                    silence_wait = rem
+                else:
+                    # 写操作：静默期严格拒绝
+                    return False, f"silence:{rem:.1f}s"
             self._gc()
             n = len(self._window)
             budget = max(4, int(self.budget_per_min))
             soft = max(1, int(budget * float(self.soft_ratio)))
             # v16.10+：交易类操作（开仓/止损/TP/撤单）强制模式跳过所有等待
             is_critical_trade = (kind == "rest_trade" and force)
-            if kind in ("rest_probe", "rest_public") and n >= soft:
+            if kind in ("rest_probe",) and n >= soft:
                 return False, f"probe_budget:{n}/{budget}"
             # 交易关键操作用 force=True 跳过所有软等待（仍受硬静默期约束）
             if n >= budget and not force:
@@ -120,11 +136,14 @@ class AccountThrottle:
             last = float(self._last_acquire_ts or 0)
             gap_need = max(0.0, float(self.min_gap_sec) - (time.time() - last))
             gap_wait = max(wait, gap_need)
+        # 静默期等待
+        if silence_wait > 0:
+            time.sleep(silence_wait)
         if gap_wait > 0:
             time.sleep(gap_wait)
         with self._lock:
             rem = max(0.0, float(self._silence_until) - time.time())
-            if rem > 0 and not (force and bypass):
+            if rem > 0 and not (force and bypass) and not is_query:
                 return False, f"silence:{rem:.1f}s"
             self._gc()
             n2 = len(self._window)
