@@ -3,6 +3,7 @@
 # position_supervisor_deepcoin.py — 与币安 VPS 逻辑完全对齐（深币张数/20x 适配）
 import logging
 import time
+import math
 import threading
 import os
 import json
@@ -2812,25 +2813,45 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._save_state()
 
     def _split_remaining_tp_quantities(self, live_qty, ratios=None):
-        """已成交档跳过；仅余一档则现仓全给该档"""
+        """
+        TP1+TP2 各保证至少1张（剩余数量足够时），剩余按比例分配。
+        TP3 永不挂限价（由雷达管理），接收所有剩余。
+        """
         live_qty = self._safe_qty(live_qty)
         ratios = ratios or self.regime_settings[self._tp_split_regime()]["ratios"]
         consumed = set(getattr(self, "tp_levels_consumed", []) or [])
         remaining = [i for i in range(3) if (i + 1) not in consumed]
         if not remaining or live_qty <= 0:
             return {}
+
+        # 仅剩一档（通常是TP3），全给该档
         if len(remaining) == 1:
             return {remaining[0] + 1: live_qty}
-        rem_weights = [ratios[i] for i in remaining]
-        wsum = sum(rem_weights) or 1.0
+
+        # TP1+TP2 各保底1张，剩余给TP3
+        # 如果live_qty不足2张，则全给TP1，TP2=0
+        if live_qty < 2:
+            out = {1: live_qty}
+            if 2 in remaining:
+                out[2] = 0
+            if 3 in remaining:
+                out[3] = 0
+            return out
+
+        tp1_qty = max(1, int(math.ceil(live_qty * ratios[0])))
+        tp2_qty = max(1, int(math.ceil(live_qty * ratios[1])))
+        # 剩余给 TP3（雷达管理，不挂限价）
+        tp3_qty = max(0, live_qty - tp1_qty - tp2_qty)
+
         out = {}
-        budget = live_qty
-        for j, idx in enumerate(remaining[:-1]):
+        for idx in remaining:
             level = idx + 1
-            q = max(0, int(round(live_qty * rem_weights[j] / wsum)))
-            out[level] = q
-            budget -= q
-        out[remaining[-1] + 1] = max(0, budget)
+            if level == 1:
+                out[1] = tp1_qty
+            elif level == 2:
+                out[2] = tp2_qty
+            elif level == 3:
+                out[3] = tp3_qty
         return out
 
     def _expected_tp_levels(self, live_qty):
