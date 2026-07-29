@@ -1378,9 +1378,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._ensure_radar_sl(live_qty, sl)
         else:
             progress = self._radar_activation_progress(curr_px) if curr_px > 0 else 0.0
+            gate = float(self._radar_activation_price() or 0)
             logger.info(
-                f"📡 [{source}] 雷达待命(TP1未成交) 进度{progress:.0%} | "
-                f"tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | "
+                f"📡 [{source}] 雷达待命(等待价格到达阈值) 进度{progress:.0%} | "
+                f"阈值={gate:.2f} | tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | "
                 f"TP {audit.get('matched_full', 0)}/{audit.get('expected', 0)}"
             )
 
@@ -2915,7 +2916,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if all((float(t or 0) <= 0) for t in tv_tps):
                 parts.append("⚠️ TP价格未初始化（tv_tps=全零）")
             else:
-                parts.append("⚠️ 无有效限价TP（仓位<MIN_TP_LEG_QTY或价格缺失）")
+                # 规格 §6.2：TP1/TP2 零头并入 TP3（雷达管理），这是正常状态不是错误
+                parts.append("ℹ️ TP1/TP2零头已并入TP3（雷达管理）")
 
         if audit.get("issues"):
             parts.append("问题:" + "; ".join(audit["issues"][:3]))
@@ -3775,6 +3777,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._save_state()
 
     def _perform_radar_handoff(self, real_amt, curr_px, reason=""):
+        """
+        【规格 v1.0 · §5.1 雷达延迟激活】
+        价格到达TP1-TP2中点（首次开仓）或TP2（重入开仓）时触发雷达交棒。
+        不再要求 TP1 先成交。
+        """
         real_amt = float(self._resolve_live_qty(real_amt) or 0)
         if real_amt <= 0:
             return False
@@ -3783,18 +3790,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         ):
             logger.info(f"📡 雷达交棒拒绝：开仓/防线重建中 | {reason or ''}")
             return False
-        if not self._tp1_filled_verified(real_amt, curr_px):
-            logger.info(f"📡 雷达交棒拒绝：TP1 未核实成交 | {reason or ''}")
+        # 规格 §5.1：价格必须到达TP1-TP2中点（首次）或TP2（重入）
+        if not self._should_radar_trail(curr_px):
+            gate = float(self._radar_activation_price() or 0)
+            logger.info(
+                f"📡 雷达交棒拒绝：价格未达激活阈值 | 现价={float(curr_px or 0):.2f} "
+                f"| 阈值={gate:.2f} | {reason or ''}"
+            )
             return False
-        if not getattr(self, "_radar_armed_after_tp1", False):
-            if not self._price_reached_tp1_zone(curr_px):
-                logger.info(
-                    f"📡 雷达交棒拒绝：价格未达 TP1 区域 | 现价={float(curr_px or 0):.2f} | "
-                    f"{reason or ''}"
-                )
-                return False
-            self._radar_armed_after_tp1 = True
-            self._save_state()
         if not self._should_radar_trail(curr_px):
             return False
 
@@ -4526,13 +4529,37 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return self._maintain_hard_shield(real_amt, curr_px)
 
     def _is_radar_active(self):
+        """
+        【规格 v1.0 · §5.1】
+        雷达激活判断：价格已到达TP1-TP2中点（首次开仓）或TP2（重入开仓），
+        且止损已移动到保本位（current_sl 已高于/低于 entry）。
+        不再要求 TP1 成交才激活雷达。
+        """
         if not self.watched_entry or not self.current_sl:
             return False
-        if not self._tp1_filled_verified():
+        # 雷达激活后不撤销，保持激活状态直到仓位平仓
+        if getattr(self, "radar_activated", False):
+            return True
+        # 价格必须到达雷达激活阈值
+        gate = float(self._radar_activation_price() or 0)
+        if gate <= 0:
             return False
-        if self.current_side == "LONG":
+        curr_px = deepcoin_client.get_current_price(self.symbol) or 0
+        if curr_px <= 0:
+            return False
+        side = str(self.current_side or "").upper()
+        if side == "LONG":
+            price_reached = curr_px >= gate
+        elif side == "SHORT":
+            price_reached = curr_px <= gate
+        else:
+            price_reached = False
+        # 止损必须已移动到保本位
+        if not price_reached:
+            return False
+        if side == "LONG":
             return self.current_sl > self.watched_entry
-        if self.current_side == "SHORT":
+        if side == "SHORT":
             return self.current_sl < self.watched_entry
         return False
 
@@ -4694,8 +4721,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._pending_order_tags = tags
 
     def _radar_sl_to_pass(self):
-        if not self._tp1_filled_verified():
-            return None
+        """
+        【规格 v1.0 · §5.1】
+        雷达激活后返回当前止损价。
+        不再要求 TP1 成交，只要雷达已激活（价格到达阈值）即可。
+        """
         return self.current_sl if self._is_radar_active() else None
 
     def _audit_requires_nuclear(self, audit):
@@ -4771,16 +4801,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return self._has_trigger_sl_near(clamped)
 
     def _report_radar_first_activation(self, real_amt, curr_px, new_sl, sl_placed):
-        """雷达首次激活：核实实盘后推送（保本止损已挂；shield_cleared 文案仍反映旧交棒逻辑）
-        TODO(v13.81+): 币安已不发「撤硬止损」交棒钉钉；shield_cleared=True 待改为并行硬止损语义。"""
+        """
+        【规格 v1.0 · §5.1 雷达延迟激活】
+        价格到达TP1-TP2中点（首次开仓）或TP2（重入开仓）时发送雷达激活通知。
+        不再要求 TP1 先成交。
+        """
         if getattr(self, "_radar_activation_notified", False):
             return
-        if not self._tp1_filled_verified(real_amt, curr_px):
-            logger.warning(
-                f"📡 雷达激活钉钉跳过：TP1 未实盘成交 "
-                f"(entry={self.watched_entry:.2f} sl={new_sl:.2f})"
-            )
-            return
+        # 规格 §5.1：只要价格到达阈值就激活，不要求TP1成交
+        # 止损必须高于入场价（多单）或低于入场价（空单）
         if self.current_side == "LONG" and float(new_sl or 0) <= float(self.watched_entry or 0):
             logger.warning(
                 f"📡 雷达激活钉钉跳过：LONG 止损 {new_sl:.2f} 未高于 entry"
@@ -4962,7 +4991,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return abs(px - sl) <= max(2.5, px * 0.002)
 
     def _enforce_pre_tp1_radar_standby(self, live_qty=None, curr_px=0.0, source=""):
-        """TP1 未成交：强制雷达待命，止损仅 tv_sl 宽线"""
+        """
+        【规格 v1.0 · §5.1】
+        雷达延迟激活：价格到达TP1-TP2中点（首次开仓）或TP2（重入开仓）之前，
+        止损仅维持 tv_sl 宽线保护，不做移动保本。
+        """
         if self._tp1_filled_verified(live_qty, curr_px):
             return False
 
@@ -5056,7 +5089,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             "雷达解除·恢复呼吸空间",
             f"{self.current_side} {live_qty}张 @ {entry:.2f} | "
             f"清除伪TP{stale or '标记'} | tv_sl={tv:.2f} | "
-            f"TP1 未实盘成交前禁止移动保本止损",
+            f"等待价格到达TP1-TP2中点后激活雷达",
         )
         if live_qty > 0 and tv > 0:
             self._maintain_hard_shield(live_qty, curr_px, force=True)
@@ -5102,7 +5135,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._radar_armed_after_tp1 = False
             self._ws_tp1_fill_hint = False
             logger.info(
-                f"📡 重启雷达待命: TP1 未成交，保留 tv_sl 宽止损 "
+                f"📡 重启雷达待命: 等待价格到达TP1-TP2中点(阈值{gate:.2f}) "
                 f"(进度 {self._radar_activation_progress(curr_px):.0%})"
             )
             return
@@ -7519,16 +7552,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return 0.0
 
     def _should_radar_trail(self, curr_px):
-        """已激活后持续追踪；TP1 未成交前不做移动保本"""
+        """
+        【规格 v1.0 · §5.1 雷达延迟激活】
+        价格到达TP1-TP2中点（首次开仓）或TP2（重入开仓）后，雷达开始追踪。
+        不再要求 TP1 成交才激活雷达。
+        """
         if getattr(self, "_radar_armed_after_tp1", False) and self._is_radar_active():
             return True
         if curr_px <= 0 or not self.watched_entry:
             return False
-        if not self._tp1_filled_verified(None, curr_px):
+        gate = float(self._radar_activation_price() or 0)
+        if gate <= 0:
             return False
-        if self.current_side == "LONG":
-            return curr_px >= self._radar_activation_price()
-        return curr_px <= self._radar_activation_price()
+        side = str(self.current_side or "").upper()
+        if side == "LONG":
+            return curr_px >= gate
+        elif side == "SHORT":
+            return curr_px <= gate
+        return False
 
     def _compute_radar_sl(self, curr_px=0.0):
         if not self.watched_entry or self.best_price <= 0:
