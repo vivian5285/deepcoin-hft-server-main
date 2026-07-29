@@ -38,8 +38,6 @@ from webhook_parser import (
     enrich_signal_fields,
     enrich_entry_tp_prices,
     format_tv_field_sources,
-    fetch_eth_atr_14_public,
-    fetch_binance_klines,
     classify_tv_close,
     compute_vps_open_qty,
     compute_vps_add_qty,
@@ -164,7 +162,6 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 logger.info(f"📐 {self.symbol} face_value={ct} (instruments)")
         except Exception as e:
             logger.warning(f"face_value instruments 失败，用 meta {self.face_value}: {e}")
-        self.atr_fallback_symbol = meta.get("atr_fallback_symbol") or "ETHUSDT"
         self.binance_mark = meta.get("binance_mark") or "ETHUSDT"
         self.monitoring = False
         self._lock = threading.Lock()
@@ -4863,6 +4860,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             (getattr(self, "open_atr", 0) or 0)
             * float(getattr(self, "breathing_coefficient", 1.0) or 1.0)
         )
+        # 规格 v1.0 §5.1：钉钉通知标注门类型
+        reentry_attempt = int(getattr(self, "reentry_attempt", 0) or 0)
+        if reentry_attempt >= 1:
+            open_kind = "重入开仓"
+            trigger_gate = "重入·TP2绝对价"
+        else:
+            open_kind = "首次开仓"
+            trigger_gate = "首次·TP1-TP2中点"
         self._call_dingtalk(
             dingtalk.report_radar_activated,
             side=self.current_side,
@@ -4878,6 +4883,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 getattr(self, "breathing_coefficient", 1.0) or 1.0
             ),
             trail_dist=trail_dist,
+            open_kind=open_kind,
+            trigger_gate=trigger_gate,
         )
         self._radar_activation_notified = True
 
@@ -6228,7 +6235,6 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return enrich_signal_fields(
             payload,
             action,
-            fetch_atr=lambda: fetch_eth_atr_14_public(symbol=self.atr_fallback_symbol),
             fallback_regime=self.regime or 3,
             fallback_atr=self.current_atr or 30.0,
             fallback_price=live_px,

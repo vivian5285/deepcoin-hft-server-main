@@ -988,14 +988,26 @@ def report_radar_activated(side, qty, entry, new_sl, radar_progress=1.0, regime=
                            breathing_coefficient=None, trail_dist=None,
                            symbol=None, open_kind=None, activation_frac=None,
                            activation_price=None, trigger_gate="", tier=None):
-    """与币安单系统对齐：启动门槛=ADX 70%~90% × 1.35×ATR（开仓冻结）；硬止损不撤销。"""
+    """
+    【规格 v1.0 · §5.1 雷达延迟激活钉钉通知】
+
+    雷达激活时发送钉钉通知，标注：
+    - 首次开仓：启动门槛 = TP1-TP2 区间中点（绝对价格）
+    - 重入开仓：启动门槛 = TP2 绝对价格
+    - 硬止损永久与雷达并存，不撤销
+    """
     kind = str(open_kind or "").strip() or "首次开仓"
-    # v13.91.0 / 对齐币安 v16.7.0：门槛为 ADX 比例，不再用中点/TP2
-    try:
-        from reentry_profiles import radar_gate_label_from_ratio
-        gate_lab = radar_gate_label_from_ratio(activation_frac)
-    except Exception:
-        gate_lab = "ADX启动 70%~90%×1.35ATR"
+    # 规格 v1.0：优先用 trigger_gate 描述门类型；无则回退
+    if trigger_gate:
+        gate_lab = str(trigger_gate)
+    elif activation_frac is not None:
+        try:
+            from reentry_profiles import radar_gate_label_from_ratio
+            gate_lab = radar_gate_label_from_ratio(activation_frac)
+        except Exception:
+            gate_lab = "绝对价格锚定"
+    else:
+        gate_lab = "TP1-TP2中点 / TP2 绝对价"
     act_px = float(activation_price or 0)
     coeff = float(breathing_coefficient or 0)
     trail_v = float(trail_dist or 0)
@@ -1026,4 +1038,4 @@ def report_radar_activated(side, qty, entry, new_sl, radar_progress=1.0, regime=
         data["触发"] = _p(str(trigger_gate)[:120], P_MUTED)
     if verify_note:
         data["🔍 核实明细"] = _p(verify_note, P_MUTED)
-    send_alert(f"📡 雷达激活 · {kind} · {gate_lab}", data, P_DEEP)
+    send_alert(f"📡 雷达激活 · {kind}", data, P_DEEP)

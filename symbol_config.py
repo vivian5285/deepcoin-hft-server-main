@@ -14,7 +14,6 @@ BINANCE_SYMBOL_META = {
         "min_qty": 0.001,
         "dust_qty": 0.004,
         "price_precision": 2,
-        "atr_fallback_symbol": "ETHUSDT",
         "breath": "ETH",
     },
     "XAUUSDT": {
@@ -25,7 +24,6 @@ BINANCE_SYMBOL_META = {
         "min_qty": 0.001,
         "dust_qty": 0.001,
         "price_precision": 2,
-        "atr_fallback_symbol": "XAUUSDT",
         "breath": "XAU",
     },
 }
@@ -43,7 +41,6 @@ DEEPCOIN_SYMBOL_META = {
         "min_qty": 1,
         "dust_qty": 1,
         "price_precision": 2,
-        "atr_fallback_symbol": "ETHUSDT",
     },
     "XAU-USDT-SWAP": {
         "symbol": "XAU-USDT-SWAP",
@@ -56,7 +53,6 @@ DEEPCOIN_SYMBOL_META = {
         "min_qty": 1,
         "dust_qty": 1,
         "price_precision": 2,
-        "atr_fallback_symbol": "XAUUSDT",
     },
 }
 
