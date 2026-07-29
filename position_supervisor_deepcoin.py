@@ -4410,6 +4410,27 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0 or entry <= 0 or not self.current_side:
             return False
+
+        # 【修复】价格已穿过硬止损线时，不再挂无效触发单（会导致死循环）
+        curr_px = deepcoin_client.get_current_price(self.symbol) or 0
+        if curr_px > 0:
+            stop_px = self._shield_stop_price()
+            if stop_px > 0:
+                crossed = False
+                if self.current_side == "LONG" and curr_px <= stop_px:
+                    crossed = True
+                elif self.current_side == "SHORT" and curr_px >= stop_px:
+                    crossed = True
+                if crossed:
+                    logger.warning(
+                        f"🛡️ 硬止损@{stop_px:.2f} 已被价格@{curr_px:.2f}穿过，"
+                        f"跳过挂触发单（防死循环）"
+                    )
+                    self.shield_active = True
+                    self.shield_sized_qty = live_qty
+                    self._save_state()
+                    return True
+
         tier_prices = self._shield_tier_prices(entry)
         remaining = self._remaining_shield_tier_indices()
         if not remaining:
@@ -5313,6 +5334,39 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 "matched": 0, "expected": audit.get("expected", 0),
                 "pending_prices": [], "rebuilt": False, "audit": audit, "nuclear": False,
             }
+
+        # 【修复】防抖冷却：距离上次防线对齐不足冷却期时，跳过撤挂重试
+        now = time.time()
+        if not recover_mode and not getattr(self, "_force_defense_realign", False):
+            last_align = getattr(self, "_last_defense_align_ok_ts", 0) or 0
+            if now - last_align < DEFENSE_ALIGN_COOLDOWN_SEC:
+                audit = self._audit_tp_levels(live_qty)
+                if self._tp_audit_ok(audit):
+                    logger.info(
+                        f"🛡️ 防线对齐冷却中（距上次 {now - last_align:.0f}s < {DEFENSE_ALIGN_COOLDOWN_SEC}s）"
+                        f"，TP 已齐，跳过撤挂 | {self._format_audit_summary(audit)}"
+                    )
+                    return {
+                        "matched": audit["matched_full"],
+                        "expected": audit["expected"],
+                        "pending_prices": audit["pending_prices"],
+                        "rebuilt": False,
+                        "audit": audit,
+                        "nuclear": False,
+                    }
+                logger.info(
+                    f"🛡️ 防线对齐冷却中（距上次 {now - last_align:.0f}s < {DEFENSE_ALIGN_COOLDOWN_SEC}s）"
+                    f"，跳过撤挂重试"
+                )
+                return {
+                    "matched": 0,
+                    "expected": self._audit_tp_levels(live_qty).get("expected", 0),
+                    "pending_prices": [],
+                    "rebuilt": False,
+                    "audit": self._audit_tp_levels(live_qty),
+                    "nuclear": False,
+                }
+
         if reason:
             logger.info(f"🛡️ 防线对齐: {reason} | 持仓 {live_qty}张")
 
