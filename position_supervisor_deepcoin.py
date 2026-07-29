@@ -6235,7 +6235,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         last = self.last_tv_signal or {}
         if (
-            last.get("action") in ("CLOSE_TP3", "CLOSE_PROTECT", "CLOSE_STOPLOSS")
+            last.get("action") in ("CLOSE_TP3", "CLOSE_PROTECT", "CLOSE_STOPLOSS",
+                                    "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT")
             and time.time() - float(last.get("ts", 0) or 0) < 180
         ):
             return self._build_close_meta(

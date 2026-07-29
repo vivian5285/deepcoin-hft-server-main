@@ -1,0 +1,7 @@
+fix: CLOSE_QUICK_EXIT/CLOSE_RSI_EXIT不被识别 + 小仓TP3合并 + TP状态持久化 + CLOSE信号提前记录
+
+1. TV信号处理器：新增 CLOSE_QUICK_EXIT/CLOSE_RSI_EXIT 识别逻辑，
+   修复掉进"未识别action"else分支导致平仓不执行的bug
+2. TP蚂蚁仓合并：MIN_TP_LEG_QTY以下非TP3数量合并入TP3（雷达管理70%仓）
+3. 恢复状态持久化：_reconcile_context_on_recover 设置 tv_tps 后立即 _save_state
+4. 信号记录前置：CLOSE信号在拿锁前先写入journal，避免重启丢失

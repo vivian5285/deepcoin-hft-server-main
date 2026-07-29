@@ -110,7 +110,7 @@ def classify_tv_close(action="", reason="", pnl_pct=None):
 
     if action == "CLOSE_TP3" or ("TP3" in reason and ("完美" in reason or "收网" in reason)):
         return CLOSE_TYPE_TP3
-    if action in ("CLOSE_PROTECT",) or action.startswith("CLOSE_PROTECT"):
+    if action in ("CLOSE_PROTECT", "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT") or action.startswith("CLOSE_PROTECT"):
         return CLOSE_TYPE_PROTECT
     if action == "CLOSE_STOPLOSS" or action.startswith("CLOSE_STOP"):
         if "防回吐" in reason:
