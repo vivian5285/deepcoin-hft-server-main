@@ -649,13 +649,16 @@ class DeepcoinClient:
         return self._request("POST", "/trade/trigger-order", params)
 
     def set_position_sltp(self, symbol, pos_side, sl_trigger_px=None, tp_trigger_px=None,
-                          td_mode="cross", mrg_position="merge", trigger_px_type="last"):
-        """POST /deepcoin/trade/set-position-sltp — 为已有持仓设置止盈止损"""
+                          td_mode="cross", mrg_position="merge", trigger_px_type="last",
+                          sl_ord_px="-1", tp_ord_px="-1"):
+        """POST /deepcoin/trade/set-position-sltp — 为已有持仓设置止盈止损
+        sl_ord_px/tp_ord_px: -1 表示市价
+        """
         params = {
             "instType": "SWAP", "instId": symbol, "posSide": pos_side,
             "mrgPosition": mrg_position, "tdMode": td_mode,
             "tpTriggerPxType": trigger_px_type, "slTriggerPxType": trigger_px_type,
-            "tpOrdPx": "-1", "slOrdPx": "-1",
+            "tpOrdPx": tp_ord_px, "slOrdPx": sl_ord_px,
         }
         if tp_trigger_px is not None:
             params["tpTriggerPx"] = str(tp_trigger_px)

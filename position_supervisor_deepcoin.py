@@ -1706,9 +1706,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     }
         return None
 
+    def _get_all_positions(self):
+        """获取所有方向的持仓（对冲模式下可能同时有多空持仓）"""
+        positions = []
+        res = deepcoin_client.get_position_info(self.symbol)
+        if res and 'data' in res:
+            for p in res['data']:
+                qty = self._safe_qty(p.get("pos"))
+                if qty > 0:
+                    positions.append({
+                        "size": qty,
+                        "entry_price": round(float(p.get("avgPx", p.get("price", 0)) or 0), 2),
+                        "posSide": p.get("posSide", "long").lower(),
+                    })
+        return positions
+
     def _verify_flat(self):
-        pos = self._get_active_position()
-        return pos is None or self._safe_qty(pos.get("size")) == 0
+        """验证所有方向的持仓都已清空（对冲模式兼容）"""
+        positions = self._get_all_positions()
+        return len(positions) == 0
 
     def _ensure_flat_before_open(self, reason_tag="开仓前"):
         if self._wait_verify(self._verify_flat, retries=4, delay=0.4):
@@ -2482,21 +2498,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         logger.info(f"📌 [{self.symbol}] 重入防线已挂: 硬止损@{init:.2f} TP1/TP2")
 
     def _sweep_dust_and_finalize(self, reason):
-        """哨兵检测：止盈后蚂蚁仓/无 TP 残张 → 撤单 + reduceOnly 扫尾 + 收网钉钉"""
+        """哨兵检测：止盈后蚂蚁仓/无 TP 残张 → 撤单 + reduceOnly 扫尾 + 收网钉钉（对冲模式兼容）"""
         logger.warning(f"🐜 止盈扫尾：检测到残量，启动蚂蚁仓强平 → {reason}")
         self.monitoring = False
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.4)
         for round_i in range(4):
-            pos = self._get_active_position()
-            if not pos or self._safe_qty(pos.get("size")) <= 0:
+            # 获取所有方向的持仓
+            all_positions = self._get_all_positions()
+            if not all_positions:
                 break
-            close_side = "sell" if pos["posSide"] == "long" else "buy"
-            live_sz = self._safe_qty(pos["size"])
-            logger.info(f"🐜 扫尾第 {round_i + 1}/4: {close_side} {live_sz}张 reduceOnly")
-            deepcoin_client.place_market_order(
-                self.symbol, close_side, pos["posSide"], live_sz, reduce_only=True,
-            )
+            for pos in all_positions:
+                close_side = "sell" if pos["posSide"] == "long" else "buy"
+                live_sz = self._safe_qty(pos["size"])
+                logger.info(f"🐜 扫尾{round_i + 1}/4: {close_side} {live_sz}张 {pos['posSide']} reduceOnly")
+                deepcoin_client.place_market_order(
+                    self.symbol, close_side, pos["posSide"], live_sz, reduce_only=True,
+                )
+                time.sleep(0.5)
             time.sleep(1.0)
         self.watched_qty = 0
         self.initial_qty = 0
@@ -4406,12 +4425,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _place_shield_stops(self, live_qty, entry=None, reason="", force=False,
                             recover_mode=False, suppress_alert=False):
+        """
+        使用 set-position-sltp 接口设置硬止损（市价触发），替代条件单。
+        根据 Deepcoin API 文档，set-position-sltp 是为止有持仓设置止盈止损的正确接口，
+        支持市价委托（slOrdPx=-1），避免价格跳空时限价单无法成交的问题。
+        """
         entry = float(entry or self.watched_entry or 0)
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0 or entry <= 0 or not self.current_side:
             return False
 
-        # 【修复】价格已穿过硬止损线时，不再挂无效触发单（会导致死循环）
+        # 【修复】价格已穿过硬止损线时，跳过无效操作（防死循环）
         curr_px = deepcoin_client.get_current_price(self.symbol) or 0
         if curr_px > 0:
             stop_px = self._shield_stop_price()
@@ -4424,92 +4448,47 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if crossed:
                     logger.warning(
                         f"🛡️ 硬止损@{stop_px:.2f} 已被价格@{curr_px:.2f}穿过，"
-                        f"跳过挂触发单（防死循环）"
+                        f"标记已触发（防死循环）"
                     )
                     self.shield_active = True
                     self.shield_sized_qty = live_qty
                     self._save_state()
                     return True
 
-        tier_prices = self._shield_tier_prices(entry)
-        remaining = self._remaining_shield_tier_indices()
-        if not remaining:
-            self.shield_active = False
-            self._save_state()
-            return True
-
-        audit = self._audit_shield_orders(live_qty, entry)
-        if self._shield_orders_adequate(audit):
-            self.shield_active = True
-            self._shield_fail_streak = 0
-            if not getattr(self, "shield_sized_qty", 0):
-                self.shield_sized_qty = live_qty
-            self._save_state()
-            return True
-
-        if not self._shield_needs_exchange_action(live_qty, audit) and not force:
-            self.shield_active = True
-            self.shield_sized_qty = live_qty
-            self._save_state()
-            return True
-
-        if not self._can_maintain_shield_now(force=force, audit=audit):
-            return getattr(self, "shield_active", False)
-
-        if audit["status"] == "duplicate" and not force:
-            purged = self._purge_shield_stop_orders(tier_prices)
-            self._record_shield_maintain(success=False)
-            logger.warning(
-                f"🛡️ 防护盾叠单清理：撤 {purged} 笔，冷却后再按实盘 {live_qty} 张 补挂"
-            )
+        pos_side = "long" if self.current_side == "LONG" else "short"
+        stop_px = self._shield_stop_price()
+        if not stop_px or stop_px <= 0:
+            logger.warning(f"🛡️ 硬止损无效：无有效止损价格")
             return False
 
-        qty_map = self._shield_quantities_for_remaining(live_qty)
-        purged = self._purge_shield_stop_orders(tier_prices)
-        if purged:
-            logger.warning(
-                f"🛡️ 撤净旧硬止损 {purged} 笔 → 按实盘 {live_qty} 张 重挂 @ tv_sl"
-            )
-            time.sleep(0.6)
+        # 计算交易所止损价（含滑点保护）
+        exchange_sl = float(order_stop_price(
+            self.current_side, stop_px,
+            profile=getattr(self, "breath_profile", None)
+        ) or stop_px)
 
-        close_side = "sell" if self.current_side == "LONG" else "buy"
-        pos_side = "long" if self.current_side == "LONG" else "short"
-        placed = 0
-        for idx in remaining:
-            q = qty_map.get(idx, 0)
-            tp = tier_prices[idx]
-            if q <= 0:
-                continue
-            exchange_tp = float(order_stop_price(self.current_side, tp, profile=getattr(self, "breath_profile", None)) or tp)
-            limit_px = exchange_tp * (0.9995 if close_side == "sell" else 1.0005)
-            res = deepcoin_client.place_trigger_order(
-                self.symbol, close_side, pos_side, q, exchange_tp,
-                order_type="limit", price=limit_px,
-                td_mode="cross", mrg_position="merge",
-            )
-            if res and str(res.get("code", "0")) in ("0", "00000", ""):
-                placed += 1
-                logger.info(
-                    f"🛡️ TV硬止损: "
-                    f"{q} 张 @ {exchange_tp:.2f} 全平 (理论 {tp:.2f} · 实盘 {live_qty} 张)"
-                )
-            time.sleep(0.35)
-
-        post_audit = self._wait_shield_audit_ok(
-            live_qty, entry,
-            retries=12 if recover_mode else 8,
-            delay=0.5,
+        # 使用 set-position-sltp 接口，设置市价止损（slOrdPx=-1）
+        res = deepcoin_client.set_position_sltp(
+            symbol=self.symbol,
+            pos_side=pos_side,
+            sl_trigger_px=exchange_sl,
+            tp_trigger_px=None,  # 止盈由 TP123 分批处理
+            td_mode="cross",
+            mrg_position="merge",
+            trigger_px_type="last",
+            sl_ord_px="-1",  # 市价止损
+            tp_ord_px="-1",
         )
-        ok = self._shield_orders_adequate(post_audit)
-        self._record_shield_maintain(success=ok)
-        if ok:
+
+        # 验证接口调用结果
+        if res and str(res.get("code", "0")) in ("0", "00000", ""):
             self.shield_active = True
             self.shield_sized_qty = live_qty
+            self._shield_fail_streak = 0
             self._save_state()
-            stop_px = tier_prices[0] if tier_prices else entry
             logger.warning(
-                f"🛡️ [TV硬止损] 已挂 | {live_qty} 张 @ {stop_px:.2f} | "
-                f"新挂 {placed} 笔 | 雷达激活后自动撤销"
+                f"🛡️ [TV硬止损] 已设置 | {live_qty} 张 @ {exchange_sl:.2f} | "
+                f"触发后市价平仓 | 雷达激活后自动覆盖"
             )
             if not getattr(self, "_shield_arm_notified", False):
                 self._shield_arm_notified = True
@@ -4519,26 +4498,27 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     entry=entry,
                     live_qty=live_qty,
                     adverse_pct=0,
-                    tier_prices=[stop_px],
+                    tier_prices=[exchange_sl],
                     tier_pcts=SHIELD_TIER_PCTS,
                     verify_note=(
-                        (reason or f"TV硬止损 tv_sl @ {stop_px:.2f}")
-                        + f" | 实盘 {live_qty} 张 @ {stop_px:.2f} | 仅播报一次"
+                        (reason or f"TV硬止损 @ {exchange_sl:.2f}")
+                        + f" | 实盘 {live_qty} 张 | 市价止损 | 仅播报一次"
                     ),
                 )
-        elif placed > 0 and not suppress_alert:
-            dingtalk.report_system_alert(
-                "TV硬止损未对齐",
-                f"已撤旧单 {purged} 笔、新挂 {placed} 笔，但核实未通过 | "
-                f"实盘 {live_qty} 张 | {', '.join(post_audit.get('issues', []))}",
-                suggestion="系统已退避冷却，下轮自动重试；请勿手动重复挂",
-            )
-        elif placed > 0:
-            logger.warning(
-                f"🛡️ 硬止损核实延迟 | 新挂 {placed} 笔 | "
-                f"{', '.join(post_audit.get('issues', []))} | 哨兵将继续补核实"
-            )
-        return ok
+            return True
+        else:
+            # 接口调用失败，记录错误
+            err_msg = str(res.get("msg", "") if res else "未知错误")
+            self._shield_fail_streak = getattr(self, "_shield_fail_streak", 0) + 1
+            logger.error(f"🛡️ 硬止损设置失败: {err_msg} | 重试次数: {self._shield_fail_streak}")
+
+            if not suppress_alert and self._shield_fail_streak >= 3:
+                dingtalk.report_system_alert(
+                    "TV硬止损设置失败",
+                    f"连续失败 {self._shield_fail_streak} 次 | 错误: {err_msg}",
+                    suggestion="请检查持仓状态和 API 权限",
+                )
+            return False
 
     def _maintain_hard_shield(self, real_amt, curr_px=None, force=False):
         """维护 TV tv_sl 硬止损底线；雷达止损独立运行"""
@@ -8030,7 +8010,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _close_all(self, reason="", force_align=None, reset_state=True, close_meta=None,
                    force_verify_note=""):
-        """先撤全部挂单再阶梯强平；返回是否已空仓"""
+        """先撤全部挂单再强平所有方向持仓；对冲模式兼容"""
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
         self._cancel_all_tp_limit_orders()
@@ -8038,37 +8018,52 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         closed_successfully = False
 
         for round_i in range(6):
-            pos = self._get_active_position()
-            if not pos or self._safe_qty(pos.get("size")) == 0:
+            # 获取所有方向的持仓
+            all_positions = self._get_all_positions()
+            if not all_positions:
                 closed_successfully = True
                 break
 
-            close_side = "sell" if pos["posSide"] == "long" else "buy"
-            live_sz = self._safe_qty(pos["size"])
-            logger.info(f"🔪 强平第 {round_i + 1}/6 轮: {close_side} {live_sz}张 reduceOnly")
-            deepcoin_client.place_market_order(
-                self.symbol, close_side, pos["posSide"], live_sz, reduce_only=True,
-            )
-            time.sleep(1.5)
-
-        if not closed_successfully:
-            residual = self._get_active_position()
-            residual_sz = self._safe_qty(residual["size"]) if residual else 0
-            if residual_sz > 0 and self._is_dust_qty(residual_sz):
-                close_side = "sell" if residual["posSide"] == "long" else "buy"
-                logger.warning(f"🐜 强平后残 {residual_sz}张，触发蚂蚁仓扫尾")
+            # 清理所有方向的持仓
+            for pos in all_positions:
+                close_side = "sell" if pos["posSide"] == "long" else "buy"
+                live_sz = self._safe_qty(pos["size"])
+                logger.info(f"🔪 强平{round_i + 1}/6: {close_side} {live_sz}张 {pos['posSide']} reduceOnly")
                 deepcoin_client.place_market_order(
-                    self.symbol, close_side, residual["posSide"], residual_sz, reduce_only=True,
+                    self.symbol, close_side, pos["posSide"], live_sz, reduce_only=True,
                 )
-                time.sleep(1.0)
+                time.sleep(0.5)  # 每个方向之间短暂间隔
+            time.sleep(1.5)  # 轮次之间等待成交
+
+        # 清理残余持仓（蚂蚁仓扫尾）
+        if not closed_successfully:
+            all_residual = self._get_all_positions()
+            if all_residual:
+                total_residual = sum(self._safe_qty(p["size"]) for p in all_residual)
+                # 对每方向分别处理
+                for residual in all_residual:
+                    residual_sz = self._safe_qty(residual["size"])
+                    if residual_sz > 0:
+                        if self._is_dust_qty(residual_sz):
+                            close_side = "sell" if residual["posSide"] == "long" else "buy"
+                            logger.warning(f"🐜 蚂蚁仓扫尾: {close_side} {residual_sz}张 {residual['posSide']}")
+                            deepcoin_client.place_market_order(
+                                self.symbol, close_side, residual["posSide"], residual_sz, reduce_only=True,
+                            )
+                            time.sleep(1.0)
+                        else:
+                            logger.warning(f"⚠️ 残仓: {residual['posSide']} {residual_sz}张 非蚂蚁量级")
                 closed_successfully = self._verify_flat()
+
             if not closed_successfully:
-                residual = self._get_active_position()
-                residual_sz = self._safe_qty(residual["size"]) if residual else 0
-                logger.error(f"❌ 6 轮强平后仍有残单: {residual_sz}张")
+                all_residual = self._get_all_positions()
+                residual_info = ", ".join(
+                    f"{p['posSide']}:{self._safe_qty(p['size'])}张" for p in all_residual
+                ) if all_residual else "无"
+                logger.error(f"❌ 6 轮强平后仍有残单: {residual_info}")
                 dingtalk.report_system_alert(
                     "强平未完全归零",
-                    f"6 轮市价平仓后仍剩 {residual_sz} 张，请人工核查 Deepcoin 盘口",
+                    f"6 轮市价平仓后仍剩: {residual_info}，请人工核查 Deepcoin 盘口",
                 )
 
         if reset_state:
