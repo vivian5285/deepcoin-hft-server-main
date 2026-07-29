@@ -48,16 +48,17 @@ class AccountThrottle:
         self._window: List[float] = []
         self._silence_until = 0.0
         self._silence_reason = ""
-        # 1 分钟滑动窗口：同 IP 目标远低于 2400/min（默认 24）
-        self.budget_per_min = _env_int("API_BUDGET_PER_MIN", 24)
+        # v16.10+：预算放宽到 60 req/min（比 Binance 2400 的 2.5% 更宽松）
+        # Deepcoin 的实际限制远比 Binance 宽松，实盘验证 60 足以覆盖正常操作
+        self.budget_per_min = _env_int("API_BUDGET_PER_MIN", 60)
         self.window_sec = _env_float("API_BUDGET_WINDOW_SEC", 60.0)
         # 接近预算时拉长间隔；探针更早拒绝，给下单留额度
-        self.soft_ratio = _env_float("API_BUDGET_SOFT_RATIO", 0.60)
-        # 静默期缩短：rate_limit 触发时 60s，避免长时间无法查询盘口
-        self.default_silence_sec = _env_float("API_SILENCE_SEC", 60.0)
-        self.rate_limit_silence_sec = _env_float("API_RATE_LIMIT_SILENCE_SEC", 60.0)
+        self.soft_ratio = _env_float("API_BUDGET_SOFT_RATIO", 0.70)
+        # v16.10+：静默期缩短到 30s（rate_limit 触发后快速恢复）
+        self.default_silence_sec = _env_float("API_SILENCE_SEC", 30.0)
+        self.rate_limit_silence_sec = _env_float("API_RATE_LIMIT_SILENCE_SEC", 30.0)
         # 任意两次 acquire 的硬下限（秒），防止 sleep-gap 被并发打穿
-        self.min_gap_sec = _env_float("API_MIN_GAP_SEC", 1.8)
+        self.min_gap_sec = _env_float("API_MIN_GAP_SEC", 0.5)
         self._last_acquire_ts = 0.0
 
     def remaining_silence(self) -> float:
@@ -106,13 +107,15 @@ class AccountThrottle:
             n = len(self._window)
             budget = max(4, int(self.budget_per_min))
             soft = max(1, int(budget * float(self.soft_ratio)))
-            # 探针在接近预算时优先拒绝，给交易类请求留额度
+            # v16.10+：交易类操作（开仓/止损/TP/撤单）强制模式跳过所有等待
+            is_critical_trade = (kind == "rest_trade" and force)
             if kind in ("rest_probe", "rest_public") and n >= soft:
                 return False, f"probe_budget:{n}/{budget}"
+            # 交易关键操作用 force=True 跳过所有软等待（仍受硬静默期约束）
             if n >= budget and not force:
                 return False, f"budget:{n}/{budget}"
             wait = 0.0
-            if n >= soft:
+            if not is_critical_trade and n >= soft:
                 wait = min(3.0, 0.4 + 0.12 * (n - soft))
             last = float(self._last_acquire_ts or 0)
             gap_need = max(0.0, float(self.min_gap_sec) - (time.time() - last))

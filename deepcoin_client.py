@@ -51,9 +51,10 @@ class DeepcoinClient:
         self._instrument_cache = {}
         self._rest_lock = threading.Lock()
         self._rest_last_ts = 0.0
-        # 任意两次 REST（含公开）硬间隔，默认 1.5s
+        # v16.10+：REST 硬间隔缩短到 0.3s（配合预算放宽）
+        # Deepcoin 限流比 Binance 宽松很多，0.3s 足以避免触发限制
         try:
-            self._rest_min_gap = float(os.getenv("DEEPCOIN_REST_MIN_GAP_SEC", "1.5"))
+            self._rest_min_gap = float(os.getenv("DEEPCOIN_REST_MIN_GAP_SEC", "0.3"))
         except Exception:
             self._rest_min_gap = 1.5
 
@@ -96,14 +97,17 @@ class DeepcoinClient:
             endpoint = "/deepcoin" + (endpoint if endpoint.startswith("/") else "/" + endpoint)
         return endpoint
 
-    def _request(self, method: str, endpoint: str, params: dict = None, _retry: int = 0):
+    def _request(self, method: str, endpoint: str, params: dict = None, _retry: int = 0,
+                 _throttle_kind: str = "rest", _throttle_force: bool = False):
         if not self.api_key or not self.secret_key:
             logger.error("Deepcoin API Key/Secret 未配置，请检查 .env")
             return None
-        # 账号级节流阀（与币安编制一致；限流后强制静默）
+        # 账号级节流阀（交易操作用 force=True 绕过预算限制，但仍受静默期约束）
         try:
             from api_throttle import get_throttle
-            ok, detail = get_throttle("deepcoin").acquire("rest", symbol="")
+            ok, detail = get_throttle("deepcoin").acquire(
+                _throttle_kind, symbol="", force=_throttle_force,
+            )
             if not ok:
                 logger.warning(f"🧊 [Deepcoin节流阀] 拒绝 REST ({detail})")
                 return None
@@ -566,12 +570,13 @@ class DeepcoinClient:
 
     def set_leverage(self, symbol="ETH-USDT-SWAP", leverage=20, mgn_mode="cross", mrg_position="merge"):
         """POST /deepcoin/account/set-leverage"""
+        # v16.10+：设置杠杆用 force=True（开仓前必要操作）
         res = self._request("POST", "/account/set-leverage", {
             "instId": symbol,
             "lever": str(int(leverage)),
             "mgnMode": mgn_mode,
             "mrgPosition": mrg_position,
-        })
+        }, _throttle_kind="rest_trade", _throttle_force=True)
         if res and self._is_success(res):
             logger.info(f"[设置杠杆成功] {symbol} → {leverage}x")
         elif res:
@@ -582,7 +587,8 @@ class DeepcoinClient:
 
     def place_order(self, params: dict):
         """POST /deepcoin/trade/order"""
-        res = self._request("POST", "/trade/order", params)
+        # v16.10+：交易下单用 force=True 绕过预算限制（仍受静默期约束）
+        res = self._request("POST", "/trade/order", params, _throttle_kind="rest_trade", _throttle_force=True)
         if res and not self._is_success(res):
             data = res.get("data") or {}
             logger.error(
@@ -653,7 +659,8 @@ class DeepcoinClient:
         }
         if order_type == "limit" and price is not None:
             params["price"] = self.format_price(price, symbol)
-        return self._request("POST", "/trade/trigger-order", params)
+        # v16.10+：止损/止盈条件单用 force=True（关键防御操作）
+        return self._request("POST", "/trade/trigger-order", params, _throttle_kind="rest_trade", _throttle_force=True)
 
     def set_position_sltp(self, symbol, pos_side, sl_trigger_px=None, tp_trigger_px=None,
                           td_mode="cross", mrg_position="merge", trigger_px_type="last",
@@ -671,7 +678,8 @@ class DeepcoinClient:
             params["tpTriggerPx"] = str(tp_trigger_px)
         if sl_trigger_px is not None:
             params["slTriggerPx"] = str(sl_trigger_px)
-        return self._request("POST", "/trade/set-position-sltp", params)
+        # v16.10+：止盈止损设置用 force=True
+        return self._request("POST", "/trade/set-position-sltp", params, _throttle_kind="rest_trade", _throttle_force=True)
 
     def cancel_order(self, symbol, ord_id=None, cl_ord_id=None):
         """POST /deepcoin/trade/cancel-order"""
@@ -736,7 +744,8 @@ class DeepcoinClient:
         return []
 
     def _safe_cancel(self, endpoint, params):
-        res = self._request("POST", endpoint, params)
+        # v16.10+：撤单用 force=True（关键防御操作）
+        res = self._request("POST", endpoint, params, _throttle_kind="rest_trade", _throttle_force=True)
         if res and str(res.get("code", "")) != "0":
             msg = str(res.get("msg", "")).lower() + str(res.get("sMsg", "")).lower()
             data = res.get("data") or {}
@@ -745,7 +754,7 @@ class DeepcoinClient:
             if "too many" in msg or "limit" in msg or "frequent" in msg:
                 logger.warning(f"⚠️ [频率限制] 退避休眠 1.5 秒... | {msg}")
                 time.sleep(1.5)
-                res = self._request("POST", endpoint, params)
+                res = self._request("POST", endpoint, params, _throttle_kind="rest_trade", _throttle_force=True)
             elif "not exist" in msg or "not found" in msg or "already" in msg or "no order" in msg:
                 pass
             else:
