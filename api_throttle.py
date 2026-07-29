@@ -47,12 +47,15 @@ class AccountThrottle:
         self._lock = threading.RLock()
         self._window: List[float] = []
         self._silence_until = 0.0
+        self._silence_reason = ""
         # 1 分钟滑动窗口：同 IP 目标远低于 2400/min（默认 24）
         self.budget_per_min = _env_int("API_BUDGET_PER_MIN", 24)
         self.window_sec = _env_float("API_BUDGET_WINDOW_SEC", 60.0)
         # 接近预算时拉长间隔；探针更早拒绝，给下单留额度
         self.soft_ratio = _env_float("API_BUDGET_SOFT_RATIO", 0.60)
-        self.default_silence_sec = _env_float("API_SILENCE_SEC", 900.0)
+        # 静默期缩短：rate_limit 触发时 60s，避免长时间无法查询盘口
+        self.default_silence_sec = _env_float("API_SILENCE_SEC", 60.0)
+        self.rate_limit_silence_sec = _env_float("API_RATE_LIMIT_SILENCE_SEC", 60.0)
         # 任意两次 acquire 的硬下限（秒），防止 sleep-gap 被并发打穿
         self.min_gap_sec = _env_float("API_MIN_GAP_SEC", 1.8)
         self._last_acquire_ts = 0.0

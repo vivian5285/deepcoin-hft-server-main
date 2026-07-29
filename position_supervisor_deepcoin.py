@@ -5315,12 +5315,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 "pending_prices": [], "rebuilt": False, "audit": audit, "nuclear": False,
             }
 
-        # 【修复】防抖冷却：距离上次防线对齐不足冷却期时，跳过撤挂重试
+        # 【修复】防抖冷却：TP 已对齐时跳过；TP 未对齐时强制补挂
         now = time.time()
         if not recover_mode and not getattr(self, "_force_defense_realign", False):
             last_align = getattr(self, "_last_defense_align_ok_ts", 0) or 0
+            audit = self._audit_tp_levels(live_qty)
             if now - last_align < DEFENSE_ALIGN_COOLDOWN_SEC:
-                audit = self._audit_tp_levels(live_qty)
                 if self._tp_audit_ok(audit):
                     logger.info(
                         f"🛡️ 防线对齐冷却中（距上次 {now - last_align:.0f}s < {DEFENSE_ALIGN_COOLDOWN_SEC}s）"
@@ -5334,18 +5334,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         "audit": audit,
                         "nuclear": False,
                     }
-                logger.info(
+                # 【关键修复】TP 未对齐时，即使在冷却期也必须补挂
+                logger.warning(
                     f"🛡️ 防线对齐冷却中（距上次 {now - last_align:.0f}s < {DEFENSE_ALIGN_COOLDOWN_SEC}s）"
-                    f"，跳过撤挂重试"
+                    f"，但 TP 未对齐 → 强制补挂 | {self._format_audit_summary(audit)}"
                 )
-                return {
-                    "matched": 0,
-                    "expected": self._audit_tp_levels(live_qty).get("expected", 0),
-                    "pending_prices": [],
-                    "rebuilt": False,
-                    "audit": self._audit_tp_levels(live_qty),
-                    "nuclear": False,
-                }
 
         if reason:
             logger.info(f"🛡️ 防线对齐: {reason} | 持仓 {live_qty}张")

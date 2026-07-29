@@ -132,10 +132,14 @@ class DeepcoinClient:
                 msg = str(data.get("msg", ""))
                 logger.error(f"Deepcoin API 错误 {method} {request_path} | code={data.get('code')} msg={msg}")
                 low = msg.lower()
+                # rate_limit 触发时静默 60s，避免长时间无法查询盘口导致开仓失败
                 if any(k in low for k in ("rate", "too many", "429", "limit", "频繁")):
                     try:
                         from api_throttle import get_throttle
-                        get_throttle("deepcoin").enter_silence(reason="deepcoin_rate")
+                        get_throttle("deepcoin").enter_silence(
+                            seconds=get_throttle("deepcoin").rate_limit_silence_sec,
+                            reason="deepcoin_rate_limit"
+                        )
                     except Exception:
                         pass
                 # 签名/时间戳类错误自动重试一次
@@ -171,7 +175,10 @@ class DeepcoinClient:
             ):
                 try:
                     from api_throttle import get_throttle
-                    get_throttle("deepcoin").enter_silence(reason="deepcoin_public_rate")
+                    get_throttle("deepcoin").enter_silence(
+                        seconds=get_throttle("deepcoin").rate_limit_silence_sec,
+                        reason="deepcoin_public_rate_limit"
+                    )
                 except Exception:
                     pass
             return data
