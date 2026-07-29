@@ -5155,6 +5155,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.current_sl = float(self.tv_sl)
             self._radar_armed_after_tp1 = False
             self._ws_tp1_fill_hint = False
+            gate = float(self._radar_activation_price() or 0)
             logger.info(
                 f"📡 重启雷达待命: 等待价格到达TP1-TP2中点(阈值{gate:.2f}) "
                 f"(进度 {self._radar_activation_progress(curr_px):.0%})"
