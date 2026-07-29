@@ -1235,26 +1235,38 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return self._shield_stop_price()
 
     def _normalize_tp_qty_map(self, qty_map, live_qty):
-        """不足最小张数的小档合并到最后一档，避免 TP3 被静默丢弃"""
+        """
+        规格 v1.0 §6.2 蚂蚁单处理 + §9.4 零头并入：
+        不足最小张数(MIN_TP_LEG_QTY)的非TP3档零头，全部并入TP3（雷达管理的70%仓位）。
+        不满足最小下单量的非TP3档直接市价平仓，不挂单。
+        """
         if not qty_map:
             return qty_map
         live_qty = int(live_qty or 0)
         levels = sorted(qty_map.keys())
         if len(levels) <= 1:
             return qty_map
-        out = dict(qty_map)
+
+        # 最后一档默认是 TP3（key=3），但健壮处理任何情况
+        last_level = levels[-1]
+
         carry = 0
-        last = levels[-1]
-        for lvl in levels[:-1]:
+        out = dict(qty_map)
+        for lvl in levels[:-1]:  # TP1, TP2（不碰 TP3）
             q = int(out.get(lvl, 0) or 0)
             if 0 < q < MIN_TP_LEG_QTY:
                 carry += q
-                out[lvl] = 0
+                out[lvl] = 0  # 不挂单，留给市价平仓
+
+        # 零头并入 TP3（雷达管理的 70%）
         if carry > 0:
-            out[last] = int(out.get(last, 0) or 0) + carry
+            out[last_level] = int(out.get(last_level, 0) or 0) + carry
+
+        # 总数不能超过实际持仓
         total = sum(int(out.get(l, 0) or 0) for l in levels)
         if total > live_qty:
-            out[last] = max(int(out.get(last, 0) or 0) - (total - live_qty), MIN_TP_LEG_QTY)
+            out[last_level] = max(int(out.get(last_level, 0) or 0) - (total - live_qty), 0)
+
         return out
 
     def _ensure_full_defense_stack(self, live_qty, entry, curr_px, source="接管", manual_fresh=False):
@@ -2896,6 +2908,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if lv["status"] != "ok":
                 line += f"({lv['status']})"
             parts.append(line)
+
+        # 规格 v1.0：tv_tps 全零时说明 TP 价格未初始化（TV 信号缺字段 / 重启恢复失败）
+        if not parts:
+            tv_tps = getattr(self, "tv_tps", None) or []
+            if all((float(t or 0) <= 0) for t in tv_tps):
+                parts.append("⚠️ TP价格未初始化（tv_tps=全零）")
+            else:
+                parts.append("⚠️ 无有效限价TP（仓位<MIN_TP_LEG_QTY或价格缺失）")
+
         if audit.get("issues"):
             parts.append("问题:" + "; ".join(audit["issues"][:3]))
         return " | ".join(parts) if parts else "无有效 TP"
@@ -6395,9 +6416,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 return
             if is_close:
                 self.monitoring = False
-            if raw_action == "CLOSE_PROTECT" or raw_action.startswith("CLOSE_PROTECT"):
+            if raw_action in ("CLOSE_PROTECT", "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT") or raw_action.startswith("CLOSE_PROTECT"):
                 pos = self._get_active_position()
-                tv_reason = close_reason or "保护性全平"
+                tv_reason = close_reason or ("保护性全平" if "PROTECT" in raw_action else f"TV平仓:{raw_action}")
                 if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
                     logger.info(f"🛡️ 保护性全平到达但盘口已空仓 → 撤单复位 | {tv_reason}{close_extra}")
                     self._handle_manual_flat_detected(
@@ -7833,9 +7854,36 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         consumed = getattr(self, "tp_levels_consumed", []) or []
         placed = 0
 
+        # 规格 v1.0 §6 保护：tv_tps 全零说明 TP 价格从未被正确初始化（TV 信号缺字段 / 重启恢复失败）。
+        # 用 open_atr + open_regime 做紧急 fallback，不让仓位裸奔。
+        if self.tv_tps and all(float(t or 0) <= 0 for t in self.tv_tps):
+            if self.current_side and entry > 0:
+                atr = float(getattr(self, "open_atr", None) or self.current_atr or 0)
+                regime = int(getattr(self, "open_regime", None) or self.regime or 3)
+                if atr > 0:
+                    from webhook_parser import enrich_entry_tp_prices
+                    payload = enrich_entry_tp_prices(self.current_side, entry, atr, regime, {})
+                    tps = [
+                        self._safe_float(payload.get("tv_tp1"), 0),
+                        self._safe_float(payload.get("tv_tp2"), 0),
+                        self._safe_float(payload.get("tv_tp3"), 0),
+                    ]
+                    self.tv_tps = self._sanitize_tp_prices(tps)
+                    logger.warning(
+                        f"⚠️ tv_tps=全零 → ATR紧急Fallback TP123={self.tv_tps} "
+                        f"| entry={entry:.2f} ATR={atr:.2f} R{regime}"
+                    )
+                    dingtalk.report_system_alert(
+                        "TP价格缺失·ATR紧急Fallback",
+                        f"tv_tps全零 | {self.current_side} {live_qty}张 @ {entry:.2f} | "
+                        f"ATR={atr:.2f} R{regime} → 强制Fallback {self.tv_tps}",
+                        suggestion="请确认 TV 策略开仓消息包含 tp1/tp2/tp3 字段",
+                    )
+                    self._save_state()
+
         logger.info(
             f"🕸️ 补挂 TP: 总 {live_qty}张 | 已成交 TP{consumed or '无'} | "
-            f"R{self._tp_split_regime()} 剩余档"
+            f"R{self._tp_split_regime()}"
         )
 
         for lv in self._expected_tp_levels(live_qty):
