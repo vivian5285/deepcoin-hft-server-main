@@ -590,6 +590,30 @@ class DeepcoinClient:
             logger.warning(f"[设置杠杆失败] {symbol} → {leverage}x | {res}")
         return res
 
+    def set_position_mode(self, symbol="ETH-USDT-SWAP", mode="both"):
+        """
+        POST /deepcoin/account/set-position-mode
+        mode: "both" = 双向持仓（对冲模式），"single" = 单向持仓
+        必须在开仓前设置为 "both"，否则市价平仓会用反向单，可能导致净开仓而非平仓。
+        """
+        product_group = self.swap_product_group(symbol)
+        res = self._request("POST", "/account/set-position-mode", {
+            "instId": symbol,
+            "positionMode": mode,   # "both" = 对冲/双向持仓
+        }, _throttle_kind="rest_trade", _throttle_force=True)
+        if res and self._is_success(res):
+            logger.info(f"[持仓模式设置成功] {symbol} → {mode}")
+        elif res:
+            logger.warning(f"[持仓模式设置失败] {symbol} → {mode} | {res}")
+        return res
+
+    def get_position_mode(self, symbol="ETH-USDT-SWAP"):
+        """GET /deepcoin/account/position-mode — 查询当前持仓模式"""
+        res = self._request("GET", "/account/position-mode", {
+            "instId": symbol,
+        })
+        return res
+
     # ── 下单 / 撤单 ──────────────────────────────────────────────
 
     def place_order(self, params: dict):

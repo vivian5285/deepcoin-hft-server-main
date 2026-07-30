@@ -10,8 +10,8 @@ logger = logging.getLogger(__name__)
 
 TV_STRATEGY_VERSION = "v6.9.108"
 
-# 交易所实盘杠杆（双品种文档统一 25x，与币安一致）
-EXCHANGE_LEVERAGE = 25
+# VPS 实盘杠杆（规格 §3：账户权益 × 20% × 5）
+EXCHANGE_LEVERAGE = 5
 VPS_MARGIN_LEVERAGE = 1
 
 # VPS 自主风控（与 TV risk_pct / qty_ratio 完全脱钩）

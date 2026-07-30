@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.15-acked-gc"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.16-hedge-mode"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -163,6 +163,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 logger.info(f"📐 {self.symbol} face_value={ct} (instruments)")
         except Exception as e:
             logger.warning(f"face_value instruments 失败，用 meta {self.face_value}: {e}")
+
+        # v16.16：启动时强制设置双向持仓模式（对冲模式），防止平仓变反向开仓
+        try:
+            deepcoin_client.set_position_mode(self.symbol, mode="both")
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] 持仓模式设置失败: {e}")
+
         self.binance_mark = meta.get("binance_mark") or "ETHUSDT"
         self.monitoring = False
         self._lock = threading.Lock()
@@ -7513,6 +7520,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             return
 
+        deepcoin_client.set_position_mode(self.symbol, mode="both")
         deepcoin_client.set_leverage(self.symbol, leverage=EXCHANGE_LEVERAGE)
         logger.info(
             f"➕ [{entry_type}] {action} 追加 {add_qty} 张 | "
@@ -7693,6 +7701,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 logger.error(f"开仓跳过：目标张数无效 balance={balance:.2f} px={curr_px}")
                 return
 
+            deepcoin_client.set_position_mode(self.symbol, mode="both")
             deepcoin_client.set_leverage(self.symbol, leverage=EXCHANGE_LEVERAGE)
             notional = qty * self.face_value * curr_px
             budget_txt = format_vps_sizing_note(sizing_meta, qty=qty, entry_type=ENTRY_TYPE_OPEN)
