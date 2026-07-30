@@ -4920,7 +4920,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     total += 1
                     time.sleep(0.12)
             logger.info(f"🧹 撤限价止盈 第{round_i + 1}轮: {len(orders)} 张")
-            time.sleep(0.6)
+            # 【关键修复】增加等待时间确保撤销完成（从0.6秒改为1.5秒）
+            time.sleep(1.5)
         if total:
             logger.info(f"🧹 已撤销限价止盈合计 {total} 张")
         return total
@@ -8104,7 +8105,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return 0
 
         self._cancel_all_tp_limit_orders()
-        time.sleep(0.35)
+        # 【关键修复】增加等待时间确保撤销完成（从0.35秒改为2秒）
+        time.sleep(2.0)
 
         if live_qty != qty:
             self.watched_qty = live_qty
