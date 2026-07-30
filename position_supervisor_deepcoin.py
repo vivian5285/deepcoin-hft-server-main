@@ -4806,6 +4806,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if save:
                 self._save_state()
 
+    def _gc_stale_pending_defense_tags_on_startup(self):
+        """
+        v16.14（根因一修复）：VPS重启时安全清理所有旧标签。
+        重启前旧 VPS 进程已终止，其挂的单（不管成交/失败/撤销）都无法再被确认。
+        若不清理，_pending_order_tags 会残留旧标签永久阻止挂新单。
+        """
+        tags = dict(getattr(self, "_pending_order_tags", {}) or {})
+        if not tags:
+            return
+        dropped = []
+        for tag, meta in list(tags.items()):
+            dropped.append(f"{tag}({meta.get('kind','?')}/{meta.get('status','?')}/{meta.get('order_id','no-oid')})")
+        self._pending_order_tags = {}
+        logger.warning(
+            f"[{self.symbol}] v16.14 重启清理旧标签 {len(dropped)} 个: {dropped[:8]}"
+            f"{'…' if len(dropped) > 8 else ''}"
+        )
+        self._save_state()
+
     def _gc_stale_pending_defense_tags(self, max_pending_age_sec=45.0, save=True):
         """清理陈旧防御单本地标签（超时/已完成）。"""
         tags = dict(getattr(self, "_pending_order_tags", {}) or {})
@@ -4867,10 +4886,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             try:
                 order_res = deepcoin_client.get_order(self.symbol, ord_id=oid)
                 if order_res:
-                    state = str(order_res.get("state", "") or order_res.get("status", "")).lower()
-                    if state in ("filled", "cancelled", "canceled", "done", "完全成交", "已撤"):
+                    state = str(order_res.get("state", "") or order_res.get("status", "")).lower().strip()
+                    # v16.14（根因一修复）：空状态/查不到订单视为已撤销
+                    # 订单在交易所侧已不存在（已成交被移除、已撤销、已过期、或从未成功提交）
+                    if state in ("filled", "cancelled", "canceled", "done", "完全成交", "已撤", ""):
+                        reason = "已终态" if state else "交易所侧不存在"
                         logger.info(
-                            f"[{self.symbol}] 标签 {tag} 的订单 {oid} 已在交易所侧 {state}，确认可清理"
+                            f"[{self.symbol}] 标签 {tag} 的订单 {oid} 状态=[{state or 'N/A'}]，{reason}，确认可清理"
                         )
                         return True
                     # 状态未知或非终态，不清理
@@ -4878,6 +4900,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         f"[{self.symbol}] 标签 {tag} 的订单 {oid} 仍在 {state}，拒绝清理"
                     )
                     return False
+                else:
+                    # v16.14（根因一修复）：order_res 为空（订单不存在/网络异常）→ 视为已撤销
+                    logger.warning(
+                        f"[{self.symbol}] 标签 {tag} 的订单 {oid} 交易所侧无记录，视为已撤销，确认可清理"
+                    )
+                    return True
             except Exception as e:
                 logger.warning(f"[{self.symbol}] 查询订单 {oid} 状态失败: {e}，拒绝清理")
                 return False
@@ -5422,6 +5450,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 f"当前 {last_audit['matched_full']}/{last_audit['expected']} | "
                 f"{self._format_audit_summary(last_audit)}"
             )
+            # v16.14（根因一修复）：核武每轮开始前清理所有本地标签
+            # 旧 VPS 重启/断线导致的残留标签、或前一轮已挂成功的订单对应的标签，
+            # 都不应阻止本轮重建。核武必须"无条件全清"后重挂。
+            self._pending_order_tags = {}
+            self._save_state()
             self._cancel_all_tp_limit_orders()
             time.sleep(1.0)
             placed = self._rebuild_defenses(live_qty, entry, dynamic_sl=None)
@@ -8526,6 +8559,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self.ownership_locked_at = float(s.get("ownership_locked_at", 0) or 0)
                     raw_tags = s.get("pending_order_tags") or {}
                     self._pending_order_tags = dict(raw_tags) if isinstance(raw_tags, dict) else {}
+                    # v16.14（根因一修复）：重启时清理陈旧标签，避免旧单残留阻止新单挂载
+                    self._gc_stale_pending_defense_tags_on_startup()
                     self._mutex_leg = str(s.get("mutex_leg", "") or "")
                     if self.sizing_principal <= 0:
                         eq = deepcoin_client.get_principal_wallet_balance()
