@@ -1695,46 +1695,65 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         except (TypeError, ValueError):
             return default
 
-    def _get_active_position(self):
+    def _get_active_position(self, prefer_ws=False):
         # 限流重试：关键持仓查询增加重试，避免静默期返回None导致开仓失败
-        for attempt in range(3):
-            res = deepcoin_client.get_position_info(self.symbol)
-            if res and 'data' in res:
-                for p in res['data']:
-                    if self._safe_qty(p.get("pos")) > 0:
-                        return {
-                            "size": self._safe_qty(p.get("pos")),
-                            "entry_price": round(float(p.get("avgPx", p.get("price", 0)) or 0), 2),
-                            "posSide": p.get("posSide", "long").lower(),
-                        }
-                return None
-            if attempt < 2:
-                time.sleep(0.5)
+        # prefer_ws参数保留兼容性但目前不实际使用WebSocket
+        for attempt in range(5):
+            try:
+                res = deepcoin_client.get_position_info(self.symbol)
+                if res and isinstance(res.get('data'), list):
+                    for p in res['data']:
+                        if self._safe_qty(p.get("pos")) > 0:
+                            return {
+                                "size": self._safe_qty(p.get("pos")),
+                                "entry_price": round(float(p.get("avgPx", p.get("price", 0)) or 0), 2),
+                                "posSide": p.get("posSide", "long").lower(),
+                            }
+                    return None
+                # API返回空数据也返回None
+                if res is not None:
+                    return None
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] 获取持仓异常: {e}")
+            if attempt < 4:
+                time.sleep(0.5 + attempt * 0.3)
         return None
 
     def _get_all_positions(self):
         """获取所有方向的持仓（对冲模式下可能同时有多空持仓）"""
-        # 限流重试
-        for attempt in range(3):
+        # 限流重试 + 静默期等待（防止限流导致查不到仓位拒绝开仓）
+        for attempt in range(5):
             positions = []
-            res = deepcoin_client.get_position_info(self.symbol)
-            if res and 'data' in res:
-                for p in res['data']:
-                    qty = self._safe_qty(p.get("pos"))
-                    if qty > 0:
-                        positions.append({
-                            "size": qty,
-                            "entry_price": round(float(p.get("avgPx", p.get("price", 0)) or 0), 2),
-                            "posSide": p.get("posSide", "long").lower(),
-                        })
-                return positions
-            if attempt < 2:
-                time.sleep(0.5)
+            try:
+                res = deepcoin_client.get_position_info(self.symbol)
+                if res and isinstance(res.get('data'), list):
+                    for p in res['data']:
+                        qty = self._safe_qty(p.get("pos"))
+                        if qty > 0:
+                            positions.append({
+                                "size": qty,
+                                "entry_price": round(float(p.get("avgPx", p.get("price", 0)) or 0), 2),
+                                "posSide": p.get("posSide", "long").lower(),
+                            })
+                    return positions
+                # API返回空数据也返回空列表，不重试
+                if res is not None:
+                    return []
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] 获取持仓异常: {e}")
+            if attempt < 4:
+                time.sleep(0.5 + attempt * 0.3)
         return []
 
     def _verify_flat(self):
-        """验证所有方向的持仓都已清空（对冲模式兼容）"""
-        positions = self._get_all_positions()
+        """验证所有方向的持仓都已清空（对冲模式兼容）- 带重试防止限流误判"""
+        # 静默期/限流时重试等待，避免误判导致光平仓不开仓
+        for attempt in range(3):
+            positions = self._get_all_positions()
+            if len(positions) == 0:
+                return True
+            if attempt < 2:
+                time.sleep(0.3 + attempt * 0.2)
         return len(positions) == 0
 
     def _ensure_flat_before_open(self, reason_tag="开仓前"):
@@ -3556,6 +3575,26 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0:
             return 0
+
+        # 【关键修复】先撤销所有旧TP订单，等待确认完成后再挂新单
+        # 防止旧单未撤干净导致重复挂单
+        self._cancel_all_tp_limit_orders(max_rounds=4)
+        time.sleep(1.0)  # 等待撤销确认
+        # 验证旧单已全部撤销
+        existing_before = self._collect_tp_limit_orders()
+        if existing_before:
+            logger.warning(
+                f"[{self.symbol}] 挂新TP前检测到{len(existing_before)}张旧单未撤干净，等待..."
+            )
+            time.sleep(2.0)
+            existing_before = self._collect_tp_limit_orders()
+            if existing_before:
+                prices = [f"@{o['price']:.2f}" for o in existing_before]
+                logger.error(
+                    f"[{self.symbol}] 旧TP仍未撤净，放弃本次挂单: {prices}"
+                )
+                return 0
+
         placed = 0
         for lv in self._expected_tp_levels(live_qty):
             level = int(lv.get("level") or 0)
@@ -3565,17 +3604,43 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             q, px = float(lv["qty"] or 0), float(lv["price"] or 0)
             if q <= 0 or px <= 0:
                 continue
+
+            # 【关键修复】挂单前必须再次确认交易所侧没有该档的TP订单
+            existing_orders = self._collect_tp_limit_orders()
+            at_px_existing = [o for o in existing_orders if abs(o.get("price", 0) - px) <= 1.0]
+            if at_px_existing:
+                logger.warning(
+                    f"[{self.symbol}] 交易所侧已有 TP@{px:.2f} ({len(at_px_existing)}张)，复用现有订单"
+                )
+                # 复用交易所侧已有订单，不挂新单
+                existing = at_px_existing[0]
+                existing_oid = str(existing.get("ordId") or existing.get("orderId") or "")
+                if existing_oid:
+                    tag = make_defense_client_order_id(self.symbol, kind, px)
+                    self._register_pending_defense_tag(tag, kind, price=px, order_id=existing_oid)
+                    self._save_state()
+                continue
+
             # 幂等标签拦截（规格 v1.0 §8-9）
-            # v16.11（根因二修复）：标签残留时，必须先确认原订单已失败/超时才能清
-            # 有 order_id → 查交易所侧真实状态；无 order_id → 必须陈旧≥45s
+            # 【关键修复】有未完成标签时，必须确认交易所侧没有对应订单才能清理
             blocked, tag0, meta0 = self._has_open_pending_defense_tag(kind)
             if blocked:
                 logger.warning(
                     f"[{self.symbol}] 本地未完成标签 tag={tag0} kind={kind} → "
                     f"开始核实原订单是否已失败 | px={px:.2f}"
                 )
-                # 无 order_id 且陈旧≥45s → 直接确认可清（GC 已放过，说明确实陈旧）
-                if not meta0.get("order_id"):
+                # 有 order_id → 查交易所侧
+                if meta0.get("order_id"):
+                    if not self._confirm_stale_before_clear(tag0, meta0):
+                        logger.warning(
+                            f"[{self.symbol}] 标签 {tag0} 对应订单仍在处理中 → 拒绝清理，本次跳过"
+                        )
+                        continue
+                    self._complete_pending_defense_tag(tag=tag0)
+                    self._save_state()
+                    time.sleep(0.15)
+                else:
+                    # 无 order_id（仅有本地标签）
                     age = time.time() - float(meta0.get("ts", 0) or 0)
                     if age >= 45.0:
                         logger.warning(
@@ -3590,16 +3655,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             f"拒绝清理（可能还在处理中），本次跳过"
                         )
                         continue
-                else:
-                    # 有 order_id → 查交易所侧
-                    if not self._confirm_stale_before_clear(tag0, meta0):
-                        logger.warning(
-                            f"[{self.symbol}] 标签 {tag0} 对应订单仍在处理中 → 拒绝清理，本次跳过"
-                        )
-                        continue
-                    self._complete_pending_defense_tag(tag=tag0)
-                    self._save_state()
-                    time.sleep(0.15)
+
             tag = make_defense_client_order_id(self.symbol, kind, px)
             self._register_pending_defense_tag(tag, kind, price=px)
             try:
@@ -3715,20 +3771,28 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return
 
         cancelled = self._cancel_all_tp_limit_orders(max_rounds=4)
-        time.sleep(0.45)
+        time.sleep(1.5)  # 【关键修复】增加等待时间确保撤销完成
         leftover = self._collect_tp_limit_orders()
         if leftover:
-            logger.error(
-                f"UPDATE_TP 撤旧 TP 未净（剩 {len(leftover)}）→ 放弃挂新单，等待下次"
+            logger.warning(
+                f"UPDATE_TP 撤旧 TP 未净（剩 {len(leftover)}）→ 再次尝试撤销"
             )
-            dingtalk.report_system_alert(
-                "UPDATE_TP 撤单失败",
-                f"旧限价 TP 未清净 {len(leftover)} 张，未挂新价，硬止损/雷达未动",
-            )
-            if old_tps and sum(1 for t in old_tps if float(t or 0) > 0) >= 2:
-                self.tv_tps = self._sanitize_tp_prices(old_tps)
-                self._save_state()
-            return
+            # 【关键修复】旧单未撤净，追加一轮撤销
+            self._cancel_all_tp_limit_orders(max_rounds=3)
+            time.sleep(1.5)
+            leftover = self._collect_tp_limit_orders()
+            if leftover:
+                logger.error(
+                    f"UPDATE_TP 撤旧 TP 仍未净（剩 {len(leftover)}）→ 放弃挂新单，等待下次"
+                )
+                dingtalk.report_system_alert(
+                    "UPDATE_TP 撤单失败",
+                    f"旧限价 TP 未清净 {len(leftover)} 张，未挂新价，硬止损/雷达未动",
+                )
+                if old_tps and sum(1 for t in old_tps if float(t or 0) > 0) >= 2:
+                    self.tv_tps = self._sanitize_tp_prices(old_tps)
+                    self._save_state()
+                return
 
         placed = self._place_tp_levels_only(live_qty, retries=2)
         time.sleep(0.5)
@@ -4755,12 +4819,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             age = (now - ts) if ts > 0 else 9999.0
             if st in ("done", "filled", "cancelled", "canceled"):
                 tags.pop(tag, None)
-                dropped.append(f"{tag}:done")
+                dropped.append(f"{tag}:{st}")
                 continue
-            if oid:
-                tags.pop(tag, None)
-                dropped.append(f"{tag}:acked")
-                continue
+            # 【BUG修复】有 order_id 不代表订单已完成！
+            # 订单已提交（有 order_id）但尚未终态，不能清理标签
+            # 必须等收到成交/撤销确认，或订单超时（由 _confirm_stale_before_clear 处理）才能清理
+            # if oid:
+            #     tags.pop(tag, None)
+            #     dropped.append(f"{tag}:acked")
+            #     continue
             if st == "pending" and age >= float(max_pending_age_sec or 45.0):
                 tags.pop(tag, None)
                 dropped.append(f"{tag}:stale:{age:.0f}s")
@@ -4834,16 +4901,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         want = str(kind or "").upper()
         for tag, meta in dict(getattr(self, "_pending_order_tags", {}) or {}).items():
             st = str((meta or {}).get("status") or "open").lower()
-            if st in ("done", "filled", "cancelled", "canceled", "acked"):
+            # 【BUG修复】只要状态不是终态，无论有没有 order_id，都算未完成
+            if st in ("done", "filled", "cancelled", "canceled"):
                 continue
             k = str((meta or {}).get("kind") or "").upper()
             if want and k != want and not k.startswith(want):
                 continue
-            oid = str((meta or {}).get("order_id") or "").strip()
-            if oid:
-                continue
-            if st == "pending":
-                return True, tag, meta
+            # 有未完成的标签（可能只有本地 pending 或已有 order_id 但未终态）
+            return True, tag, meta
         return False, "", {}
 
     def _register_pending_defense_tag(self, tag, kind, price=0.0, order_id=""):
@@ -7013,8 +7078,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._last_partial_resize_ts = now
         self._partial_resize_pending = False
         try:
-            pos = self._get_active_position(prefer_ws=True)
-            if pos == "QUERY_FAILED":
+            pos = self._get_active_position()
+            if pos == "QUERY_FAILED" or pos is None:
                 self._partial_resize_pending = True
                 logger.warning(
                     f"⏳ [{self.symbol}] 部分成交核算跳过·持仓不可读 | {source}"
@@ -8194,7 +8259,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     )
                     # 更新标签，不挂新单
                     existing = at_px_existing[0]
-                    existing_oid = str(existing.get("ordId") or "")
+                    existing_oid = str(existing.get("orderId") or existing.get("ordId") or "")
                     if existing_oid:
                         self._register_pending_defense_tag(
                             make_defense_client_order_id(self.symbol, kind, px),

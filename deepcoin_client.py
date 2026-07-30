@@ -524,8 +524,14 @@ class DeepcoinClient:
         return variants
 
     def get_position_info(self, symbol="ETH-USDT-SWAP"):
-        """持仓查询：静默期等待，不阻塞开仓流程（v16.10.1修复）"""
-        return self._request("GET", "/account/positions", {"instType": "SWAP", "instId": symbol}, _throttle_kind="rest_query")
+        """持仓查询：静默期等待，不阻塞开仓流程（v16.10.1修复）
+        【v16.12修复】限流时返回空数据而非None，避免调用方误判
+        """
+        res = self._request("GET", "/account/positions", {"instType": "SWAP", "instId": symbol}, _throttle_kind="rest_query")
+        # 限流时返回空数据结构，避免调用方因None判断失误
+        if res is None:
+            return {"code": "0", "data": []}
+        return res
 
     def get_all_swap_position_notionals(self):
         """
