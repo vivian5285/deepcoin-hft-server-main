@@ -713,6 +713,15 @@ def normalize_tv_payload(data):
     regime = _to_int(src.get("regime") or src.get("adx_regime"))
     atr = _to_float(src.get("atr") or src.get("ATR"))
 
+    # P0 修复：tier / tier_label 从 TV webhook 读取（不依赖本地 ATR 推算）
+    tier = _to_int(src.get("tier") or src.get("adx_tier") or src.get("radar_tier"))
+    tier_label = str(
+        src.get("tier_label")
+        or src.get("adx_tier_label")
+        or src.get("radar_tier_label")
+        or ""
+    ).strip()
+
     tv_tp1 = _to_float(src.get("tv_tp1") or src.get("tp1") or src.get("TP1"))
     tv_tp2 = _to_float(src.get("tv_tp2") or src.get("tp2") or src.get("TP2"))
     tv_tp3 = _to_float(src.get("tv_tp3") or src.get("tp3") or src.get("TP3"))
@@ -758,6 +767,10 @@ def normalize_tv_payload(data):
         out["regime"] = regime
     if atr is not None:
         out["atr"] = atr
+    if tier is not None:
+        out["tier"] = tier
+    if tier_label:
+        out["tier_label"] = tier_label
     if tv_tp1 is not None:
         out["tv_tp1"] = tv_tp1
     if tv_tp2 is not None:

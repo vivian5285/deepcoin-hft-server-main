@@ -15,6 +15,7 @@ from pipeline_bridge import PipelineBridgeMixin
 from pipeline_ledger import Role
 from radar_reentry_mixin import RadarReentryMixin
 import dingtalk
+import telegram_notify
 from tv_seq import (
     reorder_batch_close_then_open,
     extract_seq_meta,
@@ -266,6 +267,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.early_be_done = False
         self.breathing_coefficient = 1.0
         self._breath_ratio_history = []
+        self._last_tier_label = ""  # P0：tier_label 从 webhook 透传
 
         # 自动重入相关字段（v1.0 规格对齐）
         self.adx_tier = 1
@@ -646,8 +648,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 k: v for k, v in kwargs.items()
                 if k not in ("verified", "swept_dust", "radar_sl_ok", "action_type")
             }
-            logger.warning(f"钉钉旧版降级播报 {getattr(fn, '__name__', 'dingtalk')}: {exc}")
             fn(**legacy)
+        except Exception as e:
+            logger.debug(f"钉钉发送异常（静默）: {e}")
+
+    @staticmethod
+    def _call_telegram(fn, **kwargs):
+        """TG 通知（静默失败，不阻断主流程）。"""
+        try:
+            fn(**kwargs)
+        except Exception as e:
+            logger.debug(f"TG 发送异常（静默）: {e}")
 
     def _start_signal_worker(self):
         if self._signal_worker_started:
@@ -866,6 +877,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             reason=payload.get("reason", ""),
             vps_sizing_meta=open_sizing_meta,
         )
+        # P1 修复：并行 TG 通知（静默失败）
+        if raw_action in ("LONG", "SHORT") and self.tv_tps and self.tv_tps[0] > 0:
+            self._call_telegram(
+                telegram_notify.report_position_opened,
+                side=raw_action,
+                qty=int(self.watched_qty or self.base_qty or 0),
+                entry=self.tv_price or 0,
+                regime=self.regime,
+                atr=self.current_atr,
+                tps=self.tv_tps,
+                tv_sl=payload.get("tv_sl") or 0,
+                leverage=EXCHANGE_LEVERAGE,
+                tier_label=getattr(self, "_last_tier_label", ""),
+            )
 
     def _record_open_log(self, side, qty, entry, source="open"):
         self._append_journal(OPEN_JOURNAL, {
@@ -2241,6 +2266,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             entry_px=meta.get("entry_px"),
             closed_qty=meta.get("closed_qty"),
             live_exit_px=meta.get("live_exit_px"),
+        )
+        # P1 修复：并行 TG 平仓通知
+        from webhook_parser import close_type_display_label as _ctdl
+        close_px = meta.get("live_exit_px") or meta.get("tv_price") or self.tv_price or 0
+        self._call_telegram(
+            telegram_notify.report_position_closed,
+            side=meta.get("side") or self.current_side or "LONG",
+            qty=int(meta.get("closed_qty", 0) or self.watched_qty or 0),
+            entry=meta.get("entry_px") or self.watched_entry or 0,
+            close_px=close_px,
+            close_type=_ctdl(meta.get("close_type") or ""),
+            regime=meta.get("regime") or self.regime or 3,
+            pnl=meta.get("pnl_pct"),
+            tier_label=getattr(self, "_last_tier_label", ""),
         )
         # 自动重入评估（v1.0 规格对齐）
         self._maybe_evaluate_smart_reentry(reason=reason, close_meta=meta, curr_px=curr_px)
@@ -5274,6 +5313,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             trigger_gate=trigger_gate,
         )
         self._radar_activation_notified = True
+        # P1 修复：并行 TG 雷达激活通知
+        self._call_telegram(
+            telegram_notify.report_radar_activation,
+            side=self.current_side,
+            qty=real_amt,
+            entry=self.watched_entry,
+            curr_px=curr_px,
+            new_sl=new_sl,
+            regime=self.regime,
+        )
 
     def _tp_level_consumed(self, level):
         return level in (getattr(self, "tp_levels_consumed", []) or [])
@@ -6823,6 +6872,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if self.regime not in self.regime_settings:
                 self.regime = 3
 
+        # P0 修复：tier / tier_label 从 webhook 读取（TV 优先；缺失时本地推算）
+        tier_in = self._safe_int(payload.get("tier"), None)
+        if tier_in is not None and tier_in in (0, 1, 2):
+            self.adx_tier = tier_in
+            self.radar_tier = tier_in
+            tier_src = "tv"
+        else:
+            tier_src = "local"
+        # tier_label 透传至钉钉展示（不存状态，仅 payload 携带时透传）
+        self._last_tier_label = payload.get("tier_label") or ""
+
         atr_in = self._safe_float(payload.get("atr"), 0.0)
         if atr_in > 0:
             self.current_atr = atr_in
@@ -6863,10 +6923,47 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             "atr": payload.get("_atr_source", "tv"),
             "tp": payload.get("_tp_source", "tv"),
             "price": payload.get("_price_source", "tv"),
+            "tier": tier_src,
         }
         close_reason = str(payload.get("reason") or "策略指标反转/波动率安全退出").strip()
         close_side = str(payload.get("side") or "").strip().upper()
         pnl_pct = payload.get("pnl_pct")
+
+        # P0 修复：CLOSE 方向校验 — 反向信号立即丢弃并告警
+        if is_close and close_side in ("LONG", "SHORT"):
+            live_pos = self._get_active_position()
+            if live_pos and self._safe_qty(live_pos.get("size", 0)) > 0:
+                pos_side = "LONG" if str(live_pos.get("posSide") or "").lower() == "long" else "SHORT"
+                if close_side != pos_side:
+                    logger.warning(
+                        f"🚫 CLOSE 方向不匹配 已拒绝 | "
+                        f"TV side={close_side} 持仓={pos_side} | "
+                        f"忽略反向 CLOSE，防止多空混乱"
+                    )
+                    try:
+                        dingtalk.report_system_alert(
+                            f"🚫 CLOSE 方向不匹配 已拒绝 [{self.symbol}]",
+                            f"TV 发 {close_side} 但持仓 {pos_side} | "
+                            f"忽略反向信号，保留当前持仓 | {close_reason or raw_action}",
+                            level="危险",
+                            suggestion="检查 TV 策略信号是否错发方向",
+                        )
+                        self._call_telegram(
+                            telegram_notify.report_system_alert,
+                            title=f"CLOSE 方向不匹配 [{self.symbol}]",
+                            detail=f"TV={close_side} 持仓={pos_side} | 已拒绝 | {close_reason or raw_action}",
+                            level="危险",
+                            suggestion="检查 TV 策略信号是否错发方向",
+                        )
+                    except Exception:
+                        pass
+                    return
+        elif is_close and close_side not in ("LONG", "SHORT"):
+            # 无 side 字段时用持仓方向补全（向后兼容）
+            live_pos = self._get_active_position()
+            if live_pos and self._safe_qty(live_pos.get("size", 0)) > 0:
+                close_side = "LONG" if str(live_pos.get("posSide") or "").lower() == "long" else "SHORT"
+
         close_meta = self._build_close_meta(raw_action, close_side, pnl_pct, close_reason)
         close_extra = self._format_close_extra(
             close_side, pnl_pct, self.tv_price, self.regime, self.current_atr,
