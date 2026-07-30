@@ -3044,7 +3044,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             # 撤销后再次确认交易所侧没有该价格的订单，防止重复挂单
             time.sleep(0.3)
             orders_after = self._collect_tp_limit_orders()
-            at_px_after = [o for o in orders_after if abs(o["price"] - px) <= tolerance]
+            # 修复：使用正确的字段名 px 而不是 price
+            at_px_after = [o for o in orders_after if abs(o.get("px", o.get("price", 0)) - px) <= tolerance]
             if at_px_after:
                 logger.warning(f"  ⚠️ 撤销后仍有 TP@{px:.2f}，跳过本次挂单")
                 continue
@@ -8183,7 +8184,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 # 【紧急修复】挂单前必须确认交易所侧没有该价格的TP订单
                 # 防止因本地标签被清理后，交易所侧订单仍存在导致重复挂单
                 existing_orders = self._collect_tp_limit_orders()
-                at_px_existing = [o for o in existing_orders if abs(o.get("price", 0) - px) <= 1.0]
+                # 修复：使用正确的字段名 px 而不是 price
+                at_px_existing = [o for o in existing_orders if abs(o.get("px", o.get("price", 0)) - px) <= 1.0]
                 if at_px_existing:
                     logger.warning(
                         f"[{self.symbol}] 交易所侧已有 TP@{px:.2f} ({len(at_px_existing)}张)，跳过挂单"
