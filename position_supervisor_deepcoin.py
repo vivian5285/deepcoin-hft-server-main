@@ -215,6 +215,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._last_signal_fp_ts = 0.0
         self._defense_align_in_progress = False
         self._last_defense_align_ok_ts = 0.0
+        self._last_rebuild_attempt_ts = 0.0  # 【修复】防止_rebuild_defenses死循环
+        self._last_nuclear_realign_ts = 0.0  # 【修复】防止_nuclear_realign_tp死循环
         self._guardian_bad_streak = 0
         self._sentinel_grace_until = 0.0
         self._last_regime_cap_ts = 0.0
@@ -5398,6 +5400,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         """
         核武级止盈对齐：只撤限价 TP → 重挂 TP123 → 始终续挂 tv_sl/雷达合并止损。
         """
+        # 【关键修复】防止核武死循环：短时间重复调用直接返回
+        now = time.time()
+        if now - getattr(self, "_last_nuclear_realign_ts", 0) < 15.0:
+            audit = self._audit_tp_levels(live_qty)
+            if self._tp_audit_ok(audit):
+                logger.warning(
+                    f"☢️ 核武冷却中（{now - getattr(self, '_last_nuclear_realign_ts', 0):.1f}s < 15s），TP已对齐，跳过"
+                )
+                return audit
+            logger.warning(
+                f"☢️ 核武冷却中（{now - getattr(self, '_last_nuclear_realign_ts', 0):.1f}s < 15s），仍需对齐但跳过"
+            )
+            return audit
+        self._last_nuclear_realign_ts = now
+
         last_audit = self._audit_tp_levels(live_qty)
         for r in range(rounds):
             logger.warning(
@@ -8169,9 +8186,33 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.warning(f"重建防线跳过：交易所无可用持仓 (传入 {qty} 张)")
             return 0
 
+        # 【关键修复】防止死循环：短时间重复调用_rebuild_defenses直接返回
+        now = time.time()
+        if now - getattr(self, "_last_rebuild_attempt_ts", 0) < 10.0:
+            logger.warning(
+                f"[{self.symbol}] _rebuild_defenses 冷却中（{now - getattr(self, '_last_rebuild_attempt_ts', 0):.1f}s < 10s），跳过"
+            )
+            return 0
+        self._last_rebuild_attempt_ts = now
+
         self._cancel_all_tp_limit_orders()
         # 【关键修复】增加等待时间确保撤销完成（从0.35秒改为2秒）
         time.sleep(2.0)
+        # 【关键修复】撤销后必须验证旧单已全部撤销，防止死循环挂单
+        leftover = self._collect_tp_limit_orders()
+        if leftover:
+            prices = [f"@{o['price']:.2f}" for o in leftover]
+            logger.warning(
+                f"[{self.symbol}] 撤销后仍有{len(leftover)}张旧TP未撤净，等待..."
+            )
+            time.sleep(2.0)
+            leftover = self._collect_tp_limit_orders()
+            if leftover:
+                prices = [f"@{o['price']:.2f}" for o in leftover]
+                logger.error(
+                    f"[{self.symbol}] 旧TP仍未撤净，放弃本次补挂: {prices}"
+                )
+                return 0
 
         if live_qty != qty:
             self.watched_qty = live_qty
