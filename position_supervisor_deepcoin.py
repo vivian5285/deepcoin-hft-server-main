@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.10.1-query-fix"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.15-acked-gc"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -223,6 +223,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.shield_active = False
         self.shield_tiers_consumed = []
         self.tp_levels_consumed = []
+        # v16.15（根因四修复）：记录 set-position-sltp 最近设置的止盈止损单
+        # 用于 audit 检测 + 幂等撤销，防止重复挂/撤导致死循环
+        self._shield_sltp_ord_id = ""
+        self._shield_sltp_set_at = 0.0
+        self._shield_cancelled_ids = set()
         # 规格 v1.0 §5.0：提前保本检查点
         self._early_be_checkpoint_done = False
         # 规格 v1.0 §3：永久硬止损冻结价
@@ -1160,6 +1165,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._shield_handoff_notified = False
         self.shield_active = False
         self.shield_sized_qty = 0.0
+        self._shield_sltp_ord_id = ""
+        self._shield_sltp_set_at = 0.0
+        self._shield_cancelled_ids = set()
         self.tv_tps = [0.0, 0.0, 0.0]
         self.tv_sl = 0.0
         if not getattr(self, "open_regime", None):
@@ -2558,6 +2566,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.add_count = 0
         self.tp_levels_consumed = []
         self.shield_active = False
+        self._shield_sltp_ord_id = ""
+        self._shield_sltp_set_at = 0.0
+        self._shield_cancelled_ids = set()
         self.current_side = None
         # 规格 v1.0 §8-9：平仓时清空幂等标签 + 退出所有权
         self.exit_ownership = "NONE"
@@ -3174,16 +3185,27 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _cancel_stop_orders(self, scope="all"):
         cancelled = 0
+        # v16.15（根因四修复）：撤销前初始化本轮已撤销列表，防止重复 REST
+        self._shield_cancelled_ids = set()
         for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
             if scope == "radar" and not self._is_radar_trigger_order(t):
                 continue
             if scope == "shield" and not self._is_shield_trigger_order(t):
                 continue
-            oid = t.get("ordId")
-            if oid:
-                deepcoin_client.cancel_trigger_order(self.symbol, oid)
-                cancelled += 1
-                time.sleep(0.2)
+            oid = str(t.get("ordId") or "").strip()
+            if not oid:
+                continue
+            # v16.15（根因四修复）：幂等撤销——本轮已撤销的直接跳过
+            if oid in self._shield_cancelled_ids:
+                continue
+            deepcoin_client.cancel_trigger_order(self.symbol, oid)
+            self._shield_cancelled_ids.add(oid)
+            # 同时检查是否撤销了本地记录的 sltp 订单
+            _local = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
+            if _local == oid:
+                self._shield_sltp_ord_id = ""
+            cancelled += 1
+            time.sleep(0.2)
         return cancelled
 
     @staticmethod
@@ -4132,6 +4154,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _has_shield_stop_at_price(self, tp, tier_prices=None):
         tier_prices = tier_prices or self._shield_tier_prices()
+        # v16.15（根因四修复）：本地有 set-position-sltp 记录时，直接返回 True
+        # 避免因交易所查询不到而误判，导致反复挂单
+        _local_ord = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
+        _cancelled = getattr(self, "_shield_cancelled_ids", set()) or set()
+        _set_at = float(getattr(self, "_shield_sltp_set_at", 0) or 0)
+        if _local_ord and _local_ord not in _cancelled and (time.time() - _set_at) < 300:
+            return True
         for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
             if not self._is_shield_trigger_order(t, tier_prices):
                 continue
@@ -4164,11 +4193,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 continue
             if not any(abs(px - tp) <= SHIELD_STOP_TOLERANCE for tp in tier_prices):
                 continue
-            oid = t.get("ordId")
-            if oid:
-                deepcoin_client.cancel_trigger_order(self.symbol, oid)
-                cancelled += 1
-                time.sleep(0.15)
+            oid = str(t.get("ordId") or "").strip()
+            if not oid:
+                continue
+            # v16.15（根因四修复）：幂等撤销——本轮已撤销的直接跳过
+            if oid in self._shield_cancelled_ids:
+                continue
+            deepcoin_client.cancel_trigger_order(self.symbol, oid)
+            self._shield_cancelled_ids.add(oid)
+            _local = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
+            if _local == oid:
+                self._shield_sltp_ord_id = ""
+            cancelled += 1
+            time.sleep(0.15)
         return cancelled
 
     def _split_shield_quantities(self, total_qty):
@@ -4248,6 +4285,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         buckets = self._shield_orders_at_tiers(tier_prices)
         result["buckets"] = buckets
 
+        # v16.15（根因四修复）：本地已记录 set-position-sltp 的 order_id，
+        # 且不在本轮已撤销列表中 → 视为已设置（防止 Deepcoin 内部订单查询不到导致的死循环）
+        # 条件：order_id 非空 + 未被标记撤销 + 最近5分钟内设置（防重启后残留）
+        _local_ord_id = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
+        _cancelled_ids = getattr(self, "_shield_cancelled_ids", set()) or set()
+        _set_at = float(getattr(self, "_shield_sltp_set_at", 0) or 0)
+        _local_valid = (
+            _local_ord_id
+            and _local_ord_id not in _cancelled_ids
+            and (time.time() - _set_at) < 300
+        )
+
         has_duplicate = False
         has_missing = False
         has_qty_mismatch = False
@@ -4259,8 +4308,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 continue
             orders = buckets.get(idx, [])
             if not orders:
-                has_missing = True
-                result["issues"].append(f"tier{idx + 1}_missing")
+                # v16.15（根因四修复）：本地已有 set-position-sltp 记录时，跳过条件单缺失判断
+                if not _local_valid:
+                    has_missing = True
+                    result["issues"].append(f"tier{idx + 1}_missing")
             elif len(orders) > SHIELD_MAX_TIER_ORDERS:
                 has_duplicate = True
                 result["issues"].append(f"tier{idx + 1}_dup:{len(orders)}")
@@ -4275,8 +4326,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         for idx, orders in buckets.items():
             if idx not in remaining and orders:
-                has_duplicate = True
-                result["issues"].append(f"tier{idx + 1}_orphan:{len(orders)}")
+                # v16.15：本地已有 set-position-sltp 记录时，不把交易所订单视为孤儿
+                if not _local_valid:
+                    has_duplicate = True
+                    result["issues"].append(f"tier{idx + 1}_orphan:{len(orders)}")
 
         result["max_drift_pct"] = max_drift_pct
         if has_duplicate:
@@ -4535,23 +4588,82 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._save_state()
 
     def _disarm_shield(self, reason="", notify=False):
-        n = self._cancel_stop_orders(scope="shield")
-        if self._shield_present_on_exchange():
-            n += self._purge_shield_stop_orders()
+        # v16.15（根因四修复）：优化 REST 消耗——只查一次 pending 订单列表
+        # 用本地跟踪的已撤销 ID + 查询结果缓存，避免重复 REST 查询
+        all_pending = deepcoin_client.get_trigger_orders_pending(self.symbol)
+        cancelled = 0
+
+        # 第一次：撤销所有 shield 订单
+        for t in all_pending:
+            if not self._is_shield_trigger_order(t):
+                continue
+            oid = str(t.get("ordId") or "").strip()
+            if not oid or oid in self._shield_cancelled_ids:
+                continue
+            deepcoin_client.cancel_trigger_order(self.symbol, oid)
+            self._shield_cancelled_ids.add(oid)
+            _local = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
+            if _local == oid:
+                self._shield_sltp_ord_id = ""
+            cancelled += 1
+            time.sleep(0.2)
+
+        # 用本地已撤销 ID 判断是否还有剩余 shield（在 exchange 未查到但本地记录有）
+        _local_ord = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
+        _local_set = float(getattr(self, "_shield_sltp_set_at", 0) or 0)
+        still_have_local = (
+            _local_ord
+            and _local_ord not in self._shield_cancelled_ids
+            and (time.time() - _local_set) < 300
+        )
+
+        # 检查是否还有未撤销的 shield 订单
+        still_on_exchange = False
+        for t in all_pending:
+            if not self._is_shield_trigger_order(t):
+                continue
+            oid = str(t.get("ordId") or "").strip()
+            if oid and oid not in self._shield_cancelled_ids:
+                still_on_exchange = True
+                break
+
+        if still_on_exchange or still_have_local:
+            # 第二次查询（仅在第一次撤销后仍有订单时）
+            all_pending2 = deepcoin_client.get_trigger_orders_pending(self.symbol)
+            for t in all_pending2:
+                px = self._trigger_order_price(t)
+                if px is None:
+                    continue
+                stop_px = self._shield_stop_price()
+                if not stop_px:
+                    continue
+                if abs(px - stop_px) <= SHIELD_STOP_TOLERANCE:
+                    oid = str(t.get("ordId") or "").strip()
+                    if oid and oid not in self._shield_cancelled_ids:
+                        deepcoin_client.cancel_trigger_order(self.symbol, oid)
+                        self._shield_cancelled_ids.add(oid)
+                        if _local_ord == oid:
+                            self._shield_sltp_ord_id = ""
+                        cancelled += 1
+                        time.sleep(0.15)
             time.sleep(0.4)
+
         had = getattr(self, "shield_active", False) or bool(
             getattr(self, "shield_tiers_consumed", [])
-        ) or self._shield_present_on_exchange()
+        ) or (still_on_exchange or still_have_local)
         live_qty = self._resolve_live_qty(self.watched_qty or 0)
         entry = self.watched_entry
         self.shield_active = False
         self.shield_tiers_consumed = []
         self.shield_sized_qty = 0.0
         self._shield_arm_notified = False
+        self._shield_sltp_ord_id = ""
+        self._shield_sltp_set_at = 0.0
+        self._shield_cancelled_ids = set()
         self._save_state()
-        if reason and (had or n):
-            logger.info(f"🛡️ [硬止损解除] {reason} | 撤销 {n} 笔 TV硬止损")
-        if notify and n > 0 and live_qty > 0:
+        if reason and (had or cancelled):
+            logger.info(f"🛡️ [硬止损解除] {reason} | 撤销 {cancelled} 笔 TV硬止损")
+        if notify and cancelled > 0 and live_qty > 0:
             progress = 0.0
             try:
                 curr_px = deepcoin_client.get_current_price(self.symbol) or 0
@@ -4563,11 +4675,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 side=self.current_side,
                 live_qty=live_qty,
                 entry=entry,
-                cancelled_count=n,
+                cancelled_count=cancelled,
                 reason=reason,
                 radar_progress=progress,
                 verify_note=(
-                    f"撤 {n} 笔 TV硬止损 | "
+                    f"撤 {cancelled} 笔 TV硬止损 | "
                     + (
                         "雷达已激活，专注移动保本"
                         if self._is_radar_active()
@@ -4620,6 +4732,32 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             profile=getattr(self, "breath_profile", None)
         ) or stop_px)
 
+        # v16.15（根因四修复）：幂等挂单——价格相同且最近15s内设置过则跳过
+        _last = float(getattr(self, "_last_applied_tv_sl", 0) or 0)
+        _last_set = float(getattr(self, "_shield_sltp_set_at", 0) or 0)
+        _local_ord = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
+        if (
+            abs(exchange_sl - _last) <= SHIELD_STOP_TOLERANCE
+            and _local_ord
+            and (time.time() - _last_set) < 15.0
+        ):
+            self.shield_active = True
+            self.shield_sized_qty = live_qty
+            self._save_state()
+            logger.info(
+                f"🛡️ [TV硬止损] 幂等跳过 | {live_qty} 张 @ {exchange_sl:.2f} | "
+                f"ordId={_local_ord} | {_last_set > 0 and (time.time() - _last_set):.1f}s前已设置"
+            )
+            return True
+
+        # v16.15（根因四修复）：设置前先撤销旧订单（防止 Deepcoin 拒绝重复设置）
+        if _local_ord and _local_ord not in getattr(self, "_shield_cancelled_ids", set()):
+            deepcoin_client.cancel_trigger_order(self.symbol, _local_ord)
+            self._shield_cancelled_ids = self._shield_cancelled_ids or set()
+            self._shield_cancelled_ids.add(_local_ord)
+            logger.info(f"🛡️ [TV硬止损] 撤销旧订单 {_local_ord} 后重新设置")
+            time.sleep(0.3)
+
         # 使用 set-position-sltp 接口，设置市价止损（slOrdPx=-1）
         res = deepcoin_client.set_position_sltp(
             symbol=self.symbol,
@@ -4638,6 +4776,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self.shield_active = True
             self.shield_sized_qty = live_qty
             self._shield_fail_streak = 0
+            # v16.15（根因四修复）：从响应中提取 order_id 并存储
+            _new_ord_id = ""
+            _data = res.get("data") if res else None
+            if isinstance(_data, dict):
+                _new_ord_id = str(_data.get("ordId") or _data.get("slOrdId") or _data.get("orderId") or "").strip()
+            elif isinstance(_data, list) and _data:
+                _first = _data[0]
+                _new_ord_id = str(_first.get("ordId") or _first.get("slOrdId") or _first.get("orderId") or "").strip()
+            if not _new_ord_id:
+                _new_ord_id = f"_sltp_{exchange_sl}_{int(time.time())}"
+            self._shield_sltp_ord_id = _new_ord_id
+            self._shield_sltp_set_at = time.time()
             self._save_state()
             logger.warning(
                 f"🛡️ [TV硬止损] 已设置 | {live_qty} 张 @ {exchange_sl:.2f} | "
@@ -4838,7 +4988,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             oid = str(meta.get("order_id") or "").strip()
             ts = float(meta.get("ts") or 0)
             age = (now - ts) if ts > 0 else 9999.0
-            if st in ("done", "filled", "cancelled", "canceled"):
+            if st in ("done", "filled", "cancelled", "canceled", "acked"):
                 tags.pop(tag, None)
                 dropped.append(f"{tag}:{st}")
                 continue
@@ -4932,7 +5082,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         for tag, meta in dict(getattr(self, "_pending_order_tags", {}) or {}).items():
             st = str((meta or {}).get("status") or "open").lower()
             # 【BUG修复】只要状态不是终态，无论有没有 order_id，都算未完成
-            if st in ("done", "filled", "cancelled", "canceled"):
+            if st in ("done", "filled", "cancelled", "canceled", "acked"):
                 continue
             k = str((meta or {}).get("kind") or "").upper()
             if want and k != want and not k.startswith(want):
@@ -7232,6 +7382,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.add_count = 0
         self.tp_levels_consumed = []
         self.shield_active = False
+        self._shield_sltp_ord_id = ""
+        self._shield_sltp_set_at = 0.0
+        self._shield_cancelled_ids = set()
         self.current_side = None
         deepcoin_client.cancel_all_open_orders(self.symbol)
         self._save_state()
@@ -7653,6 +7806,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.shield_active = False
         self.shield_tiers_consumed = []
         self.tp_levels_consumed = []
+        self._shield_sltp_ord_id = ""
+        self._shield_sltp_set_at = 0.0
+        self._shield_cancelled_ids = set()
         self.breathing_coefficient = 1.0
         self._breath_ratio_history = []
         self.breakeven_phase = False
@@ -8455,6 +8611,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.shield_active = False
                 self.shield_tiers_consumed = []
                 self.tp_levels_consumed = []
+                self._shield_sltp_ord_id = ""
+                self._shield_sltp_set_at = 0.0
+                self._shield_cancelled_ids = set()
                 self._snapshot_sizing_principal("全平后本金重置")
             else:
                 residual = self._get_active_position()
