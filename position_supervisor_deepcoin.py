@@ -2491,19 +2491,22 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             pos_side, qty, init, order_type="market",
         )
 
-        # 挂 TP1/TP2 限价
+        # 挂 TP1/TP2 限价（规格 §3.5：TP1=10%，TP2=20%，剩余70%归雷达）
+        LEG_TP_RATIOS_REENTRY = [0.10, 0.20]
         tps = list(getattr(self, "tv_tps", [0, 0, 0]) or [])
         if len(tps) >= 1 and tps[0] > 0:
             tp1 = tps[0]
             tp1_side = "sell" if side == "LONG" else "buy"
+            tp1_qty = max(1, int(qty * LEG_TP_RATIOS_REENTRY[0]))
             deepcoin_client.place_limit_order(
-                self.symbol, tp1_side, pos_side, tp1, qty // 3,
+                self.symbol, tp1_side, pos_side, tp1, tp1_qty,
             )
         if len(tps) >= 2 and tps[1] > 0:
             tp2 = tps[1]
             tp2_side = "sell" if side == "LONG" else "buy"
+            tp2_qty = max(1, int(qty * LEG_TP_RATIOS_REENTRY[1]))
             deepcoin_client.place_limit_order(
-                self.symbol, tp2_side, pos_side, tp2, qty // 3,
+                self.symbol, tp2_side, pos_side, tp2, tp2_qty,
             )
 
         logger.info(f"📌 [{self.symbol}] 重入防线已挂: 硬止损@{init:.2f} TP1/TP2")
@@ -3033,10 +3036,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if len(at_px) == 1 and at_px[0]["qty"] == q:
                 logger.info(f"  ✓ TP{lv['level']} @ {px:.2f} 已存在 {at_px[0]['qty']}张，跳过")
                 continue
+            # 【紧急修复】撤销前确认交易所侧有该订单
             for o in at_px:
                 if o.get("orderId"):
                     deepcoin_client.cancel_order(self.symbol, ord_id=o["orderId"])
                     time.sleep(0.25)
+            # 撤销后再次确认交易所侧没有该价格的订单，防止重复挂单
+            time.sleep(0.3)
+            orders_after = self._collect_tp_limit_orders()
+            at_px_after = [o for o in orders_after if abs(o["price"] - px) <= tolerance]
+            if at_px_after:
+                logger.warning(f"  ⚠️ 撤销后仍有 TP@{px:.2f}，跳过本次挂单")
+                continue
             logger.info(f"  + 补挂 TP{lv['level']} @ {px:.2f} qty={q}张")
             res = deepcoin_client.place_limit_order(
                 self.symbol, close_side, pos_side, px, q, reduce_only=True,
@@ -7540,6 +7551,30 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         except Exception:
             pass
         self._refresh_breathing_coefficient(force=True)
+
+        # 规格 §3.7：从 tv_stop_distance / atr 推导 adx_tier（弱0/中1/强2）
+        # tv_stop_distance = |TV.price − TV.stop_loss|；1.3×ATR = 强趋势档边界
+        open_atr = float(getattr(self, "open_atr", None) or self.current_atr or 0)
+        tv_sl_val = float(getattr(self, "tv_sl_ref", 0) or 0)
+        tv_price_val = float(getattr(self, "tv_price", 0) or entry_price or 0)
+        if open_atr > 0 and tv_sl_val > 0 and tv_price_val > 0:
+            tv_stop_dist = abs(tv_price_val - tv_sl_val)
+            tier_threshold = 1.3 * open_atr
+            if tv_stop_dist > tier_threshold:
+                derived_tier = 0  # 弱趋势
+            else:
+                derived_tier = 2  # 强趋势（实际是 tv_stop_dist <= tier_threshold）
+            self.adx_tier = derived_tier
+            self.radar_tier = derived_tier
+            logger.info(
+                f"[{self.symbol}] 规格 §3.7 adx_tier={derived_tier} "
+                f"(tv_dist={tv_stop_dist:.2f} ATR={open_atr:.2f} "
+                f"阈值={tier_threshold:.2f})"
+            )
+
+        if hasattr(self, "_init_reentry_runtime"):
+            self._init_reentry_runtime()
+
         if hasattr(self, "_radar_stage_last"):
             self._radar_stage_last = 0
         self._radar_activation_notified = False
@@ -8145,6 +8180,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         self._save_state()
                         time.sleep(0.15)
                 tag = make_defense_client_order_id(self.symbol, kind, px)
+                # 【紧急修复】挂单前必须确认交易所侧没有该价格的TP订单
+                # 防止因本地标签被清理后，交易所侧订单仍存在导致重复挂单
+                existing_orders = self._collect_tp_limit_orders()
+                at_px_existing = [o for o in existing_orders if abs(o.get("price", 0) - px) <= 1.0]
+                if at_px_existing:
+                    logger.warning(
+                        f"[{self.symbol}] 交易所侧已有 TP@{px:.2f} ({len(at_px_existing)}张)，跳过挂单"
+                    )
+                    # 更新标签，不挂新单
+                    existing = at_px_existing[0]
+                    existing_oid = str(existing.get("ordId") or "")
+                    if existing_oid:
+                        self._register_pending_defense_tag(
+                            make_defense_client_order_id(self.symbol, kind, px),
+                            kind, price=px, order_id=existing_oid
+                        )
+                        self._save_state()
+                    continue
                 self._register_pending_defense_tag(tag, kind, price=px)
                 try:
                     self._save_state()
