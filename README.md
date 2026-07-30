@@ -1,6 +1,8 @@
 # 深币 Deepcoin · ETH/XAU 永续 Webhook 交易系统
 
-**当前版本：`v16.16-hedge-mode`**
+**当前版本：`v16.16a-hedge-check`**
+
+> **持仓模式说明**：Deepcoin 没有独立的 `set-position-mode` API，但 `posSide=long/short` 参数已在所有订单（开仓/平仓/限价止盈/条件单）中正确使用，保证双向持仓语义。`reduceOnly=True` 在止盈/止损中已正确设置，防止意外开仓。
 
 与 `VPS完整系统规格_币安单账户版 v1.0` 完全对齐。
 
@@ -11,7 +13,7 @@
 | 端口 | **5004** |
 | 单位 | **张**（0.1 ETH/张） |
 | 杠杆 | **5x** cross（双向持仓模式） |
-| 健康检查 | `GET /health` → `"version":"v16.16-hedge-mode"` |
+| 健康检查 | `GET /health` → `"version":"v16.16a-hedge-check"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
 

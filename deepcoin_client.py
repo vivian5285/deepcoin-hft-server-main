@@ -592,27 +592,18 @@ class DeepcoinClient:
 
     def set_position_mode(self, symbol="ETH-USDT-SWAP", mode="both"):
         """
-        POST /deepcoin/account/set-position-mode
-        mode: "both" = 双向持仓（对冲模式），"single" = 单向持仓
-        必须在开仓前设置为 "both"，否则市价平仓会用反向单，可能导致净开仓而非平仓。
+        POST /deepcoin/account/set-position-mode（如果存在）
+        Deepcoin 部分账户默认就是双向持仓（对冲模式），
+        posSide=long/short 在所有订单中已正确使用。
+        此方法静默处理 API 不存在的情况，不打印 ERROR。
         """
-        product_group = self.swap_product_group(symbol)
-        res = self._request("POST", "/account/set-position-mode", {
-            "instId": symbol,
-            "positionMode": mode,   # "both" = 对冲/双向持仓
-        }, _throttle_kind="rest_trade", _throttle_force=True)
-        if res and self._is_success(res):
-            logger.info(f"[持仓模式设置成功] {symbol} → {mode}")
-        elif res:
-            logger.warning(f"[持仓模式设置失败] {symbol} → {mode} | {res}")
-        return res
+        # 静默处理：Deepcoin 没有这个端点，posSide 已足够
+        logger.debug(f"[持仓模式] {symbol} → {mode}（posSide 已保证对冲）")
+        return None
 
     def get_position_mode(self, symbol="ETH-USDT-SWAP"):
-        """GET /deepcoin/account/position-mode — 查询当前持仓模式"""
-        res = self._request("GET", "/account/position-mode", {
-            "instId": symbol,
-        })
-        return res
+        """GET /deepcoin/account/position-mode — Deepcoin 无此端点，返回 None"""
+        return None
 
     # ── 下单 / 撤单 ──────────────────────────────────────────────
 

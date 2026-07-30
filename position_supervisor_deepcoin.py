@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.16-hedge-mode"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.16a-hedge-check"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -164,12 +164,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         except Exception as e:
             logger.warning(f"face_value instruments 失败，用 meta {self.face_value}: {e}")
 
-        # v16.16：启动时强制设置双向持仓模式（对冲模式），防止平仓变反向开仓
-        try:
-            deepcoin_client.set_position_mode(self.symbol, mode="both")
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] 持仓模式设置失败: {e}")
-
+        # v16.16 注：Deepcoin 没有 set-position-mode API，但 posSide(long/short)
+        # 参数已在所有订单中正确使用，账户默认行为由 Deepcoin 控制。
+        # 杠杆在每次开仓前通过 set_leverage(5x) 设置。
         self.binance_mark = meta.get("binance_mark") or "ETHUSDT"
         self.monitoring = False
         self._lock = threading.Lock()
