@@ -3231,6 +3231,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         """
         规格 v1.0 §3.3：用 |TV.price−TV.stop_loss|×1.15 锁定 frozen_hard_sl_px。
         已锁定则不覆盖。禁止用 0.5×ATR 雷达激活臂冒充永久硬止损。
+
+        v16.11（根因一保险）：最小 ATR 距离兜底。
+        若 TV 传来的 stop_loss 导致距离 < 0.5×ATR，视为异常数据，自动扩大并告警。
         """
         cur = float(self._frozen_hard_px() or 0)
         if cur > 0:
@@ -3241,6 +3244,34 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 f"[{self.symbol}] 无法锁定永久硬止损（缺 TV.stop_loss）| {source}"
             )
             return 0.0
+
+        # v16.11（根因一保险）：最小 ATR 距离兜底检查
+        fill_px = float(entry if entry is not None else (self.watched_entry or 0))
+        atr_val = float(getattr(self, "open_atr", 0) or 0)
+        if atr_val > 0 and fill_px > 0:
+            side_check = str(side or self.current_side or "").strip().upper()
+            if side_check in ("LONG", "SHORT"):
+                dist = abs(fill_px - hard)
+                min_dist = atr_val * 0.5
+                if dist < min_dist:
+                    logger.warning(
+                        f"[{self.symbol}] ⚠️ 硬止损距离异常：TV距离 {dist:.4f} < 0.5×ATR({atr_val:.4f}) "
+                        f"| entry={fill_px:.2f} hard={hard:.2f} → 自动扩大至 {min_dist:.4f}"
+                    )
+                    dingtalk.report_system_alert(
+                        "硬止损距离异常·ATR兜底",
+                        f"TV.stop_loss 距离过小 [{self.symbol}] | "
+                        f"entry={fill_px:.2f} hard={hard:.2f} | "
+                        f"dist={dist:.4f} < 0.5×ATR({atr_val:.4f}) | "
+                        f"已自动扩大至 {min_dist:.4f}（方向 {side_check}）",
+                        suggestion="请核查 TV 策略的 stop_loss 设置是否合理",
+                    )
+                    # 用 ATR 兜底距离重新计算硬止损价
+                    if side_check == "LONG":
+                        hard = round(fill_px - min_dist, 2)
+                    else:
+                        hard = round(fill_px + min_dist, 2)
+
         self.frozen_hard_sl_px = float(hard)
         try:
             self._save_state()
@@ -3522,14 +3553,41 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             q, px = float(lv["qty"] or 0), float(lv["price"] or 0)
             if q <= 0 or px <= 0:
                 continue
-            # 幂等标签拦截
-            blocked, tag0, _ = self._has_open_pending_defense_tag(kind)
+            # 幂等标签拦截（规格 v1.0 §8-9）
+            # v16.11（根因二修复）：标签残留时，必须先确认原订单已失败/超时才能清
+            # 有 order_id → 查交易所侧真实状态；无 order_id → 必须陈旧≥45s
+            blocked, tag0, meta0 = self._has_open_pending_defense_tag(kind)
             if blocked:
                 logger.warning(
-                    f"[{self.symbol}] 本地未完成标签 tag={tag0} kind={kind} "
-                    f"→ 拒挂 TP{level}（幂等拦截）"
+                    f"[{self.symbol}] 本地未完成标签 tag={tag0} kind={kind} → "
+                    f"开始核实原订单是否已失败 | px={px:.2f}"
                 )
-                continue
+                # 无 order_id 且陈旧≥45s → 直接确认可清（GC 已放过，说明确实陈旧）
+                if not meta0.get("order_id"):
+                    age = time.time() - float(meta0.get("ts", 0) or 0)
+                    if age >= 45.0:
+                        logger.warning(
+                            f"[{self.symbol}] 标签 {tag0} 无 order_id 且陈旧 {age:.0f}s ≥ 45s → 直接清理"
+                        )
+                        self._complete_pending_defense_tag(tag=tag0)
+                        self._save_state()
+                        time.sleep(0.15)
+                    else:
+                        logger.warning(
+                            f"[{self.symbol}] 标签 {tag0} 无 order_id 且仅 {age:.0f}s < 45s → "
+                            f"拒绝清理（可能还在处理中），本次跳过"
+                        )
+                        continue
+                else:
+                    # 有 order_id → 查交易所侧
+                    if not self._confirm_stale_before_clear(tag0, meta0):
+                        logger.warning(
+                            f"[{self.symbol}] 标签 {tag0} 对应订单仍在处理中 → 拒绝清理，本次跳过"
+                        )
+                        continue
+                    self._complete_pending_defense_tag(tag=tag0)
+                    self._save_state()
+                    time.sleep(0.15)
             tag = make_defense_client_order_id(self.symbol, kind, px)
             self._register_pending_defense_tag(tag, kind, price=px)
             try:
@@ -3537,7 +3595,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             except Exception:
                 pass
             last = None
-            for attempt in range(max(1, retries + 1)):
+            # v16.11（根因二修复）：TP 挂单失败时强制重试 3 次
+            max_retries = 3
+            for attempt in range(max_retries):
                 res = deepcoin_client.place_limit_order(
                     self.symbol, close_side, pos_side, px, q,
                     reduce_only=True, cl_ord_id=tag,
@@ -3545,14 +3605,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if res and deepcoin_client._is_success(res):
                     last = res
                     break
-                time.sleep(0.2)
+                if attempt < max_retries - 1:
+                    time.sleep(0.3)
             if not last:
                 self._complete_pending_defense_tag(tag=tag)
                 try:
                     self._save_state()
                 except Exception:
                     pass
-                logger.error(f"[{self.symbol}] UPDATE_TP 挂 TP{level} @ {px:.2f} 失败（已释放标签）")
+                logger.error(
+                    f"[{self.symbol}] UPDATE_TP 挂 TP{level} @ {px:.2f} "
+                    f"失败（已释放标签，max_retries={max_retries}）"
+                )
                 continue
             oid = str(last.get("orderId") or last.get("algoId") or "")
             self._register_pending_defense_tag(tag, kind, price=px, order_id=oid)
@@ -4702,6 +4766,55 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             except Exception:
                 pass
         return len(dropped)
+
+    def _confirm_stale_before_clear(self, tag, meta):
+        """
+        v16.11（根因二修复）：清残留标签前，必须先确认原订单已失败/超时。
+        不允许"看到残留就清"——只查本地状态表是远远不够的，必须核实交易所侧真实状态。
+
+        返回 True = 已确认可安全清理；False = 不能清理（订单可能还在处理中）。
+        """
+        if not tag or not meta:
+            return False
+        meta = meta or {}
+        oid = str(meta.get("order_id") or "").strip()
+        ts = float(meta.get("ts") or 0)
+        age = (time.time() - ts) if ts > 0 else 0.0
+
+        # 条件1：有 order_id → 查交易所真实状态
+        if oid:
+            try:
+                order_res = deepcoin_client.get_order(self.symbol, ord_id=oid)
+                if order_res:
+                    state = str(order_res.get("state", "") or order_res.get("status", "")).lower()
+                    if state in ("filled", "cancelled", "canceled", "done", "完全成交", "已撤"):
+                        logger.info(
+                            f"[{self.symbol}] 标签 {tag} 的订单 {oid} 已在交易所侧 {state}，确认可清理"
+                        )
+                        return True
+                    # 状态未知或非终态，不清理
+                    logger.warning(
+                        f"[{self.symbol}] 标签 {tag} 的订单 {oid} 仍在 {state}，拒绝清理"
+                    )
+                    return False
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] 查询订单 {oid} 状态失败: {e}，拒绝清理")
+                return False
+
+        # 条件2：无 order_id（仅本地标签）→ 必须满足陈旧阈值
+        STALE_THRESHOLD_SEC = 45.0
+        if age >= STALE_THRESHOLD_SEC:
+            logger.warning(
+                f"[{self.symbol}] 标签 {tag} 无 order_id 但已陈旧 {age:.0f}s >= {STALE_THRESHOLD_SEC}s，"
+                f"确认可清理"
+            )
+            return True
+        # 不够陈旧，拒绝清理（防止误清正在处理中的订单）
+        logger.warning(
+            f"[{self.symbol}] 标签 {tag} 无 order_id 且仅 {age:.0f}s < {STALE_THRESHOLD_SEC}s，"
+            f"拒绝清理（可能还在处理中）"
+        )
+        return False
 
     def _has_open_pending_defense_tag(self, kind=None):
         """本地已有同档未完成标签 → 拒挂（宁可错过）。"""
@@ -8000,14 +8113,37 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             q, px = lv["qty"], lv["price"]
             kind = f"TP{int(lv.get('level', 0))}"
             if q > 0 and px > 0:
-                # 幂等标签拦截（规格 v1.0 §8-9）
-                blocked, tag0, _ = self._has_open_pending_defense_tag(kind)
+                # v16.11（根因二修复）：标签残留时，必须先确认原订单已失败/超时才能清
+                blocked, tag0, meta0 = self._has_open_pending_defense_tag(kind)
                 if blocked:
                     logger.warning(
-                        f"[{self.symbol}] 本地未完成标签 tag={tag0} kind={kind} "
-                        f"→ 拒挂 TP{int(lv.get('level', 0))}（幂等拦截）"
+                        f"[{self.symbol}] 本地未完成标签 tag={tag0} kind={kind} → "
+                        f"开始核实原订单是否已失败 | px={px:.2f}"
                     )
-                    continue
+                    if not meta0.get("order_id"):
+                        age = time.time() - float(meta0.get("ts", 0) or 0)
+                        if age >= 45.0:
+                            logger.warning(
+                                f"[{self.symbol}] 标签 {tag0} 无 order_id 且陈旧 {age:.0f}s ≥ 45s → 直接清理"
+                            )
+                            self._complete_pending_defense_tag(tag=tag0)
+                            self._save_state()
+                            time.sleep(0.15)
+                        else:
+                            logger.warning(
+                                f"[{self.symbol}] 标签 {tag0} 无 order_id 且仅 {age:.0f}s < 45s → "
+                                f"拒绝清理（可能还在处理中），本次跳过"
+                            )
+                            continue
+                    else:
+                        if not self._confirm_stale_before_clear(tag0, meta0):
+                            logger.warning(
+                                f"[{self.symbol}] 标签 {tag0} 对应订单仍在处理中 → 拒绝清理，本次跳过"
+                            )
+                            continue
+                        self._complete_pending_defense_tag(tag=tag0)
+                        self._save_state()
+                        time.sleep(0.15)
                 tag = make_defense_client_order_id(self.symbol, kind, px)
                 self._register_pending_defense_tag(tag, kind, price=px)
                 try:
@@ -8015,7 +8151,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 except Exception:
                     pass
                 last = None
-                for attempt in range(2):
+                # v16.11（根因二修复）：TP 挂单失败时强制重试，不轻易放弃
+                max_retries = 3
+                for attempt in range(max_retries):
                     res = deepcoin_client.place_limit_order(
                         self.symbol, close_side, pos_side, px, q,
                         reduce_only=True, cl_ord_id=tag,
@@ -8027,15 +8165,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         placed += 1
                         logger.info(f"📈 TP{int(lv.get('level', 0))} {q} @ {px:.2f} tag={tag}")
                         break
-                    time.sleep(0.2)
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"[{self.symbol}] TP{int(lv.get('level', 0))} @ {px:.2f} "
+                            f"挂单失败，重试 {attempt + 1}/{max_retries}"
+                        )
+                        time.sleep(0.3)
                 if not last:
                     self._complete_pending_defense_tag(tag=tag)
                     try:
                         self._save_state()
                     except Exception:
                         pass
-                    logger.error(f"[{self.symbol}] TP{int(lv.get('level', 0))} @ {px:.2f} 失败（已释放标签）")
-                time.sleep(0.25)
+                    logger.error(
+                        f"[{self.symbol}] TP{int(lv.get('level', 0))} @ {px:.2f} "
+                        f"失败（已释放标签，max_retries={max_retries}）"
+                    )
+                else:
+                    time.sleep(0.25)
 
         curr_px = deepcoin_client.get_current_price(self.symbol)
         self._maintain_hard_shield(live_qty, curr_px, force=True)
