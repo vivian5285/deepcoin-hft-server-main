@@ -301,6 +301,7 @@ def report_principal_snapshot(reason, principal, regime=None, margin_pct=None,
 def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=False,
                             tv_pnl_pct=None, tv_side="", tv_price=None,
                             close_action="", tv_regime=None, tv_atr=None,
+                            tv_field_sources=None,
                             close_type="", tv_reason="", entry_px=None,
                             closed_qty=None, live_exit_px=None):
     """平仓报告"""
@@ -323,6 +324,9 @@ def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=Fa
         text += f"收益率: {pnl_str}\n"
     if verify_note:
         text += f"核实: {verify_note}\n"
+    if tv_field_sources:
+        from webhook_parser import format_tv_field_sources
+        text += f"TV字段: {format_tv_field_sources(tv_field_sources)}\n"
     send_text(text)
 
 

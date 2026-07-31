@@ -207,13 +207,22 @@ class RadarReentryMixin:
         gate_px = float(st.get("radar_activation_price") or 0)
         if tp1_px > 0 and tp2_px > 0 and gate_px <= 0:
             gate_px = radar_gate_price_from_tps(tp1_px, tp2_px, attempt)
+        elif gate_px <= 0:
+            # 规格 §5.1：TP1/TP2 缺失时拒绝雷达激活，不 fallback 旧公式
+            self._radar_activation_blocked = True
+            logger.error(
+                f"🚨 [{self.symbol}] TP价格缺失 tp1={tp1_px:.2f} tp2={tp2_px:.2f} "
+                f"→ 雷达激活已封锁，等 TP 补全后再激活 | {self._radar_trigger_gate or ''}"
+            )
+        else:
+            self._radar_activation_blocked = False
         gate_lab = f"绝对价格锚定 {'(重入=TP2)' if attempt >= 1 else '(首次=(TP1+TP2)/2)'}"
         self._radar_trigger_gate = f"被动雷达·{gate_lab}"
         self._apply_tier_breath_overlay()
         logger.info(
             f"⏳ [{self.symbol}] 雷达休眠至激活 "
             f"mode={gate_lab} attempt={attempt} "
-            f"ratio={frac:.0%} gate≈{gate_px:.4f}"
+            f"ratio={frac:.0%} gate≈{gate_px:.4f} blocked={getattr(self, '_radar_activation_blocked', False)}"
         )
 
     def _radar_is_dormant(self) -> bool:
@@ -222,6 +231,8 @@ class RadarReentryMixin:
 
     def _activation_reached_for_arm(self, curr_px: float) -> bool:
         """§5.0 现价触雷达激活线（首次=(TP1+TP2)/2 · 重入=TP2）。"""
+        if getattr(self, "_radar_activation_blocked", False):
+            return False
         gate = float(getattr(self, "radar_activation_price", 0) or 0)
         if gate <= 0:
             return False
@@ -232,10 +243,19 @@ class RadarReentryMixin:
             return float(curr_px or 0) <= gate
         return False
 
+    def _unblock_radar_activation(self):
+        """TP补全后解锁雷达激活。"""
+        if getattr(self, "_radar_activation_blocked", False):
+            self._radar_activation_blocked = False
+            logger.info(f"✅ [{self.symbol}] TP补全，雷达激活解锁")
+
     def _maybe_arm_radar_on_activation(self, live_qty, curr_px, source=""):
         """价触激活线（或本周期 sticky）：挂雷达 STOP@保本位，开始马拉松跟随。"""
         if bool(getattr(self, "radar_activated", False)):
             return True
+        if getattr(self, "_radar_activation_blocked", False):
+            logger.warning(f"⚠️ [{self.symbol}] 雷达激活已被封锁(TP缺失) → 拒绝武装 | {source}")
+            return False
         force = "强制" in str(source or "") or "force" in str(source or "").lower()
         if not force and not self._activation_reached_for_arm(curr_px):
             consumed = set(getattr(self, "tp_levels_consumed", []) or [])

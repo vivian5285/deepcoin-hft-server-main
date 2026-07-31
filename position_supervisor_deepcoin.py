@@ -273,6 +273,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.radar_tier = 1
         self.radar_activation_frac = 0.78
         self.radar_pending_arm = True
+        self._last_flat_qty_zero_ts = 0.0  # 上次确认归零时间戳（用于减少重复告警）
         self.reentry_active = False
         self.reentry_attempt = 0
         self.reentry_limit_order_id = None
@@ -2658,6 +2659,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"(initial={self.initial_qty}, watched={self.watched_qty}) → 扫尾强平"
         )
         self._sweep_dust_and_finalize(reason)
+        # 规格 §9.4：扫尾后必须验证持仓归零，防止蚂蚁单残留
+        flat = self._wait_verify(self._verify_flat, retries=4, delay=0.5)
+        if not flat:
+            logger.warning(
+                f"🐜 [重启扫描] 扫尾后验证未通过，请人工核查 {self.symbol} 盘口"
+            )
         return True
 
     def _recover_missed_flat_on_startup(self, was_monitoring=False):
@@ -3819,6 +3826,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         old_tps = list(getattr(self, "_prev_tv_tps_before_update", None) or self.tv_tps or [])
         self.tv_tps = new_tps
         self._save_state()
+
+        # TP补全后解锁雷达激活（规格 §5.1：绝对价格锚定需要TP1/TP2）
+        self._unblock_radar_activation()
 
         same_ledger = (
             len(old_tps) >= 3
@@ -6688,9 +6698,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             live = self._safe_qty(pos["size"])
             if live != fallback_qty:
                 logger.info(f"📐 实盘张数校正: 账本 {fallback_qty} → 交易所 {live}")
+            self._last_flat_qty_zero_ts = 0.0
             return live
         # 规格 §9.6 平仓幂等性：无持仓直接返回0，不使用fallback避免幽灵单
-        logger.warning(f"📐 实盘张数归零: 账本 {fallback_qty} → 交易所 0")
+        # 5秒内重复归零只记一次，避免日志刷屏
+        now = time.time()
+        prev = float(getattr(self, "_last_flat_qty_zero_ts", 0.0) or 0.0)
+        if now - prev > 5.0:
+            logger.warning(f"📐 实盘张数归零: 账本 {fallback_qty} → 交易所 0")
+        self._last_flat_qty_zero_ts = now
         return 0
 
     def handle_signal(self, payload):
