@@ -599,9 +599,9 @@ class RadarReentryMixin:
             logger.warning(f"⚠️ [{self.symbol}] 再入限价挂出失败")
             return False
         try:
-            import dingtalk
-            self._call_dingtalk(
-                dingtalk.report_system_alert,
+            import telegram_notify
+            self._call_telegram_notify(
+                telegram_notify.report_system_alert,
                 title=f"智能再入场限价已挂 [{self.symbol}]",
                 detail=(
                     f"{side} ADX档{tier_label(int(getattr(self, 'adx_tier', 1) or 1))} "
@@ -926,9 +926,9 @@ class RadarReentryMixin:
             tp_note = "TP=?"
         slip = abs(entry - tv_price) if tv_price > 0 else 0.0
         try:
-            import dingtalk
-            self._call_dingtalk(
-                dingtalk.report_system_alert,
+            import telegram_notify
+            self._call_telegram_notify(
+                telegram_notify.report_system_alert,
                 title=f"智能再入已成交·防线核实 [{self.symbol}]",
                 detail=(
                     f"{side} {qty} @ fill={entry:.2f} (TV@{tv_price:.2f} 滑点={slip:.2f}) | "

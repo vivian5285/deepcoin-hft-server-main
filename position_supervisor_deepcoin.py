@@ -14,8 +14,8 @@ from deepcoin_client import deepcoin_client, CLIENT_VERSION
 from pipeline_bridge import PipelineBridgeMixin
 from pipeline_ledger import Role
 from radar_reentry_mixin import RadarReentryMixin
-import dingtalk
 import telegram_notify
+from telegram_notify import (
 from tv_seq import (
     reorder_batch_close_then_open,
     extract_seq_meta,
@@ -491,8 +491,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             verify_note += " | REST 同步略延迟"
 
         if manual_open:
-            self._call_dingtalk(
-                dingtalk.report_manual_position_change,
+            self._call_telegram_notify(
+                telegram_notify.report_manual_position_change,
                 action_type=f"人工开仓 · {source}",
                 old_qty=0,
                 new_qty=real_amt,
@@ -503,8 +503,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
         elif qty_change:
             old_q, new_q, action_msg = qty_change
-            self._call_dingtalk(
-                dingtalk.report_manual_position_change,
+            self._call_telegram_notify(
+                telegram_notify.report_manual_position_change,
                 action_type=action_msg,
                 old_qty=old_q,
                 new_qty=new_q,
@@ -514,8 +514,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 verified=bool(verified),
             )
         else:
-            self._call_dingtalk(
-                dingtalk.report_recover_takeover,
+            self._call_telegram_notify(
+                telegram_notify.report_recover_takeover,
                 side=side,
                 qty=real_amt,
                 entry=entry_px,
@@ -537,7 +537,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
 
         if expected > 0 and matched < expected:
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 f"{source} · 止盈未完全对齐",
                 f"{side} {real_amt}张 @ {entry_px:.2f} | "
                 f"仅 {matched}/{expected} 档 | 哨兵将接力纠偏",
@@ -637,8 +637,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._resume_live_monitoring(pos, source="空闲巡检")
 
     @staticmethod
-    def _call_dingtalk(fn, **kwargs):
-        """兼容 VPS 旧版 dingtalk.py（缺少 verified / swept_dust 等新参数）"""
+    def _call_telegram_notify(fn, **kwargs):
+        """TG通知（静默失败，不阻断主流程）。"""
         try:
             fn(**kwargs)
         except TypeError as exc:
@@ -650,7 +650,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             }
             fn(**legacy)
         except Exception as e:
-            logger.debug(f"钉钉发送异常（静默）: {e}")
+            logger.debug(f"TG发送异常（静默）: {e}")
 
     @staticmethod
     def _call_telegram(fn, **kwargs):
@@ -733,7 +733,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._close_open_chain_active = True
                 self._last_close_bar_index = int(bi)
             try:
-                dingtalk.report_system_alert(
+                telegram_notify.report_system_alert(
                     title=f"先平后开链·同秒开平 [{self.symbol}]",
                     detail=(
                         f"执行 {exec_chain} | TV按seq {tv_by_seq} | "
@@ -863,8 +863,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             + sizing_note
             + (f" | pnl={payload.get('pnl_pct')}%" if payload.get("pnl_pct") is not None else "")
         )
-        self._call_dingtalk(
-            dingtalk.report_tv_signal_received,
+        self._call_telegram_notify(
+            telegram_notify.report_tv_signal_received,
             action=raw_action,
             entry_type=payload.get("entry_type"),
             price=self.tv_price,
@@ -1428,7 +1428,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         else:
             exp = audit.get("expected", 0)
             if exp and audit.get("matched_full", 0) < exp:
-                dingtalk.report_system_alert(
+                telegram_notify.report_system_alert(
                     f"{source} · 止盈未完全对齐",
                     f"{self.current_side} {live_qty}张 @ {entry:.2f} | "
                     f"仅 {audit.get('matched_full', 0)}/{exp} 档 | "
@@ -1821,7 +1821,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 else:
                     vps_meta = None
                 try:
-                    dingtalk.report_principal_snapshot(
+                    telegram_notify.report_principal_snapshot(
                         reason=reason,
                         principal=principal,
                         regime=self.regime if "开仓前" in reason else None,
@@ -1956,7 +1956,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"= {meta['total_notional']:.0f}U > 上限 {meta['cap']:.0f}U "
             f"(本金 {equity:.0f}U×{MAX_TOTAL_NOTIONAL_MULT:.0f}) | 盘口 {by_sym}"
         )
-        dingtalk.report_system_alert(
+        telegram_notify.report_system_alert(
             f"开仓拦截·名义敞口超限 [{self.symbol}]",
             f"本金 {equity:.0f}U · 上限 {meta['cap']:.0f}U ({MAX_TOTAL_NOTIONAL_MULT:.0f}x)\n"
             f"其它品种名义 {existing:.0f}U + 本笔 {new_notional:.0f}U "
@@ -2037,7 +2037,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         plan_err = self._validate_cap_trim_plan(real, target_qty, trim_qty)
         if plan_err:
             logger.error(f"✂️ {reason_tag} 中止: {plan_err} | live={real} target={target_qty}")
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "档位裁减已中止（安全保护）",
                 f"场景：{reason_tag}\n"
                 f"实盘：**{real}** 张 → 目标：**{target_qty}** 张\n"
@@ -2081,13 +2081,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if new_sz <= target_qty + cap_tol:
                 break
         if new_sz < target_qty * 0.5 and real > target_qty * 1.5:
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "档位裁减过度",
                 f"目标 **{target_qty}** 张，裁减后仅 **{new_sz}** 张（原 **{real}** 张）",
                 suggestion="疑似额度基数错误，请核对本金快照与 TV 档位，必要时人工恢复仓位",
             )
         elif new_sz > target_qty * OPEN_OVERSIZE_RATIO:
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "叠仓裁减未达标",
                 f"目标 **{target_qty}** 张，裁减后仍 **{new_sz}** 张",
                 suggestion="请人工核查 Deepcoin 盘口与挂单，雷达将继续尝试纠偏",
@@ -2162,8 +2162,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"{self._format_audit_summary(result['audit'])} | "
             f"雷达SL={'已保留/已补' if sl else '待命'}"
         )
-        self._call_dingtalk(
-            dingtalk.report_radar_regime_cap_trim,
+        self._call_telegram_notify(
+            telegram_notify.report_radar_regime_cap_trim,
             side=self.current_side,
             old_qty=old_qty,
             new_qty=new_qty,
@@ -2248,8 +2248,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             verify_note = f"{base_note} | REST 同步略延迟"
             logger.info(f"平仓钉钉：REST 延迟，仍推送收网播报 | reason={reason}")
         display_reason = meta.get("tv_reason") or reason or "仓位归零"
-        self._call_dingtalk(
-            dingtalk.report_supervisor_close,
+        self._call_telegram_notify(
+            telegram_notify.report_supervisor_close,
             reason=display_reason,
             verify_note=verify_note,
             verified=flat,
@@ -2436,8 +2436,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         # 钉钉通知
         try:
-            self._call_dingtalk(
-                dingtalk.report_system_alert,
+            self._call_telegram_notify(
+                telegram_notify.report_system_alert,
                 title=f"智能重入限价已挂 [{self.symbol}]",
                 detail=(
                     f"{side_str} attempt={attempt} limit@{lim:.2f} "
@@ -2734,8 +2734,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"盘口无持仓 | 挂单已清空 | 智慧大脑复位待命"
         )
         recover_meta = self._infer_flat_close_meta(hint_reason="重启对账补发收网")
-        self._call_dingtalk(
-            dingtalk.report_supervisor_close,
+        self._call_telegram_notify(
+            telegram_notify.report_supervisor_close,
             reason=recover_meta.get("tv_reason", "仓位归零 (重启对账补发)"),
             verify_note=verify_note,
             verified=True,
@@ -3375,7 +3375,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         f"[{self.symbol}] ⚠️ 硬止损距离异常：TV距离 {dist:.4f} < 0.5×ATR({atr_val:.4f}) "
                         f"| entry={fill_px:.2f} hard={hard:.2f} → 自动扩大至 {min_dist:.4f}"
                     )
-                    dingtalk.report_system_alert(
+                    telegram_notify.report_system_alert(
                         "硬止损距离异常·ATR兜底",
                         f"TV.stop_loss 距离过小 [{self.symbol}] | "
                         f"entry={fill_px:.2f} hard={hard:.2f} | "
@@ -3630,9 +3630,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 + f" | 持仓 {live_qty} 张 @ {self.watched_entry:.2f}"
             )
             if not verified:
-                verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
-            self._call_dingtalk(
-                dingtalk.report_tv_sl_updated,
+                verify_note += f" | {telegram_notify.VERIFY_DELAY_MARK}"
+            self._call_telegram_notify(
+                telegram_notify.report_tv_sl_updated,
                 side=self.current_side or pos_side,
                 live_qty=live_qty,
                 entry=self.watched_entry,
@@ -3645,7 +3645,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 verified=verified,
             )
         else:
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "TV硬止损更新失败",
                 f"UPDATE_SL tv_sl={self.tv_sl:.2f} | 核实未通过，哨兵将继续重试",
             )
@@ -3821,7 +3821,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.warning(
                 f"UPDATE_TP 方向校验失败 {pos_side} entry={entry:.2f} tps={new_tps} → 忽略"
             )
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "UPDATE_TP 已拒绝",
                 f"{pos_side} entry `{entry:.2f}` | 新TP {new_tps} 与持仓方向不符",
             )
@@ -3871,7 +3871,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 logger.error(
                     f"UPDATE_TP 撤旧 TP 仍未净（剩 {len(leftover)}）→ 放弃挂新单，等待下次"
                 )
-                dingtalk.report_system_alert(
+                telegram_notify.report_system_alert(
                     "UPDATE_TP 撤单失败",
                     f"旧限价 TP 未清净 {len(leftover)} 张，未挂新价，硬止损/雷达未动",
                 )
@@ -3899,8 +3899,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"市价 {curr_px:.2f} | 硬止损/雷达未触碰"
         )
         logger.info(f"🚀 UPDATE_TP 完成 verified={verified} | {verify_note}")
-        self._call_dingtalk(
-            dingtalk.report_tv_tp_updated,
+        self._call_telegram_notify(
+            telegram_notify.report_tv_tp_updated,
             side=pos_side,
             live_qty=live_qty,
             entry=entry,
@@ -3913,7 +3913,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             curr_px=curr_px,
         )
         if not verified:
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "UPDATE_TP 对齐未完成",
                 f"{self._format_audit_summary(audit)} | 哨兵将继续核对",
             )
@@ -4036,9 +4036,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             + f" | 持仓 {real_amt} 张"
         )
         if not sl_verified:
-            verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
-        self._call_dingtalk(
-            dingtalk.report_shield_disarmed,
+            verify_note += f" | {telegram_notify.VERIFY_DELAY_MARK}"
+        self._call_telegram_notify(
+            telegram_notify.report_shield_disarmed,
             side=self.current_side,
             live_qty=real_amt,
             entry=self.watched_entry,
@@ -4732,8 +4732,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 progress = self._radar_activation_progress(curr_px)
             except Exception:
                 curr_px = 0
-            self._call_dingtalk(
-                dingtalk.report_shield_disarmed,
+            self._call_telegram_notify(
+                telegram_notify.report_shield_disarmed,
                 side=self.current_side,
                 live_qty=live_qty,
                 entry=entry,
@@ -4857,8 +4857,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             if not getattr(self, "_shield_arm_notified", False):
                 self._shield_arm_notified = True
-                self._call_dingtalk(
-                    dingtalk.report_adverse_shield_armed,
+                self._call_telegram_notify(
+                    telegram_notify.report_adverse_shield_armed,
                     side=self.current_side,
                     entry=entry,
                     live_qty=live_qty,
@@ -4878,7 +4878,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.error(f"🛡️ 硬止损设置失败: {err_msg} | 重试次数: {self._shield_fail_streak}")
 
             if not suppress_alert and self._shield_fail_streak >= 3:
-                dingtalk.report_system_alert(
+                telegram_notify.report_system_alert(
                     "TV硬止损设置失败",
                     f"连续失败 {self._shield_fail_streak} 次 | 错误: {err_msg}",
                     suggestion="请检查持仓状态和 API 权限",
@@ -4900,7 +4900,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if real_amt > 0 and not getattr(self, "_tv_sl_missing_alerted", False):
             logger.error("维护TV硬止损失败：缺少 tv_sl，拒绝 fallback 旧逻辑")
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "TV硬止损缺失",
                 f"持仓 {real_amt} 张 但未收到 tv_sl，无法挂止损",
                 suggestion="请确认 TV 策略已透传 tv_sl，或发送 UPDATE_SL",
@@ -5299,7 +5299,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.warning(f"雷达首次激活钉钉跳过：止损 @ {new_sl:.2f} 未核实")
             return
         if not verified:
-            verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
+            verify_note += f" | {telegram_notify.VERIFY_DELAY_MARK}"
         breath_meta = getattr(self, "_breath_coeff_meta", None) or {}
         trail_dist = float(
             (getattr(self, "open_atr", 0) or 0)
@@ -5313,8 +5313,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         else:
             open_kind = "首次开仓"
             trigger_gate = "首次·TP1-TP2中点"
-        self._call_dingtalk(
-            dingtalk.report_radar_activated,
+        self._call_telegram_notify(
+            telegram_notify.report_radar_activated,
             side=self.current_side,
             qty=real_amt,
             entry=self.watched_entry,
@@ -5568,7 +5568,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"📡 [{source or '雷达'}] 解除过早雷达/伪TP{stale or '标记'} "
             f"→ 恢复 tv_sl={tv:.2f}"
         )
-        dingtalk.report_system_alert(
+        telegram_notify.report_system_alert(
             "雷达解除·恢复呼吸空间",
             f"{self.current_side} {live_qty}张 @ {entry:.2f} | "
             f"清除伪TP{stale or '标记'} | tv_sl={tv:.2f} | "
@@ -5977,8 +5977,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         )
         new_audit = result["audit"]
         if new_audit["matched_full"] < new_audit["expected"]:
-            self._call_dingtalk(
-                dingtalk.report_system_alert,
+            self._call_telegram_notify(
+                telegram_notify.report_system_alert,
                 title="雷达守护：止盈仍未对齐",
                 detail=(
                     f"{self.current_side} {real_amt}张 | "
@@ -5993,8 +5993,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             if getattr(self, "_recover_tp_unconfirmed", False):
                 self._recover_tp_unconfirmed = False
-                self._call_dingtalk(
-                    dingtalk.report_radar_guardian_realigned,
+                self._call_telegram_notify(
+                    telegram_notify.report_radar_guardian_realigned,
                     side=self.current_side,
                     qty=real_amt,
                     tp_audit=new_audit,
@@ -6006,8 +6006,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 )
             elif getattr(self, "_open_tp_unconfirmed", False):
                 self._open_tp_unconfirmed = False
-                self._call_dingtalk(
-                    dingtalk.report_radar_guardian_realigned,
+                self._call_telegram_notify(
+                    telegram_notify.report_radar_guardian_realigned,
                     side=self.current_side,
                     qty=real_amt,
                     tp_audit=new_audit,
@@ -6408,7 +6408,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"（价未达TP1 / 开仓重建竞态）→ 不标记·不启雷达 | "
                     f"{old_qty}→{new_qty}"
                 )
-                dingtalk.report_system_alert(
+                telegram_notify.report_system_alert(
                     "雷达拒启·伪TP1拦截",
                     f"{self.current_side} {old_qty}→{new_qty}张 | {levels} | "
                     f"现价 {float(curr_px or 0):.2f} | "
@@ -6478,8 +6478,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 new_qty, self.watched_entry, dynamic_sl=None,
                 reason="硬止损成交后 TP 重算",
             )
-            self._call_dingtalk(
-                dingtalk.report_shield_tier_fill,
+            self._call_telegram_notify(
+                telegram_notify.report_shield_tier_fill,
                 side=self.current_side,
                 tier_pct=f["pct"],
                 tier_price=f["price"],
@@ -6537,7 +6537,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"{self._format_audit_summary(realign_result['audit'])}"
         )
         if not verified:
-            verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
+            verify_note += f" | {telegram_notify.VERIFY_DELAY_MARK}"
 
         fills = []
         if change and change.get("kind") == "tp_fill":
@@ -6546,8 +6546,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             fills = self._detect_tp_fills(old_qty, new_qty)
         if fills:
             for fill in fills:
-                self._call_dingtalk(
-                    dingtalk.report_tp_fill,
+                self._call_telegram_notify(
+                    telegram_notify.report_tp_fill,
                     tp_level=fill["level"],
                     tp_price=fill["price"],
                     filled_qty=fill["qty"],
@@ -6566,8 +6566,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             action_msg = (
                 "手动加仓" if new_qty > old_qty else "部分止盈吃单 / 手动减仓"
             )
-            self._call_dingtalk(
-                dingtalk.report_manual_position_change,
+            self._call_telegram_notify(
+                telegram_notify.report_manual_position_change,
                 action_type=action_msg,
                 old_qty=old_qty,
                 new_qty=new_qty,
@@ -6578,7 +6578,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
 
         if realign_result["expected"] > 0 and realign_result["matched"] < realign_result["expected"]:
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "人工异动后止盈未对齐",
                 f"{self._format_audit_summary(realign_result['audit'])}",
             )
@@ -6605,10 +6605,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if verified:
             verify_note = base_note
         else:
-            verify_note = f"{base_note} | {dingtalk.VERIFY_DELAY_MARK}"
+            verify_note = f"{base_note} | {telegram_notify.VERIFY_DELAY_MARK}"
             logger.info(f"雷达钉钉：止损已挂 REST 延迟，仍推送 @{new_sl:.2f}")
-        self._call_dingtalk(
-            dingtalk.report_intervention,
+        self._call_telegram_notify(
+            telegram_notify.report_intervention,
             qty=real_amt,
             entry_px=self.watched_entry,
             new_sl=new_sl,
@@ -6966,7 +6966,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         f"忽略反向 CLOSE，防止多空混乱"
                     )
                     try:
-                        dingtalk.report_system_alert(
+                        telegram_notify.report_system_alert(
                             f"🚫 CLOSE 方向不匹配 已拒绝 [{self.symbol}]",
                             f"TV 发 {close_side} 但持仓 {pos_side} | "
                             f"忽略反向信号，保留当前持仓 | {close_reason or raw_action}",
@@ -7022,7 +7022,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"开仓后 {age:.2f}s < {LATE_CLOSE_SUPPRESS_SEC}s · 保持开仓"
                 )
                 try:
-                    dingtalk.report_system_alert(
+                    telegram_notify.report_system_alert(
                         f"迟到平仓已忽略·保持开仓 [{self.symbol}]",
                         f"{raw_action} 距开仓成交仅 {age:.2f}s "
                         f"(窗={LATE_CLOSE_SUPPRESS_SEC}s) → 不执行平仓，"
@@ -7197,8 +7197,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             "regime_changed": f"档位 R{self.open_regime}→R{self.regime} → 刷新仓位",
             "spread_ok": f"理论价差 {diff_pct:.3f}% ≥ {SAME_DIR_MIN_SPREAD_PCT}% → 刷新仓位",
         }.get(reason, "同向刷新仓位")
-        self._call_dingtalk(
-            dingtalk.report_smart_same_dir_decision,
+        self._call_telegram_notify(
+            telegram_notify.report_smart_same_dir_decision,
             side=action,
             decision=f"reentry_{reason}",
             live_entry=live_entry,
@@ -7243,8 +7243,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"止盈 {result['matched']}/{result['expected']} 档 | "
             f"{self._format_audit_summary(result['audit'])}"
         )
-        self._call_dingtalk(
-            dingtalk.report_smart_same_dir_decision,
+        self._call_telegram_notify(
+            telegram_notify.report_smart_same_dir_decision,
             side=action,
             decision="skip_refresh_tp",
             live_entry=entry,
@@ -7447,7 +7447,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._pipeline_fail(Role.AUDITOR_POS, "CLEAR_FAIL")
             except Exception:
                 pass
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "先平后开中止 · 平仓未归零",
                 "强平后盘口仍有持仓，已拒绝新开仓，请人工核查 Deepcoin 盘口",
             )
@@ -7459,7 +7459,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._pipeline_fail(Role.AUDITOR_POS, "CLEAR_VERIFY_FAIL")
             except Exception:
                 pass
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 "先平后开中止 · 空仓核查失败",
                 "平仓指令已发但 REST 仍显示持仓，已拒绝叠仓开仓",
             )
@@ -7476,7 +7476,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.error("❌ 先平后开中止：无有效市价")
             return
         try:
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 title=f"先平后开·执行 [{self.symbol}]",
                 detail=(
                     f"{reason} | 无菌通过 @ {float(curr_px):.2f} → 开 {action} "
@@ -7600,7 +7600,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.warning(f"{entry_type} 到达但盘口无持仓，已忽略")
             return
         if self._pos_side_label(pos) != action:
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 f"{entry_type} 方向不符",
                 f"TV {action} vs 实盘 {self._pos_side_label(pos)}，已拒绝加仓",
             )
@@ -7609,7 +7609,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.warning(
                 f"{entry_type} 跳过：R{self.regime} TV加仓比例={tv_ratio:.2f}（档位禁止加仓）"
             )
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 f"{entry_type} 加仓跳过",
                 f"R{self.regime} TV qty_ratio={tv_ratio:.2f} ≤ 0 | "
                 f"base={getattr(self, 'base_qty', 0)} 张",
@@ -7620,7 +7620,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 f"{entry_type} 跳过：已达 R{self.regime} 最大加仓次数 {max_add} "
                 f"(base={getattr(self, 'base_qty', 0)})"
             )
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 f"{entry_type} 加仓跳过",
                 f"R{self.regime} 已达最大加仓 {max_add} 次 | base={getattr(self, 'base_qty', 0)} "
                 f"| 现仓 {self._safe_qty(pos.get('size', 0))} 张",
@@ -7633,7 +7633,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         add_qty, meta = self._calc_vps_add_qty(tv_ratio)
         if add_qty <= 0:
             logger.error(f"{entry_type} 跳过：计算加仓量无效 {meta}")
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 f"{entry_type} 数量无效",
                 f"加仓计算失败: {self._tv_sizing_note(add_qty, meta, entry_type=entry_type)}",
             )
@@ -7649,7 +7649,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         pos_side = "long" if action == "LONG" else "short"
         res = deepcoin_client.place_market_order(self.symbol, open_side, pos_side, add_qty)
         if not res or not deepcoin_client._is_success(res):
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 f"{entry_type} 下单失败",
                 f"{action} 追加 {add_qty} 张 市价单未成交",
             )
@@ -7658,7 +7658,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         new_pos = self._get_active_position()
         if not new_pos or self._safe_qty(new_pos.get("size", 0)) <= old_qty:
-            dingtalk.report_system_alert(
+            telegram_notify.report_system_alert(
                 f"{entry_type} 核实失败",
                 f"追加 {add_qty} 张 后实盘未增长",
             )
@@ -7693,8 +7693,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"| tv_sl={getattr(self, 'tv_sl', 0):.2f} "
             f"| {'防线已核实' if sl_ok and self._tp_audit_ok(audit) else '防线待核实'}"
         )
-        self._call_dingtalk(
-            dingtalk.report_tv_position_add,
+        self._call_telegram_notify(
+            telegram_notify.report_tv_position_add,
             side=action,
             entry_type=entry_type,
             add_qty=add_qty,
@@ -7770,8 +7770,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if self._verify_flat() and self._is_duplicate_flat_entry(action, curr_px):
             logger.info(f"🧠 空仓短时重复开仓 TV [{action}] → 忽略，干净等待下次")
             try:
-                self._call_dingtalk(
-                    dingtalk.report_smart_same_dir_decision,
+                self._call_telegram_notify(
+                    telegram_notify.report_smart_same_dir_decision,
                     side=action,
                     decision="skip_duplicate_flat",
                     live_entry=0.0,
@@ -7835,7 +7835,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
             if not self._wait_verify(self._verify_flat, retries=4, delay=0.35):
                 logger.error("开仓中止：市价下单前盘口仍非空")
-                dingtalk.report_system_alert(
+                telegram_notify.report_system_alert(
                     f"开仓中止 · 下单前盘口非空 [{self.symbol}]",
                     f"TV **{action}** 目标 **{qty}** 张，下单前 REST 仍显示持仓，已拒绝叠仓",
                     suggestion="系统将尝试强制清场，请核查是否有人工挂单或残仓",
@@ -7856,7 +7856,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self._pipeline_fail(Role.EXECUTION, "ENTRY_SUBMIT_FAIL")
                 except Exception:
                     pass
-                dingtalk.report_system_alert("开仓失败", f"TV {action} {qty} 张 市价单失败")
+                telegram_notify.report_system_alert("开仓失败", f"TV {action} {qty} 张 市价单失败")
                 return
             time.sleep(2.0)
 
@@ -7875,7 +7875,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"🚨 持仓超标: 目标 {qty} 张，实盘 {real_qty} 张 "
                     f"(>{qty * OPEN_OVERSIZE_RATIO:.3f})，启动裁减"
                 )
-                dingtalk.report_system_alert(
+                telegram_notify.report_system_alert(
                     "持仓超标 · 自动裁减",
                     f"目标 {qty} 张 (下单额 {margin_usdt:.0f}U)，"
                     f"实盘 {real_qty} 张 @ {pos['entry_price']:.2f}，正在 reduceOnly 裁减",
@@ -7891,7 +7891,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             payload_atr = self._safe_float((payload or {}).get("atr"), 0.0)
             if payload_atr <= 0:
                 try:
-                    dingtalk.report_system_alert(
+                    telegram_notify.report_system_alert(
                         f"[{getattr(self, 'tag', '?')}] 开仓拒绝·缺TV atr",
                         f"{self.symbol} webhook 无 atr → 拒绝开仓",
                         level="紧急",
@@ -8065,8 +8065,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._pipeline_run_chief_audit(source="deepcoin_open")
             except Exception as e:
                 logger.warning(f"[{self.symbol}] chief audit wire: {e}")
-            self._call_dingtalk(
-                dingtalk.report_supervisor_open,
+            self._call_telegram_notify(
+                telegram_notify.report_supervisor_open,
                 side=self.current_side,
                 entry_price=verified['entry_price'],
                 tv_price=self.tv_price,
@@ -8098,7 +8098,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     "重复 TP 占满可减仓额度 | 雷达将接力纠偏"
                     if dupes else "请查 logs/deepcoin_brain.log"
                 )
-                dingtalk.report_system_alert(
+                telegram_notify.report_system_alert(
                     "开仓后限价止盈未全部挂上",
                     f"{self.current_side} {vqty}张 | 仅 {matched}/{expected} 档 | "
                     f"{self._format_audit_summary(audit)} | {hint}",
@@ -8558,7 +8558,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         f"⚠️ tv_tps=全零 → ATR紧急Fallback TP123={self.tv_tps} "
                         f"| entry={entry:.2f} ATR={atr:.2f} R{regime}"
                     )
-                    dingtalk.report_system_alert(
+                    telegram_notify.report_system_alert(
                         "TP价格缺失·ATR紧急Fallback",
                         f"tv_tps全零 | {self.current_side} {live_qty}张 @ {entry:.2f} | "
                         f"ATR={atr:.2f} R{regime} → 强制Fallback {self.tv_tps}",
@@ -8724,7 +8724,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"{p['posSide']}:{self._safe_qty(p['size'])}张" for p in all_residual
                 ) if all_residual else "无"
                 logger.error(f"❌ 6 轮强平后仍有残单: {residual_info}")
-                dingtalk.report_system_alert(
+                telegram_notify.report_system_alert(
                     "强平未完全归零",
                     f"6 轮市价平仓后仍剩: {residual_info}，请人工核查 Deepcoin 盘口",
                 )
@@ -8764,8 +8764,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 verify_note = "盘口无持仓 | 挂单已清空 | 智慧大脑复位待命"
                 if not flat:
                     verify_note += " | REST 同步略延迟"
-                self._call_dingtalk(
-                    dingtalk.report_force_align,
+                self._call_telegram_notify(
+                    telegram_notify.report_force_align,
                     real_side=real_side,
                     expected_side=expected_side,
                     verify_note=force_verify_note or verify_note,
@@ -8879,7 +8879,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if not self._lock.acquire(timeout=120.0):
                     logger.error("❌ 重启接管无法获取锁，跳过")
                     self._recover_in_progress = False
-                    dingtalk.report_system_alert(
+                    telegram_notify.report_system_alert(
                         "重启接管失败",
                         "无法获取仓位锁（120s超时），请稍后重启或检查是否有僵死进程",
                     )
@@ -8983,8 +8983,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     )
 
                     if reconcile.get("manual_open"):
-                        self._call_dingtalk(
-                            dingtalk.report_manual_position_change,
+                        self._call_telegram_notify(
+                            telegram_notify.report_manual_position_change,
                             action_type="人工开仓 · 重启接管",
                             old_qty=0,
                             new_qty=real_amt,
@@ -9015,11 +9015,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         f"{self._format_audit_summary(audit)}{skip_note}{tv_note}{reconcile_txt}"
                     )
                     if not verified:
-                        verify_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
+                        verify_note += f" | {telegram_notify.VERIFY_DELAY_MARK}"
                     if qty_change:
                         old_q, new_q, action_msg = qty_change
-                        self._call_dingtalk(
-                            dingtalk.report_manual_position_change,
+                        self._call_telegram_notify(
+                            telegram_notify.report_manual_position_change,
                             action_type=action_msg,
                             old_qty=old_q,
                             new_qty=new_q,
@@ -9035,7 +9035,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             if dupes else "请查 logs/deepcoin_brain.log 是否有撤单/限价失败"
                         )
                         self._recover_tp_unconfirmed = True
-                        dingtalk.report_system_alert(
+                        telegram_notify.report_system_alert(
                             "重启接管后限价止盈未对齐",
                             f"{self.current_side} {real_amt}张 @ {entry_px:.2f} | "
                             f"仅 {matched}/{expected} 档 | {self._format_audit_summary(audit)} | "
@@ -9051,8 +9051,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
                     self._sentinel_grace_until = time.time() + SENTINEL_GRACE_AFTER_RECOVER_SEC
 
-                    self._call_dingtalk(
-                        dingtalk.report_recover_takeover,
+                    self._call_telegram_notify(
+                        telegram_notify.report_recover_takeover,
                         side=self.current_side,
                         qty=real_amt,
                         entry=entry_px,
@@ -9087,7 +9087,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     logger.error(f"❌ 重启接管步骤异常: {recover_err}")
                     self.monitoring = True
                     self._save_state()
-                    dingtalk.report_system_alert(
+                    telegram_notify.report_system_alert(
                         "重启接管部分失败",
                         f"实盘仍有仓，已尽力启动哨兵接力 | {recover_err}",
                     )
@@ -9123,14 +9123,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"{DEEPCOIN_SUPERVISOR_VERSION}"
                 )
                 if not flat_ok:
-                    standby_note += f" | {dingtalk.VERIFY_DELAY_MARK}"
-                dingtalk.report_recover_standby(
+                    standby_note += f" | {telegram_notify.VERIFY_DELAY_MARK}"
+                telegram_notify.report_recover_standby(
                     verify_note=standby_note,
                     version=DEEPCOIN_SUPERVISOR_VERSION,
                 )
         except Exception as e:
             logger.error(f"❌ 闪电接管异常: {e}")
-            dingtalk.report_system_alert("重启接管失败", str(e))
+            telegram_notify.report_system_alert("重启接管失败", str(e))
 
 
 position_supervisor = None
