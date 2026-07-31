@@ -6928,6 +6928,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         close_reason = str(payload.get("reason") or "策略指标反转/波动率安全退出").strip()
         close_side = str(payload.get("side") or "").strip().upper()
         pnl_pct = payload.get("pnl_pct")
+        # 【BUG修复】is_close 在 _process_signal 中使用，但定义在 _process_close_action 中
+        # 对于非 close 信号 is_close 永远为 False（因为 side 不是 CLOSE 类）
+        is_close = (
+            raw_action in ("CLOSE", "CLOSE_PROTECT", "CLOSE_TP3", "CLOSE_STOPLOSS", "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT")
+            or str(raw_action or "").startswith("CLOSE")
+        )
 
         # P0 修复：CLOSE 方向校验 — 反向信号立即丢弃并告警
         if is_close and close_side in ("LONG", "SHORT"):
