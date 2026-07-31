@@ -15,7 +15,6 @@ from pipeline_bridge import PipelineBridgeMixin
 from pipeline_ledger import Role
 from radar_reentry_mixin import RadarReentryMixin
 import telegram_notify
-from telegram_notify import (
 from tv_seq import (
     reorder_batch_close_then_open,
     extract_seq_meta,
