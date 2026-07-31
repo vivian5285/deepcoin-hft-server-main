@@ -80,23 +80,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.16a-hedge-check"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.17-eth-only-no-dingtalk"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
-# v16.10+：哨兵轮询加快（配合 API 限流放宽，不再需要慢速规避）
-SENTINEL_POLL_NORMAL = 12.0
-SENTINEL_POLL_ARMING = 10.0
-SENTINEL_POLL_RADAR = 10.0
-IDLE_PATROL_INTERVAL_SEC = 120
+# v16.17：轮询降低以减少 API 调用，根源解决限流
+SENTINEL_POLL_NORMAL = 20.0
+SENTINEL_POLL_ARMING = 15.0
+SENTINEL_POLL_RADAR = 15.0
+IDLE_PATROL_INTERVAL_SEC = 180
 IDLE_PATROL_BACKOFF_SEC = 900
 IDLE_TAKEOVER_COOLDOWN_SEC = 30
 DUST_ORPHAN_CONTRACTS = 1
 TP_COMPLETE_RESIDUAL_RATIO = 0.12
 OPEN_OVERSIZE_RATIO = 1.10
 SIGNAL_DEDUP_SEC = 45
-# v16.10+：防线对齐冷却缩短（配合限流放宽）
-DEFENSE_ALIGN_COOLDOWN_SEC = 20
+# v16.17：防线对齐冷却延长以减少不必要的 API 查询
+DEFENSE_ALIGN_COOLDOWN_SEC = 30
 SENTINEL_GRACE_AFTER_RECOVER_SEC = 30
 FLAT_CONFIRM_RETRIES = 6
 FLAT_CONFIRM_DELAY_SEC = 0.85
@@ -536,10 +536,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
 
         if expected > 0 and matched < expected:
-            telegram_notify.report_system_alert(
-                f"{source} · 止盈未完全对齐",
-                f"{side} {real_amt}张 @ {entry_px:.2f} | "
-                f"仅 {matched}/{expected} 档 | 哨兵将接力纠偏",
+            logger.warning(
+                f"[钉钉已关闭] {source} · 止盈未完全对齐 | "
+                f"{side} {real_amt}张 @ {entry_px:.2f} | 仅 {matched}/{expected} 档"
             )
         else:
             self._mark_defense_align_ok()
@@ -637,27 +636,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     @staticmethod
     def _call_telegram_notify(fn, **kwargs):
-        """TG通知（静默失败，不阻断主流程）。"""
+        """TG已关闭，仅记录日志。"""
         try:
-            fn(**kwargs)
-        except TypeError as exc:
-            if "unexpected keyword argument" not in str(exc):
-                raise
-            legacy = {
-                k: v for k, v in kwargs.items()
-                if k not in ("verified", "swept_dust", "radar_sl_ok", "action_type")
-            }
-            fn(**legacy)
-        except Exception as e:
-            logger.debug(f"TG发送异常（静默）: {e}")
+            fn_name = getattr(fn, '__name__', str(fn))
+            logger.info(f"[TG离线] {fn_name} | {list(kwargs.keys())}")
+        except Exception:
+            pass
 
     @staticmethod
     def _call_telegram(fn, **kwargs):
-        """TG 通知（静默失败，不阻断主流程）。"""
+        """TG已关闭，仅记录日志。"""
         try:
-            fn(**kwargs)
-        except Exception as e:
-            logger.debug(f"TG 发送异常（静默）: {e}")
+            fn_name = getattr(fn, '__name__', str(fn))
+            logger.info(f"[TG离线] {fn_name} | {list(kwargs.keys())}")
+        except Exception:
+            pass
 
     def _start_signal_worker(self):
         if self._signal_worker_started:
@@ -732,17 +725,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._close_open_chain_active = True
                 self._last_close_bar_index = int(bi)
             try:
-                telegram_notify.report_system_alert(
-                    title=f"先平后开链·同秒开平 [{self.symbol}]",
-                    detail=(
-                        f"执行 {exec_chain} | TV按seq {tv_by_seq} | "
-                        f"终态必须开仓（动作优先于seq）"
-                    ),
-                    level="信息",
-                    suggestion="同秒开+平已强制先平后开；核对实盘终态有仓",
+                logger.info(
+                    f"[钉钉已关闭] 先平后开链·同秒开平 [{self.symbol}] | "
+                    f"执行 {exec_chain} | TV按seq {tv_by_seq} | "
+                    f"终态必须开仓（动作优先于seq）"
                 )
             except Exception as e:
-                logger.warning(f"先平后开链钉钉失败: {e}")
+                logger.debug(f"先平后开链日志失败: {e}")
 
     def _signal_fingerprint(self, payload):
         action = str(payload.get("action", "")).strip().upper()
@@ -1427,11 +1416,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         else:
             exp = audit.get("expected", 0)
             if exp and audit.get("matched_full", 0) < exp:
-                telegram_notify.report_system_alert(
-                    f"{source} · 止盈未完全对齐",
+                logger.warning(
+                    f"[钉钉已关闭] {source} · 止盈未完全对齐 | "
                     f"{self.current_side} {live_qty}张 @ {entry:.2f} | "
                     f"仅 {audit.get('matched_full', 0)}/{exp} 档 | "
-                    f"tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | 哨兵接力",
+                    f"tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | 哨兵接力"
                 )
 
         self._post_recover_radar_pulse = True
@@ -1955,12 +1944,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"= {meta['total_notional']:.0f}U > 上限 {meta['cap']:.0f}U "
             f"(本金 {equity:.0f}U×{MAX_TOTAL_NOTIONAL_MULT:.0f}) | 盘口 {by_sym}"
         )
-        telegram_notify.report_system_alert(
-            f"开仓拦截·名义敞口超限 [{self.symbol}]",
-            f"本金 {equity:.0f}U · 上限 {meta['cap']:.0f}U ({MAX_TOTAL_NOTIONAL_MULT:.0f}x)\n"
-            f"其它品种名义 {existing:.0f}U + 本笔 {new_notional:.0f}U "
-            f"= {meta['total_notional']:.0f}U\n"
-            f"盘口名义 {by_sym}",
+        logger.warning(
+            f"[钉钉已关闭] 开仓拦截·名义敞口超限 [{self.symbol}] | "
+            f"本金 {equity:.0f}U · 上限 {meta['cap']:.0f}U ({MAX_TOTAL_NOTIONAL_MULT:.0f}x) | "
+            f"其它品种名义 {existing:.0f}U + 本笔 {new_notional:.0f}U = {meta['total_notional']:.0f}U | "
+            f"盘口名义 {by_sym}"
         )
         return False, meta
 
@@ -2036,12 +2024,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         plan_err = self._validate_cap_trim_plan(real, target_qty, trim_qty)
         if plan_err:
             logger.error(f"✂️ {reason_tag} 中止: {plan_err} | live={real} target={target_qty}")
-            telegram_notify.report_system_alert(
-                "档位裁减已中止（安全保护）",
-                f"场景：{reason_tag}\n"
-                f"实盘：**{real}** 张 → 目标：**{target_qty}** 张\n"
-                f"原因：{plan_err}",
-                suggestion="请核对本金快照与 TV 档位是否一致；勿手动干预，待下一 TV 信号或人工核查后重试",
+            logger.warning(
+                f"[钉钉已关闭] 档位裁减已中止（安全保护）| "
+                f"场景：{reason_tag} | 实盘 {real}张 → 目标 {target_qty}张 | 原因：{plan_err}"
             )
             return real
         close_side = "sell" if action == "LONG" else "buy"
@@ -2080,16 +2065,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if new_sz <= target_qty + cap_tol:
                 break
         if new_sz < target_qty * 0.5 and real > target_qty * 1.5:
-            telegram_notify.report_system_alert(
-                "档位裁减过度",
-                f"目标 **{target_qty}** 张，裁减后仅 **{new_sz}** 张（原 **{real}** 张）",
-                suggestion="疑似额度基数错误，请核对本金快照与 TV 档位，必要时人工恢复仓位",
+            logger.warning(
+                f"[钉钉已关闭] 档位裁减过度 | "
+                f"目标 {target_qty}张，裁减后仅 {new_sz}张（原 {real}张）"
             )
         elif new_sz > target_qty * OPEN_OVERSIZE_RATIO:
-            telegram_notify.report_system_alert(
-                "叠仓裁减未达标",
-                f"目标 **{target_qty}** 张，裁减后仍 **{new_sz}** 张",
-                suggestion="请人工核查 Deepcoin 盘口与挂单，雷达将继续尝试纠偏",
+            logger.warning(
+                f"[钉钉已关闭] 叠仓裁减未达标 | "
+                f"目标 {target_qty}张，裁减后仍 {new_sz}张"
             )
         return new_sz
 
@@ -2433,7 +2416,6 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"attempt={attempt} tag={tag}"
         )
 
-        # 钉钉通知
         try:
             self._call_telegram_notify(
                 telegram_notify.report_system_alert,
@@ -3374,13 +3356,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         f"[{self.symbol}] ⚠️ 硬止损距离异常：TV距离 {dist:.4f} < 0.5×ATR({atr_val:.4f}) "
                         f"| entry={fill_px:.2f} hard={hard:.2f} → 自动扩大至 {min_dist:.4f}"
                     )
-                    telegram_notify.report_system_alert(
-                        "硬止损距离异常·ATR兜底",
+                    logger.warning(
+                        f"[钉钉已关闭] 硬止损距离异常·ATR兜底 | "
                         f"TV.stop_loss 距离过小 [{self.symbol}] | "
                         f"entry={fill_px:.2f} hard={hard:.2f} | "
                         f"dist={dist:.4f} < 0.5×ATR({atr_val:.4f}) | "
-                        f"已自动扩大至 {min_dist:.4f}（方向 {side_check}）",
-                        suggestion="请核查 TV 策略的 stop_loss 设置是否合理",
+                        f"已自动扩大至 {min_dist:.4f}（方向 {side_check}）"
                     )
                     # 用 ATR 兜底距离重新计算硬止损价
                     if side_check == "LONG":
@@ -3644,9 +3625,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 verified=verified,
             )
         else:
-            telegram_notify.report_system_alert(
-                "TV硬止损更新失败",
-                f"UPDATE_SL tv_sl={self.tv_sl:.2f} | 核实未通过，哨兵将继续重试",
+            logger.warning(
+                f"[钉钉已关闭] TV硬止损更新失败 | UPDATE_SL tv_sl={self.tv_sl:.2f} | 核实未通过，哨兵将继续重试"
             )
 
     def _place_tp_levels_only(self, live_qty, retries=2):
@@ -3820,9 +3800,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.warning(
                 f"UPDATE_TP 方向校验失败 {pos_side} entry={entry:.2f} tps={new_tps} → 忽略"
             )
-            telegram_notify.report_system_alert(
-                "UPDATE_TP 已拒绝",
-                f"{pos_side} entry `{entry:.2f}` | 新TP {new_tps} 与持仓方向不符",
+            logger.warning(
+                f"[钉钉已关闭] UPDATE_TP 已拒绝 | {pos_side} entry `{entry:.2f}` | 新TP {new_tps} 与持仓方向不符"
             )
             return
 
@@ -3870,9 +3849,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 logger.error(
                     f"UPDATE_TP 撤旧 TP 仍未净（剩 {len(leftover)}）→ 放弃挂新单，等待下次"
                 )
-                telegram_notify.report_system_alert(
-                    "UPDATE_TP 撤单失败",
-                    f"旧限价 TP 未清净 {len(leftover)} 张，未挂新价，硬止损/雷达未动",
+                logger.warning(
+                    f"[钉钉已关闭] UPDATE_TP 撤单失败 | 旧限价 TP 未清净 {len(leftover)} 张，未挂新价，硬止损/雷达未动"
                 )
                 if old_tps and sum(1 for t in old_tps if float(t or 0) > 0) >= 2:
                     self.tv_tps = self._sanitize_tp_prices(old_tps)
@@ -3912,9 +3890,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             curr_px=curr_px,
         )
         if not verified:
-            telegram_notify.report_system_alert(
-                "UPDATE_TP 对齐未完成",
-                f"{self._format_audit_summary(audit)} | 哨兵将继续核对",
+            logger.warning(
+                f"[钉钉已关闭] UPDATE_TP 对齐未完成 | {self._format_audit_summary(audit)} | 哨兵将继续核对"
             )
 
     def _shield_tier_prices(self, entry=None):
@@ -4877,10 +4854,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.error(f"🛡️ 硬止损设置失败: {err_msg} | 重试次数: {self._shield_fail_streak}")
 
             if not suppress_alert and self._shield_fail_streak >= 3:
-                telegram_notify.report_system_alert(
-                    "TV硬止损设置失败",
-                    f"连续失败 {self._shield_fail_streak} 次 | 错误: {err_msg}",
-                    suggestion="请检查持仓状态和 API 权限",
+                logger.warning(
+                    f"[钉钉已关闭] TV硬止损设置失败 | 连续失败 {self._shield_fail_streak} 次 | 错误: {err_msg}"
                 )
             return False
 
@@ -4899,10 +4874,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if real_amt > 0 and not getattr(self, "_tv_sl_missing_alerted", False):
             logger.error("维护TV硬止损失败：缺少 tv_sl，拒绝 fallback 旧逻辑")
-            telegram_notify.report_system_alert(
-                "TV硬止损缺失",
-                f"持仓 {real_amt} 张 但未收到 tv_sl，无法挂止损",
-                suggestion="请确认 TV 策略已透传 tv_sl，或发送 UPDATE_SL",
+            logger.warning(
+                f"[钉钉已关闭] TV硬止损缺失 | 持仓 {real_amt} 张 但未收到 tv_sl，无法挂止损"
             )
             self._tv_sl_missing_alerted = True
         return False
@@ -5567,11 +5540,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             f"📡 [{source or '雷达'}] 解除过早雷达/伪TP{stale or '标记'} "
             f"→ 恢复 tv_sl={tv:.2f}"
         )
-        telegram_notify.report_system_alert(
-            "雷达解除·恢复呼吸空间",
+        logger.info(
+            f"[钉钉已关闭] 雷达解除·恢复呼吸空间 | "
             f"{self.current_side} {live_qty}张 @ {entry:.2f} | "
             f"清除伪TP{stale or '标记'} | tv_sl={tv:.2f} | "
-            f"等待价格到达TP1-TP2中点后激活雷达",
+            f"等待价格到达TP1-TP2中点后激活雷达"
         )
         if live_qty > 0 and tv > 0:
             self._maintain_hard_shield(live_qty, curr_px, force=True)
@@ -6407,11 +6380,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"（价未达TP1 / 开仓重建竞态）→ 不标记·不启雷达 | "
                     f"{old_qty}→{new_qty}"
                 )
-                telegram_notify.report_system_alert(
-                    "雷达拒启·伪TP1拦截",
+                logger.warning(
+                    f"[钉钉已关闭] 雷达拒启·伪TP1拦截 | "
                     f"{self.current_side} {old_qty}→{new_qty}张 | {levels} | "
                     f"现价 {float(curr_px or 0):.2f} | "
-                    f"规则：TP1限价实盘成交前不激活雷达",
+                    f"规则：TP1限价实盘成交前不激活雷达"
                 )
                 result = self._smart_realign_defenses(
                     new_qty, self.watched_entry, dynamic_sl=None,
@@ -6577,9 +6550,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
 
         if realign_result["expected"] > 0 and realign_result["matched"] < realign_result["expected"]:
-            telegram_notify.report_system_alert(
-                "人工异动后止盈未对齐",
-                f"{self._format_audit_summary(realign_result['audit'])}",
+            logger.warning(
+                f"[钉钉已关闭] 人工异动后止盈未对齐 | {self._format_audit_summary(realign_result['audit'])}"
             )
 
     def _report_radar_intervention(self, real_amt, new_sl, action_msg, sl_placed=True):
@@ -6965,19 +6937,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         f"忽略反向 CLOSE，防止多空混乱"
                     )
                     try:
-                        telegram_notify.report_system_alert(
-                            f"🚫 CLOSE 方向不匹配 已拒绝 [{self.symbol}]",
-                            f"TV 发 {close_side} 但持仓 {pos_side} | "
-                            f"忽略反向信号，保留当前持仓 | {close_reason or raw_action}",
-                            level="危险",
-                            suggestion="检查 TV 策略信号是否错发方向",
-                        )
-                        self._call_telegram(
-                            telegram_notify.report_system_alert,
-                            title=f"CLOSE 方向不匹配 [{self.symbol}]",
-                            detail=f"TV={close_side} 持仓={pos_side} | 已拒绝 | {close_reason or raw_action}",
-                            level="危险",
-                            suggestion="检查 TV 策略信号是否错发方向",
+                        logger.warning(
+                            f"[钉钉已关闭] CLOSE 方向不匹配 [{self.symbol}] | "
+                            f"TV={close_side} 持仓={pos_side} | 已拒绝 | {close_reason or raw_action}"
                         )
                     except Exception:
                         pass
@@ -7021,13 +6983,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"开仓后 {age:.2f}s < {LATE_CLOSE_SUPPRESS_SEC}s · 保持开仓"
                 )
                 try:
-                    telegram_notify.report_system_alert(
-                        f"迟到平仓已忽略·保持开仓 [{self.symbol}]",
-                        f"{raw_action} 距开仓成交仅 {age:.2f}s "
-                        f"(窗={LATE_CLOSE_SUPPRESS_SEC}s) → 不执行平仓，"
-                        f"防刚开又平；同窗先平后开链不受影响",
-                        level="警告",
-                        suggestion="若确需平仓请人工或等待抑制窗结束后再发 CLOSE",
+                    logger.warning(
+                        f"[钉钉已关闭] 迟到平仓已忽略·保持开仓 [{self.symbol}] | "
+                        f"{raw_action} 距开仓成交仅 {age:.2f}s (窗={LATE_CLOSE_SUPPRESS_SEC}s)"
                     )
                 except Exception:
                     pass
@@ -7446,9 +7404,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._pipeline_fail(Role.AUDITOR_POS, "CLEAR_FAIL")
             except Exception:
                 pass
-            telegram_notify.report_system_alert(
-                "先平后开中止 · 平仓未归零",
-                "强平后盘口仍有持仓，已拒绝新开仓，请人工核查 Deepcoin 盘口",
+            logger.warning(
+                f"[钉钉已关闭] 先平后开中止·平仓未归零 | 强平后盘口仍有持仓，已拒绝新开仓，请人工核查 Deepcoin 盘口"
             )
             self._close_open_chain_active = False
             return
@@ -7458,9 +7415,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._pipeline_fail(Role.AUDITOR_POS, "CLEAR_VERIFY_FAIL")
             except Exception:
                 pass
-            telegram_notify.report_system_alert(
-                "先平后开中止 · 空仓核查失败",
-                "平仓指令已发但 REST 仍显示持仓，已拒绝叠仓开仓",
+            logger.warning(
+                f"[钉钉已关闭] 先平后开中止·空仓核查失败 | 平仓指令已发但 REST 仍显示持仓，已拒绝叠仓开仓"
             )
             self._close_open_chain_active = False
             return
@@ -7475,14 +7431,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.error("❌ 先平后开中止：无有效市价")
             return
         try:
-            telegram_notify.report_system_alert(
-                title=f"先平后开·执行 [{self.symbol}]",
-                detail=(
-                    f"{reason} | 无菌通过 @ {float(curr_px):.2f} → 开 {action} "
-                    f"| 终态必须有仓"
-                ),
-                level="信息",
-                suggestion="已先平后开；核对实盘仓位与 TP/止损",
+            logger.info(
+                f"[钉钉已关闭] 先平后开·执行 [{self.symbol}] | {reason} @ {float(curr_px):.2f} → 开 {action}"
             )
         except Exception:
             pass
@@ -7599,19 +7549,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.warning(f"{entry_type} 到达但盘口无持仓，已忽略")
             return
         if self._pos_side_label(pos) != action:
-            telegram_notify.report_system_alert(
-                f"{entry_type} 方向不符",
-                f"TV {action} vs 实盘 {self._pos_side_label(pos)}，已拒绝加仓",
+            logger.warning(
+                f"[钉钉已关闭] {entry_type} 方向不符 | TV {action} vs 实盘 {self._pos_side_label(pos)}，已拒绝加仓"
             )
             return
         if tv_ratio <= 0:
             logger.warning(
                 f"{entry_type} 跳过：R{self.regime} TV加仓比例={tv_ratio:.2f}（档位禁止加仓）"
             )
-            telegram_notify.report_system_alert(
-                f"{entry_type} 加仓跳过",
-                f"R{self.regime} TV qty_ratio={tv_ratio:.2f} ≤ 0 | "
-                f"base={getattr(self, 'base_qty', 0)} 张",
+            logger.warning(
+                f"[钉钉已关闭] {entry_type} 加仓跳过 | TV加仓比例={tv_ratio:.2f} ≤ 0 | base={getattr(self, 'base_qty', 0)} 张"
             )
             return
         if int(getattr(self, "add_count", 0) or 0) >= max_add:
@@ -7619,10 +7566,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 f"{entry_type} 跳过：已达 R{self.regime} 最大加仓次数 {max_add} "
                 f"(base={getattr(self, 'base_qty', 0)})"
             )
-            telegram_notify.report_system_alert(
-                f"{entry_type} 加仓跳过",
-                f"R{self.regime} 已达最大加仓 {max_add} 次 | base={getattr(self, 'base_qty', 0)} "
-                f"| 现仓 {self._safe_qty(pos.get('size', 0))} 张",
+            logger.warning(
+                f"[钉钉已关闭] {entry_type} 加仓跳过 | 已达最大加仓 {max_add} 次 | base={getattr(self, 'base_qty', 0)} | 现仓 {self._safe_qty(pos.get('size', 0))} 张"
             )
             return
 
@@ -7632,9 +7577,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         add_qty, meta = self._calc_vps_add_qty(tv_ratio)
         if add_qty <= 0:
             logger.error(f"{entry_type} 跳过：计算加仓量无效 {meta}")
-            telegram_notify.report_system_alert(
-                f"{entry_type} 数量无效",
-                f"加仓计算失败: {self._tv_sizing_note(add_qty, meta, entry_type=entry_type)}",
+            logger.warning(
+                f"[钉钉已关闭] {entry_type} 数量无效 | 加仓计算失败"
             )
             return
 
@@ -7648,18 +7592,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         pos_side = "long" if action == "LONG" else "short"
         res = deepcoin_client.place_market_order(self.symbol, open_side, pos_side, add_qty)
         if not res or not deepcoin_client._is_success(res):
-            telegram_notify.report_system_alert(
-                f"{entry_type} 下单失败",
-                f"{action} 追加 {add_qty} 张 市价单未成交",
+            logger.warning(
+                f"[钉钉已关闭] {entry_type} 下单失败 | {action} 追加 {add_qty} 张 市价单未成交"
             )
             return
         time.sleep(1.5)
 
         new_pos = self._get_active_position()
         if not new_pos or self._safe_qty(new_pos.get("size", 0)) <= old_qty:
-            telegram_notify.report_system_alert(
-                f"{entry_type} 核实失败",
-                f"追加 {add_qty} 张 后实盘未增长",
+            logger.warning(
+                f"[钉钉已关闭] {entry_type} 核实失败 | 追加 {add_qty} 张 后实盘未增长"
             )
             return
 
@@ -7834,10 +7776,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
             if not self._wait_verify(self._verify_flat, retries=4, delay=0.35):
                 logger.error("开仓中止：市价下单前盘口仍非空")
-                telegram_notify.report_system_alert(
-                    f"开仓中止 · 下单前盘口非空 [{self.symbol}]",
-                    f"TV **{action}** 目标 **{qty}** 张，下单前 REST 仍显示持仓，已拒绝叠仓",
-                    suggestion="系统将尝试强制清场，请核查是否有人工挂单或残仓",
+                logger.warning(
+                    f"[钉钉已关闭] 开仓中止·下单前盘口非空 [{self.symbol}] | TV {action} 目标 {qty}张，REST 仍显示持仓，已拒绝"
                 )
                 return
 
@@ -7855,7 +7795,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self._pipeline_fail(Role.EXECUTION, "ENTRY_SUBMIT_FAIL")
                 except Exception:
                     pass
-                telegram_notify.report_system_alert("开仓失败", f"TV {action} {qty} 张 市价单失败")
+                logger.warning(
+                    f"[钉钉已关闭] 开仓失败 | TV {action} {qty} 张 市价单失败"
+                )
                 return
             time.sleep(2.0)
 
@@ -7874,11 +7816,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"🚨 持仓超标: 目标 {qty} 张，实盘 {real_qty} 张 "
                     f"(>{qty * OPEN_OVERSIZE_RATIO:.3f})，启动裁减"
                 )
-                telegram_notify.report_system_alert(
-                    "持仓超标 · 自动裁减",
-                    f"目标 {qty} 张 (下单额 {margin_usdt:.0f}U)，"
-                    f"实盘 {real_qty} 张 @ {pos['entry_price']:.2f}，正在 reduceOnly 裁减",
-                    suggestion="裁减基数=VPS风险公式，非可用保证金",
+                logger.warning(
+                    f"[钉钉已关闭] 持仓超标·自动裁减 | 目标 {qty}张，实盘 {real_qty}张，正在 reduceOnly 裁减"
                 )
                 real_qty = self._trim_position_to_target(qty, action)
                 pos = self._get_active_position()
@@ -7890,11 +7829,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             payload_atr = self._safe_float((payload or {}).get("atr"), 0.0)
             if payload_atr <= 0:
                 try:
-                    telegram_notify.report_system_alert(
-                        f"[{getattr(self, 'tag', '?')}] 开仓拒绝·缺TV atr",
-                        f"{self.symbol} webhook 无 atr → 拒绝开仓",
-                        level="紧急",
-                        suggestion="检查 TV get_entry_json 是否传 atr",
+                    logger.warning(
+                        f"[钉钉已关闭] 开仓拒绝·缺TV atr | {self.symbol} webhook 无 atr → 拒绝开仓"
                     )
                 except Exception:
                     pass
@@ -8097,10 +8033,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     "重复 TP 占满可减仓额度 | 雷达将接力纠偏"
                     if dupes else "请查 logs/deepcoin_brain.log"
                 )
-                telegram_notify.report_system_alert(
-                    "开仓后限价止盈未全部挂上",
-                    f"{self.current_side} {vqty}张 | 仅 {matched}/{expected} 档 | "
-                    f"{self._format_audit_summary(audit)} | {hint}",
+                logger.warning(
+                    f"[钉钉已关闭] 开仓后限价止盈未全部挂上 | {self.current_side} {vqty}张 | 仅 {matched}/{expected} 档"
                 )
             if self._should_activate_shield(curr_px):
                 self._maintain_hard_shield(
@@ -8557,11 +8491,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         f"⚠️ tv_tps=全零 → ATR紧急Fallback TP123={self.tv_tps} "
                         f"| entry={entry:.2f} ATR={atr:.2f} R{regime}"
                     )
-                    telegram_notify.report_system_alert(
-                        "TP价格缺失·ATR紧急Fallback",
-                        f"tv_tps全零 | {self.current_side} {live_qty}张 @ {entry:.2f} | "
-                        f"ATR={atr:.2f} R{regime} → 强制Fallback {self.tv_tps}",
-                        suggestion="请确认 TV 策略开仓消息包含 tp1/tp2/tp3 字段",
+                    logger.warning(
+                        f"[钉钉已关闭] TP价格缺失·ATR紧急Fallback | {self.current_side} {live_qty}张 | ATR={atr:.2f} R{regime}"
                     )
                     self._save_state()
 
@@ -8723,9 +8654,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"{p['posSide']}:{self._safe_qty(p['size'])}张" for p in all_residual
                 ) if all_residual else "无"
                 logger.error(f"❌ 6 轮强平后仍有残单: {residual_info}")
-                telegram_notify.report_system_alert(
-                    "强平未完全归零",
-                    f"6 轮市价平仓后仍剩: {residual_info}，请人工核查 Deepcoin 盘口",
+                logger.warning(
+                    f"[钉钉已关闭] 强平未完全归零 | 6轮市价平仓后仍剩: {residual_info}，请人工核查 Deepcoin 盘口"
                 )
 
         if reset_state:
@@ -8878,9 +8808,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if not self._lock.acquire(timeout=120.0):
                     logger.error("❌ 重启接管无法获取锁，跳过")
                     self._recover_in_progress = False
-                    telegram_notify.report_system_alert(
-                        "重启接管失败",
-                        "无法获取仓位锁（120s超时），请稍后重启或检查是否有僵死进程",
+                    logger.warning(
+                        f"[钉钉已关闭] 重启接管失败 | 无法获取仓位锁（120s超时），请稍后重启或检查是否有僵死进程"
                     )
                     return
                 try:
@@ -9034,11 +8963,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             if dupes else "请查 logs/deepcoin_brain.log 是否有撤单/限价失败"
                         )
                         self._recover_tp_unconfirmed = True
-                        telegram_notify.report_system_alert(
-                            "重启接管后限价止盈未对齐",
-                            f"{self.current_side} {real_amt}张 @ {entry_px:.2f} | "
-                            f"仅 {matched}/{expected} 档 | {self._format_audit_summary(audit)} | "
-                            f"{hint} | 雷达哨兵将接力纠偏；仍失败请 APP 手动全撤后重启",
+                        logger.warning(
+                            f"[钉钉已关闭] 重启接管后限价止盈未对齐 | {self.current_side} {real_amt}张 | 仅 {matched}/{expected}档"
                         )
 
                     health_txt = (
@@ -9086,9 +9012,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     logger.error(f"❌ 重启接管步骤异常: {recover_err}")
                     self.monitoring = True
                     self._save_state()
-                    telegram_notify.report_system_alert(
-                        "重启接管部分失败",
-                        f"实盘仍有仓，已尽力启动哨兵接力 | {recover_err}",
+                    logger.warning(
+                        f"[钉钉已关闭] 重启接管部分失败 | 实盘仍有仓，已尽力启动哨兵接力 | {recover_err}"
                     )
                 finally:
                     self._recover_in_progress = False
@@ -9129,7 +9054,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 )
         except Exception as e:
             logger.error(f"❌ 闪电接管异常: {e}")
-            telegram_notify.report_system_alert("重启接管失败", str(e))
+            logger.warning(
+                f"[钉钉已关闭] 闪电接管异常 | {e}"
+            )
 
 
 position_supervisor = None

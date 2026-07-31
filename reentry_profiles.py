@@ -9,7 +9,7 @@
   · 弱 ADX<20 → 68%（早激活保护微利）；中 20–30 → 78%；强 >30 → 88%（晚激活留呼吸）
 - 激活瞬间：保本起步 = entry ± tick ± fee_cover（禁止跳到 TP1 底线）
 - 取消 TP1/TP2 强制底线；TP 成交只缩量不改价
-- 重入最多 1 次；窗口 = K线根数（ETH 2×90m · XAU 3×45m）
+- 重入最多 1 次；窗口 = K线根数（ETH 2×90m）
 - 重入成功后雷达系数放宽一档（looser_tier）；不影响 TP 价量
 - 第二层 trail（ATR 比插值）见 breath_profiles，本文件不改
 - 双保险限价：多 min(5m低+tick, TV×0.997)；空 max(5m高−tick, TV×1.003)
@@ -48,14 +48,6 @@ _DEFAULT_ETH_TIERS: List[Dict[str, float]] = [
      "breath_tp12": 1.20, "breath_tp23": 1.60, "min_mult": 2.0, "max_mult": 2.5},
     {"step_trigger_atr": 0.60, "step_advance_atr": 0.40,
      "breath_tp12": 1.50, "breath_tp23": 2.00, "min_mult": 2.5, "max_mult": 3.5},
-]
-_DEFAULT_XAU_TIERS: List[Dict[str, float]] = [
-    {"step_trigger_atr": 0.35, "step_advance_atr": 0.20,
-     "breath_tp12": 0.70, "breath_tp23": 0.90, "min_mult": 1.0, "max_mult": 1.3},
-    {"step_trigger_atr": 0.40, "step_advance_atr": 0.30,
-     "breath_tp12": 1.00, "breath_tp23": 1.40, "min_mult": 1.8, "max_mult": 2.2},
-    {"step_trigger_atr": 0.50, "step_advance_atr": 0.35,
-     "breath_tp12": 1.30, "breath_tp23": 1.80, "min_mult": 2.2, "max_mult": 3.0},
 ]
 
 REENTRY_TIERS_JSON = os.path.join(
@@ -177,15 +169,9 @@ BUFFER_BY_TIER: List[float] = [HARD_SL_BUFFER_MULT, HARD_SL_BUFFER_MULT, HARD_SL
 ETH_TIERS: List[Dict[str, float]] = list(
     ((_CFG.get("ETH") or {}).get("tiers") or _DEFAULT_ETH_TIERS)
 )
-XAU_TIERS: List[Dict[str, float]] = list(
-    ((_CFG.get("XAU") or {}).get("tiers") or _DEFAULT_XAU_TIERS)
-)
 _ETH_ZONE = float((_CFG.get("ETH") or {}).get("reentry_zone_atr") or 0.5)
-_XAU_ZONE = float((_CFG.get("XAU") or {}).get("reentry_zone_atr") or 0.3)
 _ETH_WINDOW_BARS = int((_CFG.get("ETH") or {}).get("reentry_window_bars") or 2)
-_XAU_WINDOW_BARS = int((_CFG.get("XAU") or {}).get("reentry_window_bars") or 3)
 _ETH_TF_SEC = int((_CFG.get("ETH") or {}).get("tv_tf_sec") or 5400)
-_XAU_TF_SEC = int((_CFG.get("XAU") or {}).get("tv_tf_sec") or 2700)
 
 
 def make_reentry_client_order_id(
@@ -193,7 +179,7 @@ def make_reentry_client_order_id(
 ) -> str:
     """交易所 newClientOrderId（≤36）：SHA-256 订单标签，幂等防狂挂。"""
     sym_u = str(symbol or "").upper()
-    sym = "E" if "ETH" in sym_u else ("X" if "XAU" in sym_u else "S")
+    sym = "E" if "ETH" in sym_u else "S"
     sd = "L" if str(side or "").upper() in ("LONG", "BUY", "L") else "S"
     px = abs(int(round(float(price or 0) * 100))) % 1_000_000
     t = abs(int(float(ts if ts is not None else time.time()))) % 100_000
@@ -225,35 +211,10 @@ REENTRY_ETH: Dict[str, Any] = {
     "max_unfilled_refreshes": MAX_UNFILLED_REFRESHES,
     "tick_size": 0.01,
 }
-REENTRY_XAU: Dict[str, Any] = {
-    "name": "XAU",
-    "tv_tf": "45m",
-    "tv_tf_sec": _XAU_TF_SEC,
-    "enabled": True,
-    "activation_tp1_frac": ACTIVATION_TP1_FRAC,
-    "activation_tp1_frac_reentry": ACTIVATION_TP1_FRAC_REENTRY,
-    "radar_act_adx_lo": RADAR_ACT_ADX_LO,
-    "radar_act_adx_hi": RADAR_ACT_ADX_HI,
-    "radar_act_ratio_lo": RADAR_ACT_RATIO_LO,
-    "radar_act_ratio_hi": RADAR_ACT_RATIO_HI,
-    "arm_sl_atr": ARM_SL_ATR,
-    "fee_cover_pct": FEE_COVER_PCT,
-    "arm_mode": ARM_MODE,
-    "tiers": XAU_TIERS,
-    "reentry_zone_atr": _XAU_ZONE,
-    "reentry_window_bars": _XAU_WINDOW_BARS,
-    "limit_discount": LIMIT_DISCOUNT,
-    "limit_ttl_sec": LIMIT_TTL_SEC,
-    "max_reentries": MAX_REENTRIES,
-    "max_unfilled_refreshes": MAX_UNFILLED_REFRESHES,
-    "tick_size": 0.01,
-}
 
 _BY_SYMBOL = {
     "ETHUSDT": REENTRY_ETH,
-    "XAUUSDT": REENTRY_XAU,
     "ETH-USDT-SWAP": REENTRY_ETH,
-    "XAU-USDT-SWAP": REENTRY_XAU,
 }
 
 
@@ -512,8 +473,7 @@ def apply_tier_to_breath_profile(
     out = dict(breath_profile or {})
     rp = reentry_profile if isinstance(reentry_profile, dict) else None
     if rp is None:
-        name = str(out.get("name") or "").upper()
-        rp = REENTRY_XAU if name == "XAU" else REENTRY_ETH
+        rp = REENTRY_ETH
     coeffs = tier_coeffs(tier, rp)
     out["step_trigger_atr"] = coeffs["step_trigger_atr"]
     out["step_advance_atr"] = coeffs["step_advance_atr"]

@@ -16,16 +16,6 @@ BINANCE_SYMBOL_META = {
         "price_precision": 2,
         "breath": "ETH",
     },
-    "XAUUSDT": {
-        "symbol": "XAUUSDT",
-        "unit": "XAU",
-        "tag": "XAU",
-        "qty_step": 0.001,
-        "min_qty": 0.001,
-        "dust_qty": 0.001,
-        "price_precision": 2,
-        "breath": "XAU",
-    },
 }
 
 # 深币 SWAP
@@ -42,18 +32,6 @@ DEEPCOIN_SYMBOL_META = {
         "dust_qty": 1,
         "price_precision": 2,
     },
-    "XAU-USDT-SWAP": {
-        "symbol": "XAU-USDT-SWAP",
-        "binance_mark": "XAUUSDT",
-        "unit": "张",
-        "tag": "XAU",
-        "breath": "XAU",
-        "face_value": 0.01,  # 启动后以 instruments 实盘覆盖
-        "qty_step": 1,
-        "min_qty": 1,
-        "dust_qty": 1,
-        "price_precision": 2,
-    },
 }
 
 _BINANCE_ALIASES = {
@@ -63,13 +41,6 @@ _BINANCE_ALIASES = {
     "ETHUSDT.P": "ETHUSDT",
     "BINANCE:ETHUSDT": "ETHUSDT",
     "BINANCE:ETHUSDT.P": "ETHUSDT",
-    "XAU": "XAUUSDT",
-    "XAUUSD": "XAUUSDT",
-    "XAUUSDT": "XAUUSDT",
-    "XAUUSDT.P": "XAUUSDT",
-    "GOLD": "XAUUSDT",
-    "BINANCE:XAUUSDT": "XAUUSDT",
-    "BINANCE:XAUUSDT.P": "XAUUSDT",
 }
 
 _DEEPCOIN_ALIASES = {
@@ -78,12 +49,6 @@ _DEEPCOIN_ALIASES = {
     "ETHUSD": "ETH-USDT-SWAP",
     "ETH-USDT": "ETH-USDT-SWAP",
     "ETH-USDT-SWAP": "ETH-USDT-SWAP",
-    "XAU": "XAU-USDT-SWAP",
-    "XAUUSD": "XAU-USDT-SWAP",
-    "XAUUSDT": "XAU-USDT-SWAP",
-    "XAU-USDT": "XAU-USDT-SWAP",
-    "XAU-USDT-SWAP": "XAU-USDT-SWAP",
-    "GOLD": "XAU-USDT-SWAP",
 }
 
 
@@ -147,7 +112,7 @@ def resolve_deepcoin_symbol(raw, default="ETH-USDT-SWAP"):
 
 
 def active_binance_symbols():
-    raw = os.getenv("BINANCE_SYMBOLS", "ETHUSDT,XAUUSDT")
+    raw = os.getenv("BINANCE_SYMBOLS", "ETHUSDT")
     out = []
     for part in str(raw).split(","):
         meta = resolve_binance_symbol(part.strip(), default="")
@@ -158,7 +123,7 @@ def active_binance_symbols():
 
 
 def active_deepcoin_symbols():
-    raw = os.getenv("DEEPCOIN_SYMBOLS", "ETH-USDT-SWAP,XAU-USDT-SWAP")
+    raw = os.getenv("DEEPCOIN_SYMBOLS", "ETH-USDT-SWAP")
     out = []
     for part in str(raw).split(","):
         meta = resolve_deepcoin_symbol(part.strip(), default="")
@@ -179,14 +144,13 @@ def extract_symbol_from_payload(data):
         val = data.get(key)
         if val:
             return str(val).strip()
-    # 兜底：扫描 JSON 文本中的已知合约（优先 XAU，避免误判 ETH）
+    # 兜底：扫描 JSON 文本中的已知合约（仅 ETH）
     try:
         import json
         blob = json.dumps(data, ensure_ascii=False).upper()
     except Exception:
         blob = str(data).upper()
     for token in (
-        "XAUUSDT.P", "BINANCE:XAUUSDT", "XAUUSDT", "XAU-USDT-SWAP", "XAUUSD",
         "ETHUSDT.P", "BINANCE:ETHUSDT", "ETHUSDT", "ETH-USDT-SWAP",
     ):
         if token in blob:
