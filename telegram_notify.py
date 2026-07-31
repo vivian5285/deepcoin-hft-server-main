@@ -184,11 +184,11 @@ def report_system_alert(title, detail, level="紧急", suggestion=""):
 
 
 def report_radar_activation(side, qty, entry, curr_px, new_sl, regime):
-    """雷达激活播报。"""
+    """雷达激活播报"""
     if not _is_enabled():
         return
     text = (
-        f"📡 *雷达激活*\n"
+        f"📡 *雷达激活 · 保本起步*\n"
         f"{_fmt_time()}\n"
         f"\n"
         f"{_fmt_side(side)} | {qty} {UNIT_LABEL}\n"
@@ -241,13 +241,16 @@ def report_recover_takeover(side, qty, entry, tv_tps, regime, radar_active, sl_p
                            defense_plan="", shield_status="", radar_progress=0.0,
                            tv_aligned=True, qty_aligned=True, initial_qty=0,
                            tp_consumed_levels=None):
-    """重启接管报告"""
+    """VPS 重启接管报告"""
     if not _is_enabled():
         return
-    radar_txt = f"已激活 (进度 {radar_progress:.0%})" if radar_active else "待命"
+    if radar_active:
+        radar_txt = f"保本起步 (进度 {radar_progress:.0%})"
+    else:
+        radar_txt = "待命"
     tp_txt = _fmt_tp_levels(tv_tps)
     text = (
-        f"🔄 *VPS重启接管*\n"
+        f"🔄 *VPS 重启接管*\n"
         f"{_fmt_time()}\n"
         f"\n"
         f"{_fmt_side(side)} | {qty} {UNIT_LABEL}\n"
@@ -333,20 +336,20 @@ def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=Fa
 def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
                          radar_active=False, radar_sl=None, regime=3,
                          verify_note="", verified=True):
-    """止损更新"""
+    """TV 硬止损更新"""
     if not _is_enabled():
         return
     text = (
-        f"🔒 *止损更新*\n"
+        f"🔒 *TV 硬止损更新*\n"
         f"{_fmt_time()}\n"
         f"\n"
         f"{_fmt_side(side)} | {live_qty} {UNIT_LABEL}\n"
         f"入场: `{entry:.2f}`\n"
-        f"TV止损: `{tv_sl:.2f}`\n"
+        f"TV 硬止损: `{tv_sl:.2f}`\n"
         f"交易所止损: `{exchange_stop:.2f}`\n"
     )
     if radar_active:
-        text += f"雷达: 已激活 @ `{radar_sl:.2f}`\n"
+        text += f"雷达: 保本起步 @ `{radar_sl:.2f}`\n"
     else:
         text += "雷达: 待命\n"
     if verify_note:
@@ -425,19 +428,19 @@ def report_radar_activated(side, qty, entry, new_sl, radar_progress=1.0, regime=
         return
     kind = str(open_kind or "").strip() or "首次开仓"
     text = (
-        f"📡 *雷达激活 · {kind}*\n"
+        f"📡 *雷达激活 · 保本起步 · {kind}*\n"
         f"{_fmt_time()}\n"
         f"\n"
         f"{_fmt_side(side)} | {qty} {UNIT_LABEL}\n"
         f"入场: `{entry:.2f}`\n"
-        f"新止损: `{new_sl:.2f}`\n"
+        f"雷达止损: `{new_sl:.2f}`\n"
         f"档位: R{regime}\n"
         f"进度: {radar_progress:.0%}\n"
     )
+    if trigger_gate:
+        text += f"激活条件: {trigger_gate}\n"
     if activation_price > 0:
         text += f"激活价: `{activation_price:.2f}`\n"
-    if trigger_gate:
-        text += f"触发: {trigger_gate}\n"
     if verify_note:
         text += f"核实: {verify_note}\n"
     send_text(text)

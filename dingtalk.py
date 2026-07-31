@@ -374,7 +374,7 @@ def report_manual_position_change(action_type, old_qty, new_qty, new_entry_price
     }
     if is_manual_open:
         data["📡 雷达/止损"] = _p(
-            "TP1 成交前 **仅 tv_sl 宽止损** · 雷达 **待命**（禁止提前保本）",
+            "TP1 成交前 **仅 TV 硬止损宽止损** · 雷达 **待命**（禁止提前保本）",
             P_MUTED,
         )
     if tp_audit:
@@ -747,7 +747,7 @@ def report_tv_signal_received(action, entry_type="", price=0, regime=3, atr=0,
         "📡 ATR": _p(f"`{float(atr or 0):.2f}`", P_MUTED),
     }
     if tv_sl and float(tv_sl) > 0:
-        data["📡 tv_sl"] = _p(f"`{float(tv_sl):.2f}`", P_LIGHT)
+        data["📡 TV 硬止损"] = _p(f"`{float(tv_sl):.2f}`", P_LIGHT)
     if et == ENTRY_TYPE_OPEN and vps_sizing_meta:
         data["📐 VPS预算"] = _p(
             format_vps_sizing_note(vps_sizing_meta, entry_type=ENTRY_TYPE_OPEN),
@@ -773,7 +773,7 @@ def report_tv_signal_received(action, entry_type="", price=0, regime=3, atr=0,
 def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
                          radar_active=False, radar_sl=None, regime=3,
                          verify_note="", verified=True):
-    """TV UPDATE_SL 核实成功后播报（TV底线 + 交易所止损，不动状态机）"""
+    """TV UPDATE_SL 核实成功后播报（TV 硬止损 + 交易所止损，不动状态机）"""
     tv_sl = float(tv_sl or 0)
     exchange_stop = float(exchange_stop or tv_sl or 0)
     merged = (
@@ -784,12 +784,12 @@ def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
     if merged:
         action_txt = (
             f"TV UPDATE_SL → 交易所止损 @ `{exchange_stop:.2f}` "
-            f"(TV底线 `{tv_sl:.2f}` · 雷达 `{float(radar_sl):.2f}` 分层)"
+            f"(TV 硬止损 `{tv_sl:.2f}` · 雷达 `{float(radar_sl):.2f}` 分层)"
         )
     elif radar_active:
         action_txt = (
-            f"TV UPDATE_SL → TV底线 @ `{tv_sl:.2f}` · "
-            f"雷达 @ `{float(radar_sl or exchange_stop):.2f}` 独立运行"
+            f"TV UPDATE_SL → TV 硬止损 @ `{tv_sl:.2f}` · "
+            f"雷达 @ `{float(radar_sl or exchange_stop):.2f}` 双轨运行"
         )
     else:
         action_txt = f"TV UPDATE_SL → 硬止损触发 @ `{tv_sl:.2f}`"
@@ -799,15 +799,15 @@ def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
         "📦 保护头寸": _p(f"**{live_qty}** {UNIT_LABEL}", P_MAIN),
         "💰 开仓成本": _p(f"`{entry:.2f}` USDT", P_MUTED),
         "📐 算仓模式": get_regime_name(regime),
-        "📡 TV底线 tv_sl": _p(f"**{tv_sl:.2f}** USDT", P_ACCENT),
+        "📡 TV 硬止损": _p(f"**{tv_sl:.2f}** USDT", P_ACCENT),
         "🔒 交易所止损": _p(f"**{exchange_stop:.2f}** USDT", P_LIGHT),
-        "📡 雷达状态": _p(
-            f"已激活 @ `{float(radar_sl):.2f}`" if radar_active and radar_sl
-            else ("已激活" if radar_active else "待命监控中"),
+        "📡 雷达": _p(
+            f"保本起步 @ `{float(radar_sl):.2f}`" if radar_active and radar_sl
+            else ("保本起步" if radar_active else "待命"),
             P_MAIN,
         ),
         "✅ 风控动作": _p(
-            action_txt + " · 雷达与 TV 底线分层运行",
+            action_txt + " · 雷达与 TV 硬止损双轨运行",
             P_MAIN,
         ),
         "📡 实盘核查": _verify_line(
@@ -892,7 +892,7 @@ def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entr
             f"`{old_entry:.2f}` → **`{new_entry:.2f}`** USDT",
             P_MUTED,
         ),
-        "📡 TV底线 tv_sl": _p(f"**{float(tv_sl or 0):.2f}** USDT", P_ACCENT),
+        "📡 TV 硬止损": _p(f"**{float(tv_sl or 0):.2f}** USDT", P_ACCENT),
         "📐 加仓公式": _p(
             format_vps_sizing_note(
                 vps_sizing_meta or {
@@ -912,7 +912,7 @@ def report_tv_position_add(side, entry_type, add_qty, old_qty, new_qty, old_entr
         "🕸️ TP123 重挂": _p(tp_audit or "已按新总头寸重算", P_MAIN),
         "📡 雷达状态": _p(radar_note or "待命(TP1前)", P_LIGHT),
         "✅ 风控动作": _p(
-            "加仓成交 → TV TP123 按新头寸重挂 + tv_sl/雷达同步",
+            "加仓成交 → TV TP123 按新头寸重挂 + TV 硬止损/雷达同步",
             P_MAIN,
         ),
         "📡 实盘核查": _verify_line(
@@ -936,7 +936,7 @@ def report_adverse_shield_armed(side, entry, live_qty, adverse_pct, tier_prices,
         "📦 保护头寸": _p(f"**{live_qty}** {UNIT_LABEL} 全平", P_MAIN),
         "🛡️ TV硬止损": _p(f"`{stop_px:.2f}` USDT", P_ACCENT),
         "✅ 风控动作": _p(
-            "开单即挂：TV 透传 tv_sl 条件止损全平 · "
+            "开单即挂：TV 透传 TV 硬止损条件止损全平 · "
             "价格达 TP1 激活比例后撤 TV 硬止损 → 切换雷达移动保本防回吐",
             P_MAIN,
         ),
