@@ -1,6 +1,6 @@
 # 深币 Deepcoin · ETH/XAU 永续 Webhook 交易系统
 
-**当前版本：`v16.16a-hedge-check`**
+**当前版本：`v16.17-eth-only-no-dingtalk`**
 
 > **持仓模式说明**：Deepcoin 没有独立的 `set-position-mode` API，但 `posSide=long/short` 参数已在所有订单（开仓/平仓/限价止盈/条件单）中正确使用，保证双向持仓语义。`reduceOnly=True` 在止盈/止损中已正确设置，防止意外开仓。
 
@@ -13,7 +13,7 @@
 | 端口 | **5004** |
 | 单位 | **张**（0.1 ETH/张） |
 | 杠杆 | **5x** cross（双向持仓模式） |
-| 健康检查 | `GET /health` → `"version":"v16.16a-hedge-check"` |
+| 健康检查 | `GET /health` → `"version":"v16.17-eth-only-no-dingtalk"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
 
@@ -172,10 +172,19 @@ XAUUSDT.P：
 
 ```bash
 cd ~/deepcoin-hft-server
-git fetch origin
-git log --oneline origin/main -3       # 确认最新 commit
-git reset --hard origin/main
+
+# 方式一：自动部署（脚本内含 git pull，推荐）
 bash deploy_deepcoin.sh
+
+# 方式二：手动拉取部署
+git fetch origin
+git stash                        # 暂存本地修改（如有）
+git checkout main
+git reset --hard origin/main
+chmod +x deploy_deepcoin.sh system_monitor.sh
+bash deploy_deepcoin.sh
+
+# 验证
 curl -s http://127.0.0.1:5004/health
 tail -f logs/deepcoin_brain.log
 ```
@@ -258,4 +267,4 @@ FLASK_PORT=5004
 
 ---
 
-*深币紫金引擎 · v16.15-acked-gc · 对齐规格 v1.0*
+*深币紫金引擎 · v16.17 · 对齐规格 v1.0*

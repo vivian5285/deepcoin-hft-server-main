@@ -1,9 +1,9 @@
-# 密钥与本地配置（切勿提交）
+# ── 密钥与本地配置（切勿提交）────────────────────────────
 .env
 .env.*
 !.env.example
 
-# Python
+# ── Python ────────────────────────────────────────────────
 venv/
 .venv/
 __pycache__/
@@ -15,18 +15,41 @@ __pycache__/
 dist/
 build/
 
-# 运行时状态与日志
+# ── 运行时状态与日志 ────────────────────────────────────
 logs/
 *.log
 deepcoin_vps_state.json
+deepcoin_vps_state_*.json
 *.pid
 
-# IDE / OS
+# ── IDE / OS ─────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 .DS_Store
 Thumbs.db
 
-# 部署生成的 per-instance 文件（可由 setup 脚本再生）
+# ── 部署生成文件（可由 setup 脚本再生）────────────────
 deploy/nginx-*.conf.snippet
+
+# ── 测试与临时文件（本地开发用，不提交）──────────────
+# 这些文件已被清理，仅作防御性排除
+*_test.py
+*_test.sh
+*_diag*
+*_vps*
+fix_*.py
+fix_*.sh
+deploy_*.py
+deploy_*.sh
+apply_*.sh
+write_*.py
+transfer_*.py
+diagnostic.py
+vps_diagnostic.py
+run_vps_*.py
+git_commit*
+vps_update.bat
+run_deepcoin.sh
+*_b64.txt
+quant_gateway_*.conf

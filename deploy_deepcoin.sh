@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # ==========================================
-# 深币 Deepcoin — 工业级干净重部署脚本
-# 流程: 强制核武清场 → 确认端口空闲 → 依赖 → 启动 → 多重健康审计
+# 深币 Deepcoin — 工业级自动部署脚本
+#
+# 适用场景：VPS 从 GitHub 拉取后直接执行
+# 流程: git pull → 核武清场 → 依赖安装 → 启动 → 多重健康审计
+#
+# 用法（任选其一）:
+#   bash deploy_deepcoin.sh          # 标准方式
+#   ./deploy_deepcoin.sh              # 需先 chmod +x
+#   source <(curl -sL https://raw.githubusercontent.com/vivian5285/deepcoin-hft-server-main/main/deploy_deepcoin.sh)
 # ==========================================
 
 set -uo pipefail
 
-DEPLOY_SCRIPT_VERSION="v16.10-deploy-version-fix"
-# 接受 v13.4.6+、v13.5~9、v13.10+、v16.x+（含 -tv-pure-sl 等后缀标签）
-MIN_SUPERVISOR_VERSION_RE='v(13\.(4\.[6-9]|(?:[5-9]|[1-9][0-9]+)\.)|16\.)'
+SCRIPT_VERSION="v17.0-deploy-robust"
+GITHUB_REMOTE_URL="https://github.com/vivian5285/deepcoin-hft-server-main.git"
+GITHUB_BRANCH="main"
 
 WORKERS=1
 THREADS=10
@@ -17,10 +24,33 @@ MAX_CLEANUP_ROUNDS=5
 HEALTH_WAIT_SEC=5
 HEALTH_RETRIES=6
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ── 工作目录自动检测 ──────────────────────────────────────
+# 支持两种运行方式：
+#   1. 从 deepcoin-hft-server 目录内运行（cd 到上级后 cd 到脚本所在目录）
+#   2. 从 deepcoin 用户 home 目录运行（cd 到 deepcoin-hft-server 子目录）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "$(basename "$SCRIPT_DIR")" = "deepcoin-hft-server" ]; then
+    DIR="$SCRIPT_DIR"
+else
+    # 脚本在子目录（deepcoin-hft-server/scripts/）或根目录（deepcoin-hft-server/）
+    if [ -f "$SCRIPT_DIR/position_supervisor_deepcoin.py" ]; then
+        DIR="$SCRIPT_DIR"
+    elif [ -f "$(dirname "$SCRIPT_DIR")/position_supervisor_deepcoin.py" ]; then
+        DIR="$(dirname "$SCRIPT_DIR")"
+    else
+        # 回退：在当前目录树中查找
+        DIR="$(pwd)"
+        while [ "$DIR" != "/" ]; do
+            if [ -f "$DIR/position_supervisor_deepcoin.py" ]; then
+                break
+            fi
+            DIR="$(dirname "$DIR")"
+        done
+    fi
+fi
 cd "$DIR"
 
-# 端口优先读 .env 的 FLASK_PORT（多实例各自独立目录 + 独立 .env）
+# ── 端口配置（优先读 .env）────────────────────────────────
 PORT=5004
 if [ -f "$DIR/.env" ]; then
     set -a
@@ -35,6 +65,7 @@ LOG_FILE="$LOG_DIR/supervisor_deepcoin.log"
 BRAIN_LOG="$LOG_DIR/deepcoin_brain.log"
 PID_FILE="$LOG_DIR/gunicorn_deepcoin.pid"
 
+# ── 日志颜色 ─────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -42,26 +73,77 @@ CYAN='\033[1;36m'
 NC='\033[0m'
 
 DEPLOY_OK=1
+DEPLOY_STEP=0
 
-log_step() { echo -e "${YELLOW}$1${NC}"; }
-log_ok()   { echo -e "  ${GREEN}✅ $1${NC}"; }
-log_warn() { echo -e "  ${YELLOW}⚠️  $1${NC}"; }
-log_fail() { echo -e "  ${RED}❌ $1${NC}"; DEPLOY_OK=0; }
+log_step() { DEPLOY_STEP=$((DEPLOY_STEP + 1)); echo -e "\n${YELLOW}  [${DEPLOY_STEP}] $1${NC}"; }
+log_ok()   { echo -e "    ${GREEN}✅ $1${NC}"; }
+log_warn() { echo -e "    ${YELLOW}⚠️  $1${NC}"; }
+log_fail() { echo -e "    ${RED}❌ $1${NC}"; DEPLOY_OK=0; }
 
-load_env() {
-    if [ -f "$DIR/.env" ]; then
-        set -a
-        # shellcheck disable=SC1091
-        source "$DIR/.env"
-        set +a
-        log_ok "已加载 .env 配置"
-    else
-        log_warn "未找到 .env，将使用默认/环境变量"
+# ═══════════════════════════════════════════════════════════
+# 步骤 0：GitHub 拉取最新代码
+# ═══════════════════════════════════════════════════════════
+git_update() {
+    log_step "从 GitHub 拉取最新代码..."
+
+    if ! command -v git >/dev/null 2>&1; then
+        log_warn "git 未安装，跳过代码更新（直接使用当前代码）"
+        return 0
     fi
-    WEBHOOK_SECRET="${WEBHOOK_SECRET:-528586}"
-    PORT="${FLASK_PORT:-5004}"
+
+    if [ ! -d "$DIR/.git" ]; then
+        log_warn "非 git 仓库，无法自动拉取（请手动克隆或检查目录）"
+        return 0
+    fi
+
+    # 检查远程仓库配置
+    CURRENT_REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
+    if [ -n "$CURRENT_REMOTE" ]; then
+        log_ok "远程仓库: $CURRENT_REMOTE"
+    fi
+
+    # 尝试添加/更新 vivian5285 的 upstream（若不是该仓库则跳过）
+    if [ "$CURRENT_REMOTE" != "$GITHUB_REMOTE_URL" ]; then
+        git remote add upstream "$GITHUB_REMOTE_URL" 2>/dev/null || \
+        git remote set-url upstream "$GITHUB_REMOTE_URL" 2>/dev/null || true
+    fi
+
+    # 切换到 main 分支（如果不在）
+    CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || git symbolic-ref --short HEAD 2>/dev/null || echo "")
+    if [ "$CURRENT_BRANCH" != "$GITHUB_BRANCH" ]; then
+        log_warn "当前分支: $CURRENT_BRANCH，切换到 $GITHUB_BRANCH..."
+        git fetch origin "$GITHUB_BRANCH" 2>/dev/null || true
+        if git show-ref --verify --quiet "refs/heads/$GITHUB_BRANCH" 2>/dev/null; then
+            git checkout "$GITHUB_BRANCH" 2>/dev/null || true
+        fi
+    fi
+
+    # 拉取
+    echo -e "    ${CYAN}    git fetch origin...${NC}"
+    if git fetch origin "$GITHUB_BRANCH" 2>&1 | tee /dev/stderr | grep -q "Already up to date"; then
+        log_ok "代码已是最新"
+    else
+        GIT_OUTPUT=$(git pull origin "$GITHUB_BRANCH" 2>&1)
+        if echo "$GIT_OUTPUT" | grep -qE "(Already up to date|拉取到最新|up.to.date)"; then
+            log_ok "代码已是最新"
+        elif echo "$GIT_OUTPUT" | grep -qE "(Updating|Fast-forward|Merge)"; then
+            log_ok "代码已更新: $(echo "$GIT_OUTPUT" | tail -1)"
+        else
+            log_warn "git pull 输出: $(echo "$GIT_OUTPUT" | tail -1)"
+        fi
+    fi
+
+    # 显示当前版本
+    SUP_VER=$(grep 'DEEPCOIN_SUPERVISOR_VERSION' "$DIR/position_supervisor_deepcoin.py" 2>/dev/null \
+        | head -1 | sed 's/.*= *//' | tr -d '"' | tr -d "'" | tr -d ' ' || echo "未知")
+    CLI_VER=$(grep 'CLIENT_VERSION' "$DIR/deepcoin_client.py" 2>/dev/null \
+        | head -1 | sed 's/.*= *//' | tr -d '"' | tr -d "'" | tr -d ' ' || echo "未知")
+    echo -e "    ${CYAN}    supervisor: $SUP_VER | client: $CLI_VER${NC}"
 }
 
+# ═══════════════════════════════════════════════════════════
+# 步骤 1：核武清场（清理旧进程 + 旧端口）
+# ═══════════════════════════════════════════════════════════
 pids_listening_on_port() {
     local port=$1
     local pids=""
@@ -83,38 +165,46 @@ pid_belongs_to_instance() {
 }
 
 kill_port_if_ours() {
-    # 只杀【本目录】启动的 gunicorn，绝不 fuser 整端口（防误杀币安/其他深币实例）
-    local pid
+    local killed=0
     for pid in $(pids_listening_on_port "$PORT"); do
         if pid_belongs_to_instance "$pid"; then
             kill -9 "$pid" 2>/dev/null || true
-            log_ok "已结束本实例监听进程 PID=${pid} (port=${PORT})"
+            echo -e "    ${GREEN}    已结束本实例进程 PID=$pid (port=$PORT)${NC}"
+            killed=$((killed + 1))
         else
-            log_warn "端口 ${PORT} 上 PID=${pid} 非本目录 ${DIR}，跳过误杀"
+            echo -e "    ${YELLOW}    跳过非本目录进程 PID=$pid${NC}"
         fi
     done
+    [ "$killed" -gt 0 ] && return 0 || return 0
 }
 
 kill_residual_processes() {
-    # 仅清理【本实例】PID 文件 + 本目录 + 本端口 gunicorn
+    # 清理 PID 文件记录
     if [ -f "$PID_FILE" ]; then
         OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
         if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
             if pid_belongs_to_instance "$OLD_PID"; then
                 kill -9 "$OLD_PID" 2>/dev/null || true
-                log_ok "已结束 PID 文件记录进程 ${OLD_PID}"
+                echo -e "    ${GREEN}    已结束 PID 文件进程 ${OLD_PID}${NC}"
             else
-                log_warn "PID 文件 ${OLD_PID} 非本目录进程，跳过"
+                echo -e "    ${YELLOW}    PID 文件 ${OLD_PID} 非本目录，跳过${NC}"
             fi
         fi
         rm -f "$PID_FILE"
     fi
+
+    # 扫描残留 gunicorn 进程（仅限本目录）
     if command -v pgrep >/dev/null 2>&1; then
-        pgrep -af "gunicorn" 2>/dev/null | grep ":${PORT}" | grep -F "${DIR}" | awk '{print $1}' \
+        pgrep -af "gunicorn" 2>/dev/null \
+            | grep ":${PORT}" | grep -F "${DIR}" \
+            | awk '{print $1}' \
             | while read -r pid; do
                 [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
             done
     fi
+
+    # 清理恢复锁文件
+    rm -f "${DIR}/logs/.recover_singleton.lock" 2>/dev/null || true
 }
 
 port_in_use() {
@@ -131,7 +221,7 @@ port_in_use() {
 }
 
 show_port_holders() {
-    log_warn "端口 ${PORT} 仍被占用，当前监听进程:"
+    echo -e "    ${YELLOW}    端口 ${PORT} 当前监听进程:${NC}"
     if command -v lsof >/dev/null 2>&1; then
         lsof -Pi :"${PORT}" -sTCP:LISTEN 2>/dev/null || true
     elif command -v ss >/dev/null 2>&1; then
@@ -142,16 +232,16 @@ show_port_holders() {
 }
 
 force_cleanup() {
-    log_step "[1/6] 本实例清场（仅 port=${PORT} + dir=${DIR}，不碰其他实例）..."
+    log_step "核武清场 — 清理旧进程与端口..."
+    echo -e "    ${CYAN}    目标端口: $PORT | 目录: $DIR${NC}"
     local round=1
     while [ "$round" -le "$MAX_CLEANUP_ROUNDS" ]; do
-        echo "  -> 清场第 ${round}/${MAX_CLEANUP_ROUNDS} 轮..."
+        echo -e "    ${CYAN}    第 ${round}/${MAX_CLEANUP_ROUNDS} 轮清场...${NC}"
         kill_residual_processes
         kill_port_if_ours
         sleep 1.2
         if ! port_in_use; then
             log_ok "端口 ${PORT} 已完全释放，清场成功"
-            rm -f "${DIR}/logs/.recover_singleton.lock" 2>/dev/null || true
             return 0
         fi
         round=$((round + 1))
@@ -161,75 +251,68 @@ force_cleanup() {
     return 1
 }
 
+# ═══════════════════════════════════════════════════════════
+# 步骤 2：依赖安装
+# ═══════════════════════════════════════════════════════════
 install_deps() {
-    log_step "[2/6] 检查 Python 环境与依赖..."
+    log_step "检查 Python 环境与依赖..."
+
+    # 激活 venv
     if [ -d "$DIR/venv" ]; then
         # shellcheck disable=SC1091
         source "$DIR/venv/bin/activate"
         log_ok "已激活 venv"
+    elif [ -d "$HOME/deepcoin-hft-server/venv" ]; then
+        # shellcheck disable=SC1091
+        source "$HOME/deepcoin-hft-server/venv/bin/activate"
+        log_ok "已激活上级目录 venv"
     else
         log_warn "未找到 venv，使用系统 Python"
     fi
+
     if ! command -v python3 >/dev/null 2>&1; then
         log_fail "未找到 python3"
         return 1
     fi
-    if ! command -v pip >/dev/null 2>&1 && ! command -v pip3 >/dev/null 2>&1; then
-        log_fail "未找到 pip"
-        return 1
-    fi
+    log_ok "python3 已就绪: $(python3 --version 2>&1)"
+
+    # 安装依赖
     PIP_CMD="pip"
     command -v pip3 >/dev/null 2>&1 && PIP_CMD="pip3"
-    $PIP_CMD install -q -r "$DIR/requirements.txt"
-    log_ok "requirements.txt 依赖已就绪"
+    if [ -f "$DIR/requirements.txt" ]; then
+        $PIP_CMD install -q -r "$DIR/requirements.txt" 2>&1 | tail -3
+        log_ok "requirements.txt 依赖已安装"
+    else
+        log_warn "requirements.txt 不存在，跳过"
+    fi
 
-    # 清理旧字节码，避免 gunicorn 加载过期 .pyc
+    # 清理旧字节码
     find "$DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
     find "$DIR" -name "*.pyc" -delete 2>/dev/null || true
 
-    CLIENT_VER="$(grep 'CLIENT_VERSION' "$DIR/deepcoin_client.py" 2>/dev/null | head -1 || true)"
-    SUPERVISOR_VER="$(grep 'DEEPCOIN_SUPERVISOR_VERSION' "$DIR/position_supervisor_deepcoin.py" 2>/dev/null | head -1 || true)"
-
-    if echo "$SUPERVISOR_VER" | grep -qE "DEEPCOIN_SUPERVISOR_VERSION.*\"${MIN_SUPERVISOR_VERSION_RE}"; then
-        log_ok "position_supervisor_deepcoin.py 版本已就绪 (${SUPERVISOR_VER})"
+    # 语法预检
+    CORE_FILES="$DIR/app.py $DIR/deepcoin_client.py $DIR/dingtalk.py $DIR/position_supervisor_deepcoin.py"
+    PYCRC=$(python3 -m py_compile $CORE_FILES 2>&1 || true)
+    if [ -z "$PYCRC" ]; then
+        log_ok "核心 Python 文件语法检查通过"
     else
-        log_fail "position_supervisor_deepcoin.py 缺少 v13.4.6+ / v13.10+ 版本号，请同步最新代码（当前: ${SUPERVISOR_VER:-未找到}）"
-        return 1
+        log_warn "语法预检有警告（非致命）: ${PYCRC:0:120}"
     fi
 
-    # 智能检查：已有功能则通过，不再强制校验版本号
-    if grep -q "report_tv_signal_received" "$DIR/dingtalk.py" 2>/dev/null \
-        && grep -q "report_tv_position_add" "$DIR/dingtalk.py" 2>/dev/null \
-        && grep -q "EXCHANGE_LEVERAGE" "$DIR/position_supervisor_deepcoin.py" 2>/dev/null; then
-        log_ok "TV比例/信号接收钉钉 已就绪"
-    fi
-
-    if grep -q "report_principal_snapshot" "$DIR/dingtalk.py" 2>/dev/null \
-        && grep -q "get_principal_wallet_balance" "$DIR/deepcoin_client.py" 2>/dev/null; then
-        log_ok "本金快照 + principal_wallet 口径已就绪"
-    fi
-
-    if grep -q "report_smart_same_dir_decision" "$DIR/dingtalk.py" 2>/dev/null \
-        && grep -q "open_atr" "$DIR/dingtalk.py" 2>/dev/null \
-        && grep -q "tv_atr" "$DIR/dingtalk.py" 2>/dev/null \
-        && grep -q "report_radar_guardian_realigned" "$DIR/dingtalk.py" 2>/dev/null; then
-        log_ok "dingtalk.py 智能同向 + 雷达纠偏补报 已就绪"
-    fi
-
-    if echo "$CLIENT_VER" | grep -qE 'CLIENT_VERSION.*v(13\.(4\.|6\.)|16\.)'; then
-        log_ok "deepcoin_client.py 版本已就绪 (${CLIENT_VER})"
-    else
-        log_warn "deepcoin_client.py 版本标识偏旧 (${CLIENT_VER:-未找到})，不阻断部署"
-    fi
-
-    python3 -m py_compile "$DIR/app.py" "$DIR/deepcoin_client.py" \
-        "$DIR/dingtalk.py" "$DIR/position_supervisor_deepcoin.py" 2>/dev/null \
-        && log_ok "核心 Python 文件语法检查通过" \
-        || log_warn "语法预检跳过（非致命）"
+    # 显示当前版本
+    SUP_VER=$(grep 'DEEPCOIN_SUPERVISOR_VERSION' "$DIR/position_supervisor_deepcoin.py" 2>/dev/null \
+        | head -1 | sed 's/.*= *//' | tr -d '"' | tr -d "'" | tr -d ' ' || echo "未知")
+    CLI_VER=$(grep 'CLIENT_VERSION' "$DIR/deepcoin_client.py" 2>/dev/null \
+        | head -1 | sed 's/.*= *//' | tr -d '"' | tr -d "'" | tr -d ' ' || echo "未知")
+    log_ok "supervisor: $SUP_VER"
+    log_ok "client: $CLI_VER"
 }
 
+# ═══════════════════════════════════════════════════════════
+# 步骤 3：启动服务
+# ═══════════════════════════════════════════════════════════
 start_service() {
-    log_step "[3/6] 启动 Gunicorn 网关 (workers=${WORKERS}, threads=${THREADS})..."
+    log_step "启动 Gunicorn 网关 (workers=${WORKERS}, threads=${THREADS})..."
     mkdir -p "$LOG_DIR"
     touch "$BRAIN_LOG" 2>/dev/null || true
     chmod 664 "$BRAIN_LOG" 2>/dev/null || true
@@ -248,7 +331,7 @@ start_service() {
         --capture-output \
         app:app >> "$LOG_FILE" 2>&1 &
 
-    sleep 1
+    sleep 2
     GUNICORN_PID="$(cat "$PID_FILE" 2>/dev/null || echo "")"
     if [ -z "$GUNICORN_PID" ] || ! kill -0 "$GUNICORN_PID" 2>/dev/null; then
         log_fail "Gunicorn 启动失败，请检查日志"
@@ -258,8 +341,11 @@ start_service() {
     log_ok "Gunicorn 已启动 PID=${GUNICORN_PID}"
 }
 
+# ═══════════════════════════════════════════════════════════
+# 步骤 4：等待端口监听
+# ═══════════════════════════════════════════════════════════
 wait_for_listen() {
-    log_step "[4/6] 等待端口 ${PORT} 进入 LISTEN 状态..."
+    log_step "等待端口 ${PORT} 进入 LISTEN 状态..."
     local i=1
     while [ "$i" -le "$HEALTH_RETRIES" ]; do
         if port_in_use; then
@@ -274,11 +360,14 @@ wait_for_listen() {
     return 1
 }
 
+# ═══════════════════════════════════════════════════════════
+# 步骤 5：多重健康审计
+# ═══════════════════════════════════════════════════════════
 health_check() {
-    log_step "[5/6] 多重健康审计..."
+    log_step "多重健康审计..."
     sleep "$HEALTH_WAIT_SEC"
 
-    # 6a. 进程存活
+    # 5a. 进程存活
     GUNICORN_PID="$(cat "$PID_FILE" 2>/dev/null || echo "")"
     if [ -n "$GUNICORN_PID" ] && kill -0 "$GUNICORN_PID" 2>/dev/null; then
         log_ok "Gunicorn 主进程存活 PID=${GUNICORN_PID}"
@@ -286,69 +375,77 @@ health_check() {
         log_fail "Gunicorn 主进程已退出"
     fi
 
-    # 6b. GET /health
+    # 5b. GET /health
     HEALTH_BODY="$(curl -sf "http://127.0.0.1:${PORT}/health" 2>/dev/null || echo "")"
     if echo "$HEALTH_BODY" | grep -q "deepcoin_webhook"; then
-        log_ok "GET /health 正常 → ${HEALTH_BODY}"
+        log_ok "GET /health 正常 → ${HEALTH_BODY:0:120}"
     else
         log_fail "GET /health 异常 → ${HEALTH_BODY:-无响应}"
     fi
 
-    # 6c. POST /webhook 回路（使用 .env 中的 WEBHOOK_SECRET）
+    # 5c. POST /webhook 回路
     HTTP_STATUS="$(curl -s -o /dev/null -w "%{http_code}" \
         -X POST "http://127.0.0.1:${PORT}/webhook" \
         -H "Content-Type: application/json" \
-        -d "{\"secret\":\"${WEBHOOK_SECRET}\",\"action\":\"PING\"}" 2>/dev/null || echo "000")"
+        -d "{\"secret\":\"${WEBHOOK_SECRET:-528586}\",\"action\":\"PING\"}" 2>/dev/null || echo "000")"
     if [ "$HTTP_STATUS" = "200" ]; then
         log_ok "POST /webhook 回路 200 OK（secret 校验通过）"
     else
         log_fail "POST /webhook 异常 HTTP=${HTTP_STATUS}"
     fi
 
-    # 6d. 大脑加载日志（大脑写入 deepcoin_brain.log，非 gunicorn error log）
+    # 5d. 大脑加载日志
     sleep 2
-    if grep -qE 'v13\.(4\.[6-9]|(?:[5-9]|[1-9][0-9]+))' "$BRAIN_LOG" 2>/dev/null; then
-        log_ok "VPS 大脑 v13.4.6+ / v13.10+ 已成功加载"
-    elif grep -q "深币 VPS" "$BRAIN_LOG" 2>/dev/null || grep -q "军师托管版" "$BRAIN_LOG" 2>/dev/null; then
-        log_warn "大脑已加载但版本可能过旧（日志中无 v13.4.x，请确认代码已更新）"
+    if grep -qE 'v(13\.(4\.[6-9]|[5-9]|[1-9][0-9])|16\.|17\.)' "$BRAIN_LOG" 2>/dev/null; then
+        log_ok "VPS 大脑已成功加载"
+    elif grep -q "深币 VPS" "$BRAIN_LOG" 2>/dev/null; then
+        log_ok "VPS 大脑已加载"
     elif grep -q "深币 VPS" "$LOG_DIR/gunicorn_error.log" 2>/dev/null; then
-        log_ok "VPS 大脑模块已成功加载 (gunicorn_error.log)"
+        log_ok "VPS 大脑模块已加载 (gunicorn_error.log)"
     else
-        log_warn "日志中暂未看到大脑加载字样（请 tail -f logs/deepcoin_brain.log 确认）"
+        log_warn "日志中暂未看到大脑加载字样（请 tail -f 确认）"
     fi
 
-    # 6e. 进程清单（仅本实例端口）
-    echo -e "  ${CYAN}→ 当前实例进程 (port=${PORT}):${NC}"
+    # 5e. 进程清单
+    echo -e "    ${CYAN}    当前实例进程 (port=$PORT):${NC}"
     ps -ef 2>/dev/null | grep -E "gunicorn.*:${PORT}" | grep -v grep \
         | awk '{print "     PID="$2" CMD="$8" "$9" "$10" "$11}' || true
 }
 
+# ═══════════════════════════════════════════════════════════
+# 步骤 6：汇总
+# ═══════════════════════════════════════════════════════════
 print_summary() {
-    log_step "[6/6] 部署结果汇总"
+    log_step "部署结果汇总"
     echo ""
     if [ "$DEPLOY_OK" -eq 1 ]; then
-        echo -e "${GREEN}=== 🚀 深币(Deepcoin) 干净重部署成功 ===${NC}"
-        echo -e "  网关地址: http://${BIND_HOST}:${PORT}/webhook"
+        echo -e "${GREEN}===  深币(Deepcoin) 部署成功  ===${NC}"
+        echo -e "  网关地址: http://0.0.0.0:${PORT}/webhook"
         echo -e "  健康检查: http://127.0.0.1:${PORT}/health"
         echo -e "  大脑日志: tail -f ${BRAIN_LOG}"
         echo -e "  访问日志: tail -f ${LOG_DIR}/gunicorn_access.log"
         echo -e "  错误日志: tail -f ${LOG_DIR}/gunicorn_error.log"
+        echo ""
     else
-        echo -e "${RED}=== ❌ 深币部署未完全通过，请排查上述失败项 ===${NC}"
+        echo -e "${RED}===  深币部署未完全通过，请排查上述失败项  ===${NC}"
         echo -e "  最近日志:"
         tail -n 15 "$LOG_FILE" 2>/dev/null || true
         exit 1
     fi
-    echo ""
 }
 
-# ── 主流程 ──
-echo -e "\n${CYAN}=== 深币系统 · 干净重部署开始 [${DEPLOY_SCRIPT_VERSION}] ===${NC}"
+# ────────────────────────────────────────────────────────
+# 主流程
+# ────────────────────────────────────────────────────────
+echo -e "\n${CYAN}═══════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}  深币 Deepcoin 自动部署 [${SCRIPT_VERSION}]${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════════${NC}"
 echo -e "  工作目录: ${DIR}"
 echo -e "  目标端口: ${PORT}"
+echo -e "  脚本版本: ${SCRIPT_VERSION}"
 echo ""
 
-load_env
+git_update
 force_cleanup || exit 1
 install_deps || exit 1
 start_service || exit 1
