@@ -67,7 +67,11 @@ def check_tp_slice_budget(
     ratios: Optional[List[float]] = None,
     tol_ratio: float = 0.03,
 ) -> AuditItem:
-    """TP1+TP2 之和应 ≈ initial × 30%（place=2）。"""
+    """TP1+TP2 之和应 ≈ initial × 30%（place=2）。
+    
+    特殊处理：当 initial_qty <= 2 时（最小仓位），tp1+tp2 允许等于 initial_qty
+    （因为 10%+20% 比例在 1 张时无法满足：min(tp1)=1, min(tp2)=1, min(和)=2 > 1×0.30）
+    """
     ratios = list(ratios or [0.10, 0.20, 0.70])
     place_n = max(1, min(2, int(place_levels or 2)))
     initial = _f(initial_qty)
@@ -77,7 +81,14 @@ def check_tp_slice_budget(
     got = _f(tp1_qty) + _f(tp2_qty)
     drift = abs(got - expected)
     tol = max(0.001, initial * float(tol_ratio), expected * float(tol_ratio))
-    ok = drift <= tol and got <= initial * 0.35 + 1e-9
+    
+    # 特殊处理：对于 1-2 张的最小仓位，tp1+tp2 允许等于 initial（全部给 TP1）
+    # 因为 1 张时 min(tp1)=1, min(tp2)=1，导致 tp1+tp2 >= 2 > 1×0.30
+    if initial <= 2:
+        ok = got == initial  # 全部给 TP1 是唯一合理选择
+    else:
+        ok = drift <= tol and got <= initial * 0.35 + 1e-9
+    
     return AuditItem(
         "tp_slice",
         ok,

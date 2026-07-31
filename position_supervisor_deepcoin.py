@@ -2569,14 +2569,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if len(tps) >= 1 and tps[0] > 0:
             tp1 = tps[0]
             tp1_side = "sell" if side == "LONG" else "buy"
+            # 使用 floor 确保不超过 qty，1 张时 tp1=1, tp2=0
             tp1_qty = max(1, int(qty * LEG_TP_RATIOS_REENTRY[0]))
+            tp2_qty = max(0, int(qty * LEG_TP_RATIOS_REENTRY[1]))
+            if qty == 1:
+                tp1_qty = 1
+                tp2_qty = 0
             deepcoin_client.place_limit_order(
                 self.symbol, tp1_side, pos_side, tp1, tp1_qty,
             )
-        if len(tps) >= 2 and tps[1] > 0:
+        if len(tps) >= 2 and tps[1] > 0 and tp2_qty > 0:
             tp2 = tps[1]
             tp2_side = "sell" if side == "LONG" else "buy"
-            tp2_qty = max(1, int(qty * LEG_TP_RATIOS_REENTRY[1]))
             deepcoin_client.place_limit_order(
                 self.symbol, tp2_side, pos_side, tp2, tp2_qty,
             )
@@ -2943,8 +2947,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 out[3] = 0
             return out
 
-        tp1_qty = max(1, int(math.ceil(live_qty * ratios[0])))
-        tp2_qty = max(1, int(math.ceil(live_qty * ratios[1])))
+        # 使用 floor() 确保总量不超过 live_qty
+        tp1_qty = max(1, int(math.floor(live_qty * ratios[0])))
+        tp2_qty = max(1, int(math.floor(live_qty * ratios[1])))
+        # 确保 tp1 + tp2 不超过 live_qty，必要时压缩
+        if tp1_qty + tp2_qty > live_qty:
+            # 优先保证 TP1，TP2 压缩到最小
+            tp1_qty = max(1, live_qty - 1)
+            tp2_qty = max(0, live_qty - tp1_qty)
         # 剩余给 TP3（雷达管理，不挂限价）
         tp3_qty = max(0, live_qty - tp1_qty - tp2_qty)
 
