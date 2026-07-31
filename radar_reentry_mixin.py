@@ -499,26 +499,8 @@ class RadarReentryMixin:
         self.reentry_sterile_fail_count = int(
             getattr(self, "reentry_sterile_fail_count", 0) or 0
         ) + 1
-        try:
-            self.trading_paused = True
-        except Exception:
-            pass
-        try:
-            import dingtalk
-            self._call_dingtalk(
-                dingtalk.report_system_alert,
-                title=f"再入前无菌失败·已暂停 [{self.symbol}]",
-                detail=(
-                    f"{reason} 连续{max_n}轮未净场 | {last_detail} | "
-                    f"已 trading_paused=True，禁止再挂限价（防叠单击穿）"
-                ),
-                level="紧急",
-                suggestion="APP 手动全部撤单确认净场后 /admin/resume",
-            )
-        except Exception:
-            pass
-        logger.error(
-            f"🚨 [{self.symbol}] {reason} 失败超限 → 暂停交易 | {last_detail}"
+        logger.warning(
+            f"⚠️ [{self.symbol}] {reason} 失败超限 → 仅记录日志，不再暂停交易 | {last_detail}"
         )
         return False
 

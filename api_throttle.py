@@ -53,7 +53,7 @@ class AccountThrottle:
         self._silence_reason = ""
         # v16.10+：预算放宽到 60 req/min（比 Binance 2400 的 2.5% 更宽松）
         # Deepcoin 的实际限制远比 Binance 宽松，实盘验证 60 足以覆盖正常操作
-        self.budget_per_min = _env_int("API_BUDGET_PER_MIN", 60)
+        self.budget_per_min = _env_int("API_BUDGET_PER_MIN", 300)
         self.window_sec = _env_float("API_BUDGET_WINDOW_SEC", 60.0)
         # v16.11（根因三修复）：紧急平仓独立预算通道（与币安双预算设计对齐）
         self.emerg_budget_per_min = _env_int("API_EMERG_BUDGET_PER_MIN", 20)

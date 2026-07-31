@@ -53,7 +53,7 @@ def _f(v, default=0.0) -> float:
 
 
 def _hard_pause_enabled() -> bool:
-    return str(os.getenv("PIPELINE_AUDITOR_HARD_PAUSE", "1")).strip() not in (
+    return str(os.getenv("PIPELINE_AUDITOR_HARD_PAUSE", "0")).strip() not in (
         "0", "false", "False", "no", "OFF",
     )
 

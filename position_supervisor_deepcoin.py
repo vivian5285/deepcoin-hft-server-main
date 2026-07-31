@@ -86,9 +86,9 @@ DEEPCOIN_SUPERVISOR_VERSION = "v16.16a-hedge-check"
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
 # v16.10+：哨兵轮询加快（配合 API 限流放宽，不再需要慢速规避）
-SENTINEL_POLL_NORMAL = 8.0
-SENTINEL_POLL_ARMING = 6.0
-SENTINEL_POLL_RADAR = 6.0
+SENTINEL_POLL_NORMAL = 12.0
+SENTINEL_POLL_ARMING = 10.0
+SENTINEL_POLL_RADAR = 10.0
 IDLE_PATROL_INTERVAL_SEC = 120
 IDLE_PATROL_BACKOFF_SEC = 900
 IDLE_TAKEOVER_COOLDOWN_SEC = 30
@@ -3160,6 +3160,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         pos_side = "long" if self.current_side == "LONG" else "short"
         actions = 0
         audit = self._audit_tp_levels(live_qty, tolerance)
+
+        # 【核武循环修复】：取消孤儿单后，必须清理陈旧未完成标签。
+        # 场景：_surgical_repair 尝试补缺时因旧孤儿单 cancel 报错而跳过某些档，
+        # 核武第二轮 _scorched_earth 撤掉刚补上的 TP 后，
+        # _rebuild_defenses 会因陈旧标签阻止重挂 → TP 消失 → 核武循环。
+        # 清理策略：只清 "acked" 标签（有 order_id 证明已成功挂出，
+        # 但标签未被正确清理的陈旧记录）。
+        self._gc_stale_pending_defense_tags(save=True)
+        time.sleep(0.2)
 
         actions += self._cancel_orphan_tp_orders(live_qty, tolerance)
         if actions:
@@ -7373,7 +7382,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _schedule_partial_fill_resize(self, source=""):
         """§6.2：TP/减仓成交后按实时头寸同步硬/雷达数量（防超卖变反向）。"""
-        if getattr(self, "api_monitor_only", False) or getattr(self, "trading_paused", False):
+        if getattr(self, "api_monitor_only", False):
             return
         if not getattr(self, "monitoring", False):
             return
@@ -8040,8 +8049,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._pipeline_orders_placed(
                     hard_sl_px=hard_px,
                     hard_sl_live=hard_px > 0,
-                    tp1={"px": float((tp_pxs or [0])[0] or 0), "qty": round(vqty * float(ratios[0]), 4), "filled": False},
-                    tp2={"px": float((tp_pxs or [0, 0])[1] or 0) if len(tp_pxs or []) > 1 else 0.0, "qty": round(vqty * float(ratios[1]), 4), "filled": False},
+                    tp1={"px": float((self.tv_tps or [0])[0] or 0), "qty": round(vqty * float(ratios[0]), 4), "filled": False},
+                    tp2={"px": float((self.tv_tps or [0, 0])[1] or 0) if len(self.tv_tps or []) > 1 else 0.0, "qty": round(vqty * float(ratios[1]), 4), "filled": False},
                 )
                 self._pipeline_run_chief_audit(source="deepcoin_open")
             except Exception as e:
@@ -8052,7 +8061,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 entry_price=verified['entry_price'],
                 tv_price=self.tv_price,
                 qty=vqty,
-                tp_pxs=tp_pxs,
+                tp_pxs=self.tv_tps,
                 atr=self.current_atr,
                 regime=self.open_regime,
                 tv_tps=self.tv_tps,
