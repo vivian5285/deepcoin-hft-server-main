@@ -617,3 +617,30 @@ def report_recover_standby(verify_note="", version=""):
         f"版本: {version or 'deepcoin_webhook'}\n"
     )
     send_text(text)
+
+
+def report_supervisor_open(side, entry_price, tv_price, qty, tp_pxs, atr,
+                          regime, verify_note="", verified=True, principal_balance=0,
+                          margin_pct=0, margin_usdt=0, leverage=5,
+                          vps_sizing_meta=None, tv_field_sources=None,
+                          symbol="ETH-USDT-SWAP", unit_label="张", tp_audit=None):
+    """开仓审计报告"""
+    if not _is_enabled():
+        return
+    tp_txt = _fmt_tp_levels(tp_pxs)
+    emoji = "✅" if verified else "⚠️"
+    text = (
+        f"{emoji} *开仓审计*\n"
+        f"{_fmt_time()}\n"
+        f"\n"
+        f"{_fmt_side(side)} | {qty} {unit_label}\n"
+        f"入价: `{entry_price:.2f}` (TV `{tv_price:.2f}`)\n"
+        f"ATR: `{atr:.2f}` | 档位: R{regime}\n"
+        f"止盈: {tp_txt}\n"
+        f"保证金: {margin_usdt:.0f} USDT ({margin_pct:.1%})\n"
+        f"本金余额: `{principal_balance:.2f}`\n"
+        f"杠杆: {leverage}x\n"
+    )
+    if verify_note:
+        text += f"核实: {verify_note}\n"
+    send_text(text)

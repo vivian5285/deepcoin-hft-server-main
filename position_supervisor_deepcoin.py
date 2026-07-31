@@ -636,21 +636,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     @staticmethod
     def _call_telegram_notify(fn, **kwargs):
-        """TG已关闭，仅记录日志。"""
+        """通过 TG Bot 发送通知。"""
         try:
-            fn_name = getattr(fn, '__name__', str(fn))
-            logger.info(f"[TG离线] {fn_name} | {list(kwargs.keys())}")
-        except Exception:
-            pass
+            fn(**kwargs)
+        except Exception as e:
+            logger.warning(f"[TG发送失败] {getattr(fn, '__name__', fn)} | {e}")
 
     @staticmethod
     def _call_telegram(fn, **kwargs):
-        """TG已关闭，仅记录日志。"""
+        """通过 TG Bot 发送通知。"""
         try:
-            fn_name = getattr(fn, '__name__', str(fn))
-            logger.info(f"[TG离线] {fn_name} | {list(kwargs.keys())}")
-        except Exception:
-            pass
+            fn(**kwargs)
+        except Exception as e:
+            logger.warning(f"[TG发送失败] {getattr(fn, '__name__', fn)} | {e}")
 
     def _start_signal_worker(self):
         if self._signal_worker_started:
