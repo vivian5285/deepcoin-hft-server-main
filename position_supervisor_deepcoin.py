@@ -7413,7 +7413,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         except Exception as e:
             logger.error(f"[{self.symbol}] partial_fill_resize: {e}")
 
-    def _full_reentry(self, action, close_reason):
+    def _full_reentry(self, action, close_reason, payload=None):
         """铁律：先平现有仓 → 净挂单 → 再开仓刷新；钉钉核实。"""
         reason = close_reason or "TV开仓·一律先平后开"
         try:
@@ -7468,7 +7468,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
         except Exception:
             pass
-        self._open_position(action, curr_px)
+        self._open_position(action, curr_px, payload=payload)
         self._close_open_chain_active = False
 
     def _handle_manual_flat_detected(self, reason, close_meta=None, curr_px=0.0):
@@ -7781,6 +7781,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._full_reentry(
             action,
             "TV开仓·一律先平后开刷新仓位（有仓先平；无仓净挂单再开）",
+            payload=payload,
         )
         self._touch_entry_signal_signature(action)
 
