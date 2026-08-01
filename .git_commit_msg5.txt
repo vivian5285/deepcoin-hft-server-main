@@ -1,0 +1,5 @@
+fix v16.23b: 修复 _enforce_tv_direction_or_flat None guard + pos=None 双保险
+
+1. _enforce_tv_direction_or_flat: 添加 if pos is None 安全返回
+2. _perform_live_takeover: 添加显式 if pos is None 检查（双保险）
+3. 版本号确认 v16.23-hard-shield-recovery

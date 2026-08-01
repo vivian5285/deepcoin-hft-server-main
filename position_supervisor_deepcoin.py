@@ -431,6 +431,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         实盘有仓但 VPS 未监控 / 防线缺失 → 补挂 TP123+硬止损，启动雷达哨兵。
         """
         # v16.22 修复：防止 pos=None 导致崩溃（_recover_missed_flat_on_startup 可能在持仓已平时仍调用）
+        # v16.23 修复：显式 None 检查，防止任何形态的 pos=None 导致崩溃
+        if pos is None:
+            logger.warning(f"⚠️ _perform_live_takeover 跳过：pos=None | source={source}")
+            return False
         if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
             logger.warning(f"⚠️ _perform_live_takeover 跳过：无实盘持仓 | source={source}")
             return False
@@ -1048,6 +1052,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _enforce_tv_direction_or_flat(self, pos, source="sentinel"):
         """实盘与 TV 明确反向 → 核武全平；同向或信源不明 → 交给接管"""
+        # v16.23 修复：pos=None 时安全返回，防止上层调用链崩溃
+        if pos is None:
+            return False
         if not pos or self._safe_qty(pos.get("size")) <= 0:
             return False
         live_side = self._live_position_side(pos)
