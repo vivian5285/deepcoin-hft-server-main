@@ -1,6 +1,6 @@
 # 深币 Deepcoin · ETH/XAU 永续 Webhook 交易系统
 
-**当前版本：`v16.17-eth-only-no-dingtalk`**
+**当前版本：`v16.18-tp-recover-audit`**
 
 > **持仓模式说明**：Deepcoin 没有独立的 `set-position-mode` API，但 `posSide=long/short` 参数已在所有订单（开仓/平仓/限价止盈/条件单）中正确使用，保证双向持仓语义。`reduceOnly=True` 在止盈/止损中已正确设置，防止意外开仓。
 
@@ -11,11 +11,13 @@
 | GitHub | `vivian5285/deepcoin-hft-server-main` |
 | VPS 目录 | `/home/deepcoin/deepcoin-hft-server` |
 | 端口 | **5004** |
+| TV Webhook | `http://187.77.130.144/deepcoin/webhook` |
 | 单位 | **张**（0.1 ETH/张） |
 | 杠杆 | **5x** cross（双向持仓模式） |
-| 健康检查 | `GET /health` → `"version":"v16.17-eth-only-no-dingtalk"` |
+| 健康检查 | `GET /health` → `"version":"v16.18-tp-recover-audit"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
+| 自检 | `bash check_network.sh` 或 `bash check_network.sh --quick` |
 
 ---
 
@@ -173,21 +175,32 @@ XAUUSDT.P：
 ```bash
 cd ~/deepcoin-hft-server
 
-# 方式一：自动部署（脚本内含 git pull，推荐）
+# 方式一：自动部署（推荐，内含网络自检）
 bash deploy_deepcoin.sh
 
-# 方式二：手动拉取部署
+# 方式二：仅自检网络，不重启
+bash deploy_deepcoin.sh --check
+
+# 方式三：手动拉取部署
 git fetch origin
 git stash                        # 暂存本地修改（如有）
 git checkout main
 git reset --hard origin/main
-chmod +x deploy_deepcoin.sh system_monitor.sh
+chmod +x deploy_deepcoin.sh check_network.sh system_monitor.sh
 bash deploy_deepcoin.sh
 
 # 验证
 curl -s http://127.0.0.1:5004/health
 tail -f logs/deepcoin_brain.log
+
+# 完整网络检测（推荐部署前执行）
+bash check_network.sh
+
+# 快速检测（仅关键项）
+bash check_network.sh --quick
 ```
+
+> **TV Webhook 地址**：`http://187.77.130.144/deepcoin/webhook`
 
 ---
 
@@ -258,6 +271,8 @@ FLASK_PORT=5004
 
 | 版本 | 要点 |
 |------|------|
+| v16.18 | TP恢复安全增强：对账时比较 live_qty vs saved_initial 推断 TP 成交；低置信度时启用保守模式直接查交易所验证；全局 TP 补挂安全上限 5 次/会话，防止重复挂 50 个单 |
+| v16.17 | 移除钉钉通知，简化日志；防线对齐冷却优化 |
 | v16.16 | 修复杠杆 25x→5x；新增双向持仓模式（hedge mode）启动设置；先平后开流程确认限价TP+硬止损+雷达全链路验证 |
 | v16.15 | acked-tag deadlock fix: include acked in final states for GC + open-tag check; prevents nuclear-loop infinite blocking |
 | v16.10.2 | 修复 adx_tier 从 tv_stop_distance/ATR 推导；重入 TP 分仓按 10/20/70 |
@@ -267,4 +282,4 @@ FLASK_PORT=5004
 
 ---
 
-*深币紫金引擎 · v16.17 · 对齐规格 v1.0*
+*深币紫金引擎 · v16.18 · 对齐规格 v1.0*

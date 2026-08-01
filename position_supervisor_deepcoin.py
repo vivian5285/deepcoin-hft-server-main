@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.17-eth-only-no-dingtalk"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.18-eth-only-tp-recover-audit"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -136,6 +136,17 @@ OPEN_SAME_DIR_COOLDOWN_SEC = 180  # 同向重复 OPEN：开仓后冷却期内禁
 ATR_SIMILAR_RATIO = 0.03  # 持仓 ATR 与 TV ATR 偏差 ≤3% 视为未变
 TV_JOURNAL = "logs/deepcoin_tv_journal.jsonl"
 OPEN_JOURNAL = "logs/deepcoin_open_journal.jsonl"
+# ============================================================
+# 增强对账常量（v16.18 TP恢复安全增强）
+# ============================================================
+# TP恢复安全模式：当实盘持仓 vs 预期持仓不一致时，使用保守策略
+RECOVER_TP_VERIFY_ATTEMPTS = 3       # 交易所 TP 状态验证重试次数
+RECOVER_TP_VERIFY_DELAY_SEC = 1.2    # 验证重试间隔
+RECOVER_TP_PLACE_MAX_ATTEMPTS = 2     # 单档 TP 最大补挂尝试次数（防止50个重复单）
+RECOVER_TP_PLACE_GUARD_MAX = 5        # 全局 TP 补挂次数上限（整个会话）
+RECOVER_TP_FILL_CONFIRM_ROUNDS = 2   # 成交确认轮次
+# 保守模式条件：live_qty 与预期偏差超过此比例才触发
+RECOVER_TP_CONSERVATIVE_THRESHOLD = 0.05  # 5% 偏差阈值
 
 
 class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
@@ -282,6 +293,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.reentry_window_deadline_ts = 0.0
         self.reentry_order_tag = None
         self.tp_levels_consumed = []  # 确保已初始化
+
+        # v16.18：TP恢复安全增强
+        self._tp_place_guard_count = 0           # 本会话 TP 补挂总次数（防止重复挂50个单）
+        self._tp_place_guard_session_ts = 0.0  # 本次计数周期起始时间
+        self._tp_recover_verified_levels = {}   # 已通过交易所验证的 TP 档位 {level: timestamp}
 
         self.state_file = os.path.join(
             _BASE_DIR, f'deepcoin_vps_state_{self.symbol.replace("-", "_")}.json'
@@ -3115,10 +3131,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             # 撤销后再次确认交易所侧没有该价格的订单，防止重复挂单
             time.sleep(0.3)
             orders_after = self._collect_tp_limit_orders()
-            # 修复：使用正确的字段名 px 而不是 price
             at_px_after = [o for o in orders_after if abs(o.get("px", o.get("price", 0)) - px) <= tolerance]
             if at_px_after:
                 logger.warning(f"  ⚠️ 撤销后仍有 TP@{px:.2f}，跳过本次挂单")
+                continue
+            # v16.18：补挂安全上限检查（防止重复挂50个单）
+            allowed, guard_reason = self._check_tp_place_guard(lv["level"])
+            if not allowed:
+                logger.warning(
+                    f"  ⛔ 补挂跳过：TP{lv['level']}@{px:.2f} | {guard_reason} | "
+                    f"累计{getattr(self, '_tp_place_guard_count', 0)}/{RECOVER_TP_PLACE_GUARD_MAX}"
+                )
                 continue
             logger.info(f"  + 补挂 TP{lv['level']} @ {px:.2f} qty={q}张")
             res = deepcoin_client.place_limit_order(
@@ -3126,6 +3149,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             if res and deepcoin_client._is_success(res):
                 placed += 1
+                self._increment_tp_place_guard()
             time.sleep(0.4)
         return placed
 
@@ -3202,23 +3226,39 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     deepcoin_client.cancel_order(self.symbol, ord_id=at_px[0]["orderId"])
                     actions += 1
                     time.sleep(0.3)
-                    res = deepcoin_client.place_limit_order(
-                        self.symbol, close_side, pos_side, price, target_q,
-                        reduce_only=True,
-                    )
-                    if res and deepcoin_client._is_success(res):
-                        actions += 1
-                        logger.info(
-                            f"🔧 重启纠偏 TP{lv['level']} @{price:.2f} → {target_q} 张"
+                    # v16.18 纠偏前安全上限检查
+                    allowed, guard_reason = self._check_tp_place_guard(lv["level"])
+                    if not allowed:
+                        logger.warning(
+                            f"  ⛔ 纠偏跳过：TP{lv['level']}@{price:.2f} | {guard_reason}"
                         )
+                    else:
+                        res = deepcoin_client.place_limit_order(
+                            self.symbol, close_side, pos_side, price, target_q,
+                            reduce_only=True,
+                        )
+                        if res and deepcoin_client._is_success(res):
+                            actions += 1
+                            self._increment_tp_place_guard()
+                            logger.info(
+                                f"🔧 重启纠偏 TP{lv['level']} @{price:.2f} → {target_q} 张"
+                            )
                     time.sleep(0.35)
                 continue
 
+            # v16.18 补缺前安全上限检查
+            allowed, guard_reason = self._check_tp_place_guard(lv["level"])
+            if not allowed:
+                logger.warning(
+                    f"  ⛔ 补缺跳过：TP{lv['level']}@{price:.2f} | {guard_reason}"
+                )
+                continue
             res = deepcoin_client.place_limit_order(
                 self.symbol, close_side, pos_side, price, target_q, reduce_only=True,
             )
             if res and deepcoin_client._is_success(res):
                 actions += 1
+                self._increment_tp_place_guard()
                 logger.info(f"🔧 重启补挂 TP{lv['level']} @{price:.2f} qty={target_q} 张")
             time.sleep(0.35)
 
@@ -3230,6 +3270,253 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 f"{self._format_audit_summary(final)}"
             )
         return final, actions
+
+    # ============================================================
+    # v16.18：TP 恢复安全增强
+    # ============================================================
+
+    def _reset_tp_place_guard(self):
+        """重置 TP 补挂次数计数器（新会话/新持仓周期）"""
+        self._tp_place_guard_count = 0
+        self._tp_place_guard_session_ts = time.time()
+
+    def _check_tp_place_guard(self, level=0):
+        """
+        检查 TP 补挂是否超过安全上限。
+        返回 (allowed, reason)：allowed=True = 可以继续挂；False = 禁止挂。
+        """
+        now = time.time()
+        # 每5分钟重置一次计数器（新周期）
+        if now - self._tp_place_guard_session_ts > 300:
+            self._reset_tp_place_guard()
+
+        count = getattr(self, "_tp_place_guard_count", 0) or 0
+        max_allowed = RECOVER_TP_PLACE_GUARD_MAX
+        if count >= max_allowed:
+            logger.warning(
+                f"🛡️ TP补挂安全拦截：已补 {count} 次 >= {max_allowed} 上限，"
+                f"禁止本次补挂（level={level}）| 请人工核查"
+            )
+            return False, f"guard_limit:{count}>={max_allowed}"
+        return True, ""
+
+    def _increment_tp_place_guard(self):
+        """记录一次 TP 补挂操作"""
+        self._tp_place_guard_count = (getattr(self, "_tp_place_guard_count", 0) or 0) + 1
+        logger.info(
+            f"🛡️ TP补挂计数 +1 → {self._tp_place_guard_count}/{RECOVER_TP_PLACE_GUARD_MAX}"
+        )
+
+    def _verify_tp_order_on_exchange(self, level, price, tolerance=1.0):
+        """
+        直接查交易所，确认指定档位 TP 是否存在。
+        返回 (exists, actual_orders)。
+        """
+        price = round(float(price), 2)
+        all_orders = list(deepcoin_client.get_pending_orders(self.symbol))
+        tp_orders = []
+        for o in all_orders:
+            if not self._is_tp_limit_order(o):
+                continue
+            o_px = round(float(o.get("px", 0) or 0), 2)
+            if abs(o_px - price) <= tolerance:
+                tp_orders.append({
+                    "orderId": o.get("ordId"),
+                    "price": o_px,
+                    "qty": self._safe_qty(o.get("sz")),
+                })
+        exists = len(tp_orders) >= 1
+        return exists, tp_orders
+
+    def _verify_live_tp_completeness(self, live_qty, initial_qty=None):
+        """
+        v16.18 核心对账：比较 live_qty 与 expected_qty，推断哪些 TP 被成交。
+
+        策略：
+        1. 用当前档位 TP 比例 + live_qty 反推 expected_initial
+        2. 用 saved_initial（如果提供）做交叉验证
+        3. 推断已成交 TP 档位集合
+
+        返回 {
+            "live_qty": float,
+            "inferred_initial": float or None,
+            "inferred_consumed": list[int],
+            "confidence": "high" | "medium" | "low",
+            "discrepancy_pct": float,
+            "needs_conservative_mode": bool,
+        }
+        """
+        live_qty = self._safe_qty(live_qty)
+        regime = self._tp_split_regime()
+        ratios = self.regime_settings[regime]["ratios"]
+
+        # 计算各档理论张数
+        initial_guess = initial_qty if initial_qty and initial_qty > 0 else live_qty
+        tp1_qty_theory = self._calculate_tp_quantities(initial_guess, ratios)[0]
+        tp2_qty_theory = self._calculate_tp_quantities(initial_guess, ratios)[1]
+
+        # 反推：如果只有 TP2 成交（TP1 未挂/未成交），expected_live_qty = initial - tp2
+        # 如果 TP1 成交，expected_live_qty = initial - tp1
+        # 两种场景都计算
+        scenarios = {}
+        for consumed_pattern, label in [
+            ([], "none"),
+            ([1], "tp1_only"),
+            ([2], "tp2_only"),
+            ([1, 2], "both"),
+        ]:
+            rem = live_qty
+            if 1 in consumed_pattern:
+                rem += tp1_qty_theory
+            if 2 in consumed_pattern:
+                rem += tp2_qty_theory
+            scenarios[label] = {
+                "consumed": consumed_pattern,
+                "inferred_initial": rem,
+                "label": label,
+            }
+
+        # 找最接近 initial_qty 的场景
+        saved_initial = self._safe_qty(
+            initial_qty if initial_qty and initial_qty > 0 else getattr(self, "initial_qty", 0)
+        )
+
+        best = None
+        best_diff = 99999
+        for s in scenarios.values():
+            diff = abs(s["inferred_initial"] - saved_initial) if saved_initial > 0 else 0
+            if diff < best_diff:
+                best_diff = diff
+                best = s
+
+        inferred_consumed = (best or scenarios["none"])["consumed"]
+        inferred_initial = (best or scenarios["none"])["inferred_initial"]
+
+        # 计算偏差百分比
+        if saved_initial > 0:
+            discrepancy_pct = abs(inferred_initial - saved_initial) / saved_initial
+        else:
+            discrepancy_pct = abs(inferred_initial - live_qty) / max(live_qty, 1)
+
+        # 置信度评估
+        if discrepancy_pct <= 0.03:
+            confidence = "high"
+        elif discrepancy_pct <= RECOVER_TP_CONSERVATIVE_THRESHOLD:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        needs_conservative = (
+            confidence == "low"
+            or discrepancy_pct > RECOVER_TP_CONSERVATIVE_THRESHOLD
+            or saved_initial <= 0
+        )
+
+        logger.info(
+            f"📊 [TP对账] live={live_qty} | saved_init={saved_initial} | "
+            f"inferred_init={inferred_initial:.1f} | 偏差={discrepancy_pct:.1%} | "
+            f"推断已成交={inferred_consumed} | 置信={confidence} | "
+            f"保守模式={'是' if needs_conservative else '否'}"
+        )
+
+        return {
+            "live_qty": live_qty,
+            "inferred_initial": inferred_initial,
+            "inferred_consumed": list(inferred_consumed),
+            "confidence": confidence,
+            "discrepancy_pct": discrepancy_pct,
+            "needs_conservative_mode": needs_conservative,
+            "tp1_theory": tp1_qty_theory,
+            "tp2_theory": tp2_qty_theory,
+        }
+
+    def _conservative_tp_recover(self, live_qty, entry, dynamic_sl=None, rounds=1):
+        """
+        v16.18 保守 TP 恢复模式：
+        - 不信任本地 tp_levels_consumed（可能过时）
+        - 直接读取交易所 TP 挂单，验证哪些档位实际存在
+        - 只补挂交易所确认缺失的档位
+        - 限制补挂次数防止重复
+        """
+        live_qty = self._resolve_live_qty(live_qty)
+        if live_qty <= 0:
+            return {"placed": 0, "skipped": 0, "guarded": 0, "levels": []}
+
+        close_side = "sell" if self.current_side == "LONG" else "buy"
+        pos_side = "long" if self.current_side == "LONG" else "short"
+
+        # 重置会话计数（新持仓周期）
+        if not getattr(self, "_tp_place_guard_session_ts", 0) or \
+           time.time() - self._tp_place_guard_session_ts > 300:
+            self._reset_tp_place_guard()
+
+        results = {"placed": 0, "skipped": 0, "guarded": 0, "levels": []}
+        expected_levels = self._expected_tp_levels(live_qty)
+
+        for lv in expected_levels:
+            level = int(lv.get("level", 0))
+            price = round(float(lv["price"]), 2)
+            target_q = self._safe_qty(lv["qty"])
+            if price <= 0 or target_q <= 0:
+                continue
+
+            # Step 1: 直接查交易所验证该档是否存在
+            exists, exchange_orders = self._verify_tp_order_on_exchange(level, price)
+            if exists:
+                logger.info(
+                    f"  ✓ [保守] TP{level} @{price:.2f} 交易所确认存在 "
+                    f"({len(exchange_orders)} 单)，跳过"
+                )
+                results["skipped"] += 1
+                results["levels"].append({"level": level, "price": price, "status": "exists_exchange"})
+                continue
+
+            # Step 2: 检查补挂安全上限
+            allowed, guard_reason = self._check_tp_place_guard(level)
+            if not allowed:
+                logger.warning(
+                    f"  ⛔ [保守] TP{level} @{price:.2f} 交易所缺失但补挂被安全拦截 | {guard_reason}"
+                )
+                results["guarded"] += 1
+                results["levels"].append({"level": level, "price": price, "status": "guarded"})
+                continue
+
+            # Step 3: 验证交易所侧确实没有（双重确认）
+            time.sleep(RECOVER_TP_VERIFY_DELAY_SEC)
+            exists2, _ = self._verify_tp_order_on_exchange(level, price)
+            if exists2:
+                logger.info(
+                    f"  ✓ [保守] TP{level} @{price:.2f} 双重验证确认存在，跳过"
+                )
+                results["skipped"] += 1
+                results["levels"].append({"level": level, "price": price, "status": "exists_double_check"})
+                continue
+
+            # Step 4: 补挂
+            logger.info(
+                f"  + [保守] TP{level} @{price:.2f} qty={target_q}张 "
+                f"（交易所确认缺失，尝试补挂）"
+            )
+            res = deepcoin_client.place_limit_order(
+                self.symbol, close_side, pos_side, price, target_q, reduce_only=True,
+            )
+            if res and deepcoin_client._is_success(res):
+                self._increment_tp_place_guard()
+                results["placed"] += 1
+                results["levels"].append({"level": level, "price": price, "status": "placed"})
+                logger.info(f"  ✅ [保守] TP{level} 补挂成功")
+            else:
+                results["levels"].append({"level": level, "price": price, "status": "failed"})
+                logger.warning(f"  ❌ [保守] TP{level} 补挂失败: {res}")
+            time.sleep(0.5)
+
+        logger.info(
+            f"📊 [保守TP恢复] live={live_qty}张 | "
+            f"补挂={results['placed']} | 跳过={results['skipped']} | "
+            f"拦截={results['guarded']} | "
+            f"累计补挂={getattr(self, '_tp_place_guard_count', 0)}/{RECOVER_TP_PLACE_GUARD_MAX}"
+        )
+        return results
 
     def _cancel_stop_orders(self, scope="all"):
         cancelled = 0
@@ -3736,12 +4023,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             # v16.11（根因二修复）：TP 挂单失败时强制重试 3 次
             max_retries = 3
             for attempt in range(max_retries):
+                # v16.18 补挂安全上限检查
+                allowed, guard_reason = self._check_tp_place_guard(level)
+                if not allowed:
+                    logger.warning(
+                        f"⛔ _place_tp_levels_only 跳过：TP{level}@{px:.2f} | {guard_reason}"
+                    )
+                    break
                 res = deepcoin_client.place_limit_order(
                     self.symbol, close_side, pos_side, px, q,
                     reduce_only=True, cl_ord_id=tag,
                 )
                 if res and deepcoin_client._is_success(res):
                     last = res
+                    self._increment_tp_place_guard()
                     break
                 if attempt < max_retries - 1:
                     time.sleep(0.3)
@@ -5709,9 +6004,51 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
     def _ensure_defenses_on_recover(self, live_qty, entry, dynamic_sl=None):
         """
         重启/异动接管：审计 → 齐全跳过 → 增量补挂 → 仍失败才清场重建
-        返回 (matched, pending_prices, expected, rebuilt)
+
+        v16.18 增强：
+        - 入参阶段：先用 _verify_live_tp_completeness 交叉验证 live_qty vs saved_initial
+        - 低置信度时：降级到保守模式（直接查交易所验证）
+        - 补挂全程受 TP 补挂安全上限约束
+        - 核武前必须通过交易所双重确认
         """
         live_qty = self._resolve_live_qty(live_qty)
+        saved_initial = self._safe_qty(getattr(self, "initial_qty", 0) or 0)
+
+        # ============================================================
+        # Step 0: v16.18 交叉验证 - 用 live_qty 反推 initial，与 saved 对比
+        # ============================================================
+        qty_check = self._verify_live_tp_completeness(live_qty, saved_initial)
+
+        conservative_mode = qty_check["needs_conservative_mode"]
+        if conservative_mode:
+            logger.warning(
+                f"⚠️ [TP恢复] 置信度={qty_check['confidence']} | "
+                f"偏差={qty_check['discrepancy_pct']:.1%} | 启用保守模式"
+            )
+            # 重置补挂计数器（新持仓周期）
+            self._reset_tp_place_guard()
+            # 保守模式：直接查交易所验证，不依赖本地 tp_levels_consumed
+            result = self._conservative_tp_recover(
+                live_qty, entry, dynamic_sl=dynamic_sl,
+            )
+            audit = self._audit_tp_levels(live_qty)
+            matched = audit["matched_full"]
+            expected = audit["expected"]
+            if matched >= expected and not audit.get("orphans"):
+                logger.info(
+                    f"✅ [保守] TP 恢复完成 | {matched}/{expected} | "
+                    f"补挂={result['placed']} | 跳过={result['skipped']} | "
+                    f"拦截={result['guarded']}"
+                )
+                return matched, audit["pending_prices"], expected, result["placed"] > 0
+            # 保守模式也失败，降级走常规流程（但带安全上限）
+            logger.warning(
+                f"⚠️ [保守] TP 仍不齐 ({matched}/{expected})，降级常规流程"
+            )
+
+        # ============================================================
+        # Step 1: 常规防线审计
+        # ============================================================
         audit = self._audit_tp_levels(live_qty)
         expected = audit["expected"]
         matched = audit["matched_full"]
@@ -5726,6 +6063,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 f"☢️ 审计触发核武级重挂: {len(self._collect_tp_limit_orders())} 张止盈 | "
                 f"{self._format_audit_summary(audit)}"
             )
+            # v16.18 核武前检查补挂安全上限
+            guard_ok, _ = self._check_tp_place_guard(level=0)
+            if not guard_ok:
+                logger.warning(
+                    f"⛔ 核武被 TP 补挂安全上限拦截！累计补挂="
+                    f"{getattr(self, '_tp_place_guard_count', 0)}/{RECOVER_TP_PLACE_GUARD_MAX}"
+                )
+                # 仍然允许核武（撤单行为），但记录为异常
             audit = self._nuclear_realign_tp(live_qty, entry, dynamic_sl=dynamic_sl, rounds=3)
             return audit["matched_full"], audit["pending_prices"], audit["expected"], True
 
@@ -8579,6 +8924,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 # v16.11（根因二修复）：TP 挂单失败时强制重试，不轻易放弃
                 max_retries = 3
                 for attempt in range(max_retries):
+                    # v16.18 补挂安全上限检查（防止重复挂50个单）
+                    allowed, guard_reason = self._check_tp_place_guard(int(lv.get("level", 0)))
+                    if not allowed:
+                        logger.warning(
+                            f"⛔ _rebuild跳过：TP{lv['level']}@{px:.2f} | {guard_reason}"
+                        )
+                        break
                     res = deepcoin_client.place_limit_order(
                         self.symbol, close_side, pos_side, px, q,
                         reduce_only=True, cl_ord_id=tag,
@@ -8588,6 +8940,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         oid = str(last.get("orderId") or last.get("algoId") or "")
                         self._register_pending_defense_tag(tag, kind, price=px, order_id=oid)
                         placed += 1
+                        self._increment_tp_place_guard()
                         logger.info(f"📈 TP{int(lv.get('level', 0))} {q} @ {px:.2f} tag={tag}")
                         break
                     if attempt < max_retries - 1:
@@ -8723,6 +9076,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if not self._try_acquire_recover_singleton():
             return
         try:
+            # v16.18：重启时重置 TP 补挂安全计数器（新会话）
+            self._reset_tp_place_guard()
             saved_monitoring = False
             if os.path.exists(self.state_file):
                 with open(self.state_file, 'r') as f:
