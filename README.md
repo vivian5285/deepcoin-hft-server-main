@@ -1,6 +1,6 @@
 # 深币 Deepcoin · ETH/BNB 永续 Webhook 交易系统
 
-**当前版本：`v16.23-hard-shield-recovery`**
+**当前版本：`v16.24-hard-shield-recovery`**
 
 > **持仓模式说明**：Deepcoin 没有独立的 `set-position-mode` API，但 `posSide=long/short` 参数已在所有订单（开仓/平仓/限价止盈/条件单）中正确使用，保证双向持仓语义。`reduceOnly=True` 在止盈/止损中已正确设置，防止意外开仓。
 
