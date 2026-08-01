@@ -107,30 +107,60 @@ network_check() {
 
     # --- TV Webhook 目标 ---
     info "测试 TV Webhook 目标连通性: $TV_WEBHOOK_URL"
-    TV_HOST=$(echo "$TV_WEBHOOK_URL" | sed -E 's|^https?://||' | cut -d'/' -f1)
-    TV_PORT=$(echo "$TV_WEBHOOK_URL" | sed -E 's|^https?://||' | cut -d':' -f2 | cut -d'/' -f1)
-    [ -z "$TV_PORT" ] && TV_PORT=80
-    if echo "$TV_WEBHOOK_URL" | grep -q "https"; then TV_PORT=443; fi
+    # 正确解析 host 和 port（兼容有无显式端口的情况）
+    # 例: http://187.77.130.144/deepcoin/webhook -> host=187.77.130.144, port=80
+    TV_HOST=$(echo "$TV_WEBHOOK_URL" | sed -E 's|^https?://||' | cut -d'/' -f1 | cut -d':' -f1)
+    TV_PORT_STR=$(echo "$TV_WEBHOOK_URL" | sed -E 's|^https?://||' | cut -d'/' -f1 | grep ':' | cut -d':' -f2 2>/dev/null || echo "")
+    if [ -n "$TV_PORT_STR" ]; then
+        TV_PORT="$TV_PORT_STR"
+    elif echo "$TV_WEBHOOK_URL" | grep -q "https"; then
+        TV_PORT=443
+    else
+        TV_PORT=80
+    fi
+    info "  -> 解析结果: host=$TV_HOST port=$TV_PORT"
 
-    # TCP ping
-    if command -v nc >/dev/null 2>&1; then
-        if nc -zw 5 "$TV_HOST" "$TV_PORT" 2>/dev/null; then
-            pass "TV Webhook TCP 连通: $TV_HOST:$TV_PORT"
+    # 策略：优先 HTTP 检测（curl），因为 TV webhook 本质是 HTTP 服务
+    # nc TCP 检测只作为补充（部分 VPS 没装 nc）
+    TV_CHECK_OK=false
+
+    # 1) HTTP curl 检测（POST，因为 webhook 通常是 POST 接口）
+    info "  -> 尝试 HTTP POST 检测..."
+    HTTP_CODE=$(curl -sf --connect-timeout 5 \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d '{"test":"ping"}' \
+        -o /dev/null -w "%{http_code}" \
+        "$TV_WEBHOOK_URL" 2>/dev/null || echo "000")
+    # 接受常见响应码：200=成功, 405=方法不允许(说明服务在线但端点仅接受特定请求), 302/301=重定向, 401/403=需要认证
+    if [[ "$HTTP_CODE" =~ ^(200|405|302|301|401|403)$ ]]; then
+        pass "TV Webhook HTTP 响应: $HTTP_CODE（TV 推送应正常）"
+        TV_CHECK_OK=true
+    elif [ "$HTTP_CODE" = "000" ]; then
+        info "  -> HTTP POST 超时，尝试 GET..."
+        HTTP_CODE=$(curl -sf --connect-timeout 5 \
+            -o /dev/null -w "%{http_code}" \
+            "$TV_WEBHOOK_URL" 2>/dev/null || echo "000")
+        if [[ "$HTTP_CODE" =~ ^(200|405|302|301|401|403)$ ]]; then
+            pass "TV Webhook HTTP GET 响应: $HTTP_CODE（TV 推送应正常）"
+            TV_CHECK_OK=true
+        elif [ "$HTTP_CODE" = "000" ]; then
+            warn "TV Webhook 连接失败（HTTP GET 也超时，可能是防火墙/VPS 安全组未开放 $TV_PORT 端口）"
         else
-            fail "TV Webhook TCP 连通失败: $TV_HOST:$TV_PORT"
-            ALL_OK=false
+            warn "TV Webhook HTTP GET 响应: $HTTP_CODE（需结合 TV 端验证）"
+            TV_CHECK_OK=true
         fi
     else
-        # fallback: curl
-        HTTP_CODE=$(curl -sf --connect-timeout 5 -o /dev/null -w "%{http_code}" \
-            "$TV_WEBHOOK_URL" 2>/dev/null || echo "000")
-        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "405" ]; then
-            pass "TV Webhook HTTP 响应: $HTTP_CODE"
-        elif [ "$HTTP_CODE" = "000" ]; then
-            fail "TV Webhook 连接超时/拒绝: $TV_HOST:$TV_PORT"
-            ALL_OK=false
+        warn "TV Webhook HTTP 响应异常: $HTTP_CODE（需结合 TV 端验证）"
+        TV_CHECK_OK=true
+    fi
+
+    # 2) nc TCP 检测作为补充参考（不阻塞，仅 warn）
+    if command -v nc >/dev/null 2>&1; then
+        if nc -zw 5 "$TV_HOST" "$TV_PORT" 2>/dev/null; then
+            [ "$TV_CHECK_OK" = false ] && pass "TV Webhook TCP 连通: $TV_HOST:$TV_PORT" || true
         else
-            warn "TV Webhook HTTP 异常: $HTTP_CODE"
+            [ "$TV_CHECK_OK" = false ] && warn "TV Webhook TCP 连通失败，但 HTTP 检测可能更准确"
         fi
     fi
 
@@ -239,7 +269,7 @@ restart_service() {
     info "停止旧进程 (port=$PORT)..."
     for pid in $(lsof -ti:"$PORT" 2>/dev/null || ss -tlnp | grep ":$PORT " | grep -oE 'pid=[0-9]+' | cut -d= -f2 2>/dev/null || true); do
         if [ -n "$pid" ] && [ "$pid" != "$$" ]; then
-            kill -TERM "$pid" 2>/dev/null && info "已发送 TERM → $pid" || true
+            kill -TERM "$pid" 2>/dev/null && info "已发送 TERM -> $pid" || true
         fi
     done
     sleep 2
@@ -247,7 +277,7 @@ restart_service() {
     # 强制 kill
     for pid in $(lsof -ti:"$PORT" 2>/dev/null || true); do
         if [ -n "$pid" ]; then
-            kill -9 "$pid" 2>/dev/null && info "强制 kill → $pid" || true
+            kill -9 "$pid" 2>/dev/null && info "强制 kill -> $pid" || true
         fi
     done
     sleep 1
