@@ -202,6 +202,37 @@ class DeepcoinClient:
         return True
 
     @staticmethod
+    def is_reduce_only_rejected(res) -> bool:
+        """检测 reduceOnly 订单是否被交易所拒绝（超持仓/无持仓等）"""
+        if res is None:
+            return True
+        data = (res.get("data") or {}) if isinstance(res, dict) else {}
+        smsg = str(data.get("sMsg", "") or res.get("msg", "")).lower()
+        # Binance/Deepcoin reduceOnly 拒绝的典型错误码/消息
+        reject_patterns = (
+            "reduce only", "reduceonly",
+            "position amount is insufficient",
+            "position is insufficient",
+            "insufficient position",
+            "exceeds position",
+            "position balance",
+            "no position to reduce",
+            "position side",
+            "not allow to place order in",
+            "order is mandatory",
+        )
+        scode = str(data.get("sCode", "") or res.get("code", ""))
+        return any(p in smsg for p in reject_patterns) or scode not in ("0", "")
+
+    @staticmethod
+    def force_rest_get_all_positions(symbol):
+        """强制走 REST 获取所有方向持仓（绕过预算/静默期，供 reduceOnly 失败后紧急对账）"""
+        try:
+            return deepcoin_client.get_all_positions(symbol)
+        except Exception:
+            return None
+
+    @staticmethod
     def inst_id_to_instrument_id(inst_id: str) -> str:
         """BTC-USDT-SWAP -> BTCUSDT"""
         return inst_id.replace("-SWAP", "").replace("-", "")

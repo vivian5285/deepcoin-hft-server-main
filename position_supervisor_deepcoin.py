@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.18-eth-only-tp-recover-audit"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.19-reduceonly-no-degrade-speed"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -1788,14 +1788,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return []
 
     def _verify_flat(self):
-        """验证所有方向的持仓都已清空（对冲模式兼容）- 带重试防止限流误判"""
-        # 静默期/限流时重试等待，避免误判导致光平仓不开仓
+        """验证所有方向的持仓都已清空（对冲模式兼容）。
+        v16.19：采用先快后慢策略——WS 推送后几乎即时确认，不需要固定长等待。
+        """
         for attempt in range(3):
             positions = self._get_all_positions()
             if len(positions) == 0:
                 return True
             if attempt < 2:
-                time.sleep(0.3 + attempt * 0.2)
+                # v16.19: 0.3s→0.15s / 0.5s→0.25s（WS 时代快速轮询）
+                time.sleep(0.15 if attempt == 0 else 0.25)
         return len(positions) == 0
 
     def _ensure_flat_before_open(self, reason_tag="开仓前"):
@@ -2067,9 +2069,32 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if slice_trim <= 0:
                 new_sz = cur
                 break
-            deepcoin_client.place_market_order(
+            res = deepcoin_client.place_market_order(
                 self.symbol, close_side, pos_side, slice_trim, reduce_only=True,
             )
+            # 根因修复：reduceOnly 失败绝不降级
+            if deepcoin_client.is_reduce_only_rejected(res):
+                logger.warning(
+                    f"⚠️ 裁减 reduceOnly 拒绝 {close_side} {slice_trim}张 "
+                    f"→ force_rest 重查后重新计算裁减量"
+                )
+                time.sleep(0.5)
+                fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
+                if fresh:
+                    for fp in fresh:
+                        fpsz = self._safe_qty(fp["size"])
+                        if fpsz <= 0:
+                            continue
+                        fp_side = "sell" if fp["posSide"] == "long" else "buy"
+                        retry_res = deepcoin_client.place_market_order(
+                            self.symbol, fp_side, fp["posSide"], fpsz, reduce_only=True,
+                        )
+                        if deepcoin_client.is_reduce_only_rejected(retry_res):
+                            logger.error(
+                                f"❌ 裁减重查后 reduceOnly 仍拒绝 {fp_side} {fpsz}张 → 跳过"
+                            )
+                        time.sleep(0.5)
+                break
             time.sleep(1.0)
             verified = self._wait_verify(
                 lambda: self._get_active_position(),
@@ -2584,7 +2609,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         logger.info(f"📌 [{self.symbol}] 重入防线已挂: 硬止损@{init:.2f} TP1/TP2")
 
     def _sweep_dust_and_finalize(self, reason):
-        """哨兵检测：止盈后蚂蚁仓/无 TP 残张 → 撤单 + reduceOnly 扫尾 + 收网钉钉（对冲模式兼容）"""
+        """哨兵检测：止盈后蚂蚁仓/无 TP 残张 → 撤单 + reduceOnly 扫尾 + 收网钉钉（对冲模式兼容）
+        ⚠️ 根因修复：reduceOnly 失败绝不降级 → 立即 force_rest 重查持仓后重试。
+        """
         logger.warning(f"🐜 止盈扫尾：检测到残量，启动蚂蚁仓强平 → {reason}")
         self.monitoring = False
         deepcoin_client.cancel_all_open_orders(self.symbol)
@@ -2598,9 +2625,31 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 close_side = "sell" if pos["posSide"] == "long" else "buy"
                 live_sz = self._safe_qty(pos["size"])
                 logger.info(f"🐜 扫尾{round_i + 1}/4: {close_side} {live_sz}张 {pos['posSide']} reduceOnly")
-                deepcoin_client.place_market_order(
+                res = deepcoin_client.place_market_order(
                     self.symbol, close_side, pos["posSide"], live_sz, reduce_only=True,
                 )
+                # 根因修复：reduceOnly 失败绝不降级
+                if deepcoin_client.is_reduce_only_rejected(res):
+                    logger.warning(
+                        f"⚠️ 蚂蚁仓 reduceOnly 拒绝 {close_side} {live_sz}张 "
+                        f"→ force_rest 重查持仓后再扫"
+                    )
+                    time.sleep(0.5)
+                    fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
+                    if fresh:
+                        for fp in fresh:
+                            fpsz = self._safe_qty(fp["size"])
+                            if fpsz <= 0:
+                                continue
+                            fp_side = "sell" if fp["posSide"] == "long" else "buy"
+                            retry_res = deepcoin_client.place_market_order(
+                                self.symbol, fp_side, fp["posSide"], fpsz, reduce_only=True,
+                            )
+                            if deepcoin_client.is_reduce_only_rejected(retry_res):
+                                logger.error(
+                                    f"❌ 蚂蚁仓重查后 reduceOnly 仍拒绝 {fp_side} {fpsz}张 → 残仓待下次"
+                                )
+                            time.sleep(0.5)
                 time.sleep(0.5)
             time.sleep(1.0)
         self.watched_qty = 0
@@ -3147,6 +3196,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             res = deepcoin_client.place_limit_order(
                 self.symbol, close_side, pos_side, px, q, reduce_only=True,
             )
+            # 根因修复：reduceOnly 失败 → 重查持仓修正数量
+            if deepcoin_client.is_reduce_only_rejected(res):
+                logger.warning(
+                    f"⚠️ 补挂 TP{lv['level']} reduceOnly 拒绝 → force_rest 重查持仓"
+                )
+                time.sleep(0.3)
+                fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
+                live_q = 0
+                if fresh:
+                    for fp in fresh:
+                        if fp.get("posSide", "").lower() == pos_side:
+                            live_q = self._safe_qty(fp.get("size", 0))
+                            break
+                if live_q > 0:
+                    res = deepcoin_client.place_limit_order(
+                        self.symbol, close_side, pos_side, px,
+                        min(q, live_q), reduce_only=True,
+                    )
             if res and deepcoin_client._is_success(res):
                 placed += 1
                 self._increment_tp_place_guard()
@@ -3237,6 +3304,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             self.symbol, close_side, pos_side, price, target_q,
                             reduce_only=True,
                         )
+                        # 根因修复：reduceOnly 失败 → 重查持仓修正数量
+                        if deepcoin_client.is_reduce_only_rejected(res):
+                            logger.warning(
+                                f"⚠️ 纠偏 TP{lv['level']} reduceOnly 拒绝 → force_rest 重查"
+                            )
+                            time.sleep(0.3)
+                            fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
+                            live_q = 0
+                            if fresh:
+                                for fp in fresh:
+                                    if fp.get("posSide", "").lower() == pos_side:
+                                        live_q = self._safe_qty(fp.get("size", 0))
+                                        break
+                            if live_q > 0:
+                                res = deepcoin_client.place_limit_order(
+                                    self.symbol, close_side, pos_side, price,
+                                    min(target_q, live_q), reduce_only=True,
+                                )
                         if res and deepcoin_client._is_success(res):
                             actions += 1
                             self._increment_tp_place_guard()
@@ -3256,6 +3341,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             res = deepcoin_client.place_limit_order(
                 self.symbol, close_side, pos_side, price, target_q, reduce_only=True,
             )
+            # 根因修复：reduceOnly 失败 → 重查持仓修正数量
+            if deepcoin_client.is_reduce_only_rejected(res):
+                logger.warning(
+                    f"⚠️ 补缺 TP{lv['level']} reduceOnly 拒绝 → force_rest 重查"
+                )
+                time.sleep(0.3)
+                fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
+                live_q = 0
+                if fresh:
+                    for fp in fresh:
+                        if fp.get("posSide", "").lower() == pos_side:
+                            live_q = self._safe_qty(fp.get("size", 0))
+                            break
+                if live_q > 0:
+                    res = deepcoin_client.place_limit_order(
+                        self.symbol, close_side, pos_side, price,
+                        min(target_q, live_q), reduce_only=True,
+                    )
             if res and deepcoin_client._is_success(res):
                 actions += 1
                 self._increment_tp_place_guard()
@@ -3500,6 +3603,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             res = deepcoin_client.place_limit_order(
                 self.symbol, close_side, pos_side, price, target_q, reduce_only=True,
             )
+            # 根因修复：reduceOnly 失败 → 重查持仓修正数量
+            if deepcoin_client.is_reduce_only_rejected(res):
+                logger.warning(
+                    f"⚠️ [保守] TP{level} reduceOnly 拒绝 → force_rest 重查持仓"
+                )
+                time.sleep(0.3)
+                fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
+                live_q = 0
+                if fresh:
+                    for fp in fresh:
+                        if fp.get("posSide", "").lower() == pos_side:
+                            live_q = self._safe_qty(fp.get("size", 0))
+                            break
+                if live_q > 0:
+                    res = deepcoin_client.place_limit_order(
+                        self.symbol, close_side, pos_side, price,
+                        min(target_q, live_q), reduce_only=True,
+                    )
             if res and deepcoin_client._is_success(res):
                 self._increment_tp_place_guard()
                 results["placed"] += 1
@@ -4034,6 +4155,35 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self.symbol, close_side, pos_side, px, q,
                     reduce_only=True, cl_ord_id=tag,
                 )
+                # 根因修复：reduceOnly 限价单失败 → 查实盘持仓 → 重算可平量
+                if deepcoin_client.is_reduce_only_rejected(res):
+                    logger.warning(
+                        f"⚠️ TP{level} reduceOnly 拒绝 {close_side} {q}张 → "
+                        f"force_rest 重查持仓后修正挂单量"
+                    )
+                    time.sleep(0.3)
+                    fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
+                    live_qty = 0
+                    if fresh:
+                        for fp in fresh:
+                            if fp.get("posSide", "").lower() == pos_side:
+                                live_qty = self._safe_qty(fp.get("size", 0))
+                                break
+                    if live_qty <= 0:
+                        logger.info(f"TP{level} 无持仓可平，跳过挂单")
+                        break
+                    # 递归调用，只改数量（保留 level/px/pos_side/tag 不变）
+                    new_q = min(q, live_qty)
+                    logger.info(f"🔄 TP{level} 修正数量 {q}→{new_q}张（持仓={live_qty}）")
+                    q = new_q
+                    # 用修正后的数量重试一次
+                    res = deepcoin_client.place_limit_order(
+                        self.symbol, close_side, pos_side, px, q,
+                        reduce_only=True, cl_ord_id=tag,
+                    )
+                    if deepcoin_client.is_reduce_only_rejected(res):
+                        logger.error(f"❌ TP{level} 重试仍拒绝 → 跳过该档")
+                        break
                 if res and deepcoin_client._is_success(res):
                     last = res
                     self._increment_tp_place_guard()
@@ -5486,7 +5636,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return True
         return False
 
-    def _cancel_all_tp_limit_orders(self, max_rounds=4):
+    def _cancel_all_tp_limit_orders(self, max_rounds=3):
         total = 0
         for round_i in range(max_rounds):
             orders = [
@@ -5500,10 +5650,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if oid:
                     deepcoin_client.cancel_order(self.symbol, ord_id=oid)
                     total += 1
-                    time.sleep(0.12)
+                    time.sleep(0.10)
             logger.info(f"🧹 撤限价止盈 第{round_i + 1}轮: {len(orders)} 张")
-            # 【关键修复】增加等待时间确保撤销完成（从0.6秒改为1.5秒）
-            time.sleep(1.5)
+            time.sleep(0.8)  # v16.19 优化：1.5s→0.8s（典型场景1轮即清）
         if total:
             logger.info(f"🧹 已撤销限价止盈合计 {total} 张")
         return total
@@ -7749,14 +7898,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.error(f"[{self.symbol}] partial_fill_resize: {e}")
 
     def _full_reentry(self, action, close_reason, payload=None):
-        """铁律：先平现有仓 → 净挂单 → 再开仓刷新；钉钉核实。"""
+        """铁律：先平现有仓 → 净挂单 → 再开仓刷新；钉钉核实。
+        v16.19 优化：取消 `_close_all` 后立即取价开仓（去重第2次撤单 + 额外等待）。
+        """
         reason = close_reason or "TV开仓·一律先平后开"
         try:
             self._pipeline_pending_clear(note=reason)
         except Exception:
             pass
         deepcoin_client.cancel_all_open_orders(self.symbol)
-        time.sleep(0.5)
+        time.sleep(0.3)  # v16.19: 0.5→0.3s
         if not self._close_all(reason, reset_state=True):
             logger.error("❌ 先平后开中止：平仓未归零，拒绝叠仓开仓")
             try:
@@ -7768,7 +7919,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             self._close_open_chain_active = False
             return
-        if not self._wait_verify(self._verify_flat, retries=8, delay=0.5):
+        if not self._wait_verify(self._verify_flat, retries=6, delay=0.25):  # v16.19: 8次×0.5→6次×0.25
             logger.error("❌ 先平后开中止：空仓核查未通过")
             try:
                 self._pipeline_fail(Role.AUDITOR_POS, "CLEAR_VERIFY_FAIL")
@@ -7783,8 +7934,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._pipeline_cleared(note="sterile_ok")
         except Exception:
             pass
-        deepcoin_client.cancel_all_open_orders(self.symbol)
-        time.sleep(0.5)
+        # v16.19：取消第2次撤单 + 额外0.5s 等待（_close_all 已完成撤单，无重复挂单风险）
         curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
         if curr_px <= 0:
             logger.error("❌ 先平后开中止：无有效市价")
@@ -8158,7 +8308,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"[钉钉已关闭] 开仓失败 | TV {action} {qty} 张 市价单失败"
                 )
                 return
-            time.sleep(2.0)
+            time.sleep(1.2)  # v16.19: 2.0→1.2s（市价成交快，WS 实时推送）
 
             pos = self._get_active_position()
             if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
@@ -8935,6 +9085,32 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         self.symbol, close_side, pos_side, px, q,
                         reduce_only=True, cl_ord_id=tag,
                     )
+                    # 根因修复：reduceOnly 限价单失败 → 查实盘持仓 → 重算可平量
+                    if deepcoin_client.is_reduce_only_rejected(res):
+                        logger.warning(
+                            f"⚠️ _rebuild TP{lv['level']} reduceOnly 拒绝 {close_side} {q}张 → "
+                            f"force_rest 重查持仓后修正挂单量"
+                        )
+                        time.sleep(0.3)
+                        fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
+                        live_qty = 0
+                        if fresh:
+                            for fp in fresh:
+                                if fp.get("posSide", "").lower() == pos_side:
+                                    live_qty = self._safe_qty(fp.get("size", 0))
+                                    break
+                        if live_qty <= 0:
+                            logger.info(f"_rebuild TP{lv['level']} 无持仓可平，跳过")
+                            break
+                        q = min(q, live_qty)
+                        logger.info(f"🔄 _rebuild TP{lv['level']} 修正数量 → {q}张（持仓={live_qty}）")
+                        res = deepcoin_client.place_limit_order(
+                            self.symbol, close_side, pos_side, px, q,
+                            reduce_only=True, cl_ord_id=tag,
+                        )
+                        if deepcoin_client.is_reduce_only_rejected(res):
+                            logger.error(f"❌ _rebuild TP{lv['level']} 重试仍拒绝 → 跳过")
+                            break
                     if res and deepcoin_client._is_success(res):
                         last = res
                         oid = str(last.get("orderId") or last.get("algoId") or "")
@@ -8970,11 +9146,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _close_all(self, reason="", force_align=None, reset_state=True, close_meta=None,
                    force_verify_note=""):
-        """先撤全部挂单再强平所有方向持仓；对冲模式兼容"""
+        """先撤全部挂单再强平所有方向持仓；对冲模式兼容。
+        ⚠️ 根因修复：reduceOnly 失败绝不降级 → 立即 force_rest 重查持仓后重试。
+        ⚠️ v16.19 优化：减少固定等待时间，依赖实时 WS + REST 核查决定是否继续。
+        """
         deepcoin_client.cancel_all_open_orders(self.symbol)
-        time.sleep(0.5)
+        time.sleep(0.3)  # v16.19: 0.5→0.3s
         self._cancel_all_tp_limit_orders()
-        time.sleep(0.3)
+        time.sleep(0.2)  # v16.19: 0.3→0.2s（WS 会在下一轮帮我们确认）
         closed_successfully = False
 
         for round_i in range(6):
@@ -8989,11 +9168,39 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 close_side = "sell" if pos["posSide"] == "long" else "buy"
                 live_sz = self._safe_qty(pos["size"])
                 logger.info(f"🔪 强平{round_i + 1}/6: {close_side} {live_sz}张 {pos['posSide']} reduceOnly")
-                deepcoin_client.place_market_order(
+                res = deepcoin_client.place_market_order(
                     self.symbol, close_side, pos["posSide"], live_sz, reduce_only=True,
                 )
-                time.sleep(0.5)  # 每个方向之间短暂间隔
-            time.sleep(1.5)  # 轮次之间等待成交
+                # ── 根因修复：reduceOnly 失败绝不降级，立即 force_rest 重查 ──
+                if deepcoin_client.is_reduce_only_rejected(res):
+                    logger.warning(
+                        f"⚠️ reduceOnly 拒绝 {close_side} {live_sz}张 → "
+                        f"force_rest 重查持仓后再平仓"
+                    )
+                    time.sleep(0.4)
+                    fresh_positions = deepcoin_client.force_rest_get_all_positions(self.symbol)
+                    if fresh_positions:
+                        for fp in fresh_positions:
+                            fpsz = self._safe_qty(fp["size"])
+                            if fpsz <= 0:
+                                continue
+                            fp_side = "sell" if fp["posSide"] == "long" else "buy"
+                            logger.info(f"🔄 重查后平仓: {fp_side} {fpsz}张 {fp['posSide']}")
+                            retry_res = deepcoin_client.place_market_order(
+                                self.symbol, fp_side, fp["posSide"], fpsz, reduce_only=True,
+                            )
+                            if deepcoin_client.is_reduce_only_rejected(retry_res):
+                                logger.error(
+                                    f"❌ 重查后 reduceOnly 仍拒绝 {fp_side} {fpsz}张 "
+                                    f"→ 记录残仓，跳出该方向"
+                                )
+                            time.sleep(0.4)
+                    break
+                # ── 正常路径：等待成交后继续 ──
+                time.sleep(0.3)  # v16.19: 0.5→0.3s（WS 实时推送加速确认）
+            # v16.19: 根据轮次动态调整等待时间，快速轮用短等待
+            inter_wait = 1.2 if round_i == 0 else 1.0  # 首轮1.2s（首次成交稍慢），后续1.0s
+            time.sleep(inter_wait)
 
         # 清理残余持仓（蚂蚁仓扫尾）
         if not closed_successfully:
@@ -9007,9 +9214,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         if self._is_dust_qty(residual_sz):
                             close_side = "sell" if residual["posSide"] == "long" else "buy"
                             logger.warning(f"🐜 蚂蚁仓扫尾: {close_side} {residual_sz}张 {residual['posSide']}")
-                            deepcoin_client.place_market_order(
+                            res = deepcoin_client.place_market_order(
                                 self.symbol, close_side, residual["posSide"], residual_sz, reduce_only=True,
                             )
+                            # 蚂蚁仓 reduceOnly 失败也记录
+                            if deepcoin_client.is_reduce_only_rejected(res):
+                                logger.error(
+                                    f"❌ 蚂蚁仓 reduceOnly 拒绝: {close_side} {residual_sz}张 "
+                                    f"→ 残仓待下次清理"
+                                )
                             time.sleep(1.0)
                         else:
                             logger.warning(f"⚠️ 残仓: {residual['posSide']} {residual_sz}张 非蚂蚁量级")
