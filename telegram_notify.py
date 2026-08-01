@@ -183,18 +183,19 @@ def report_system_alert(title, detail, level="紧急", suggestion=""):
     send_text(text)
 
 
-def report_radar_activation(side, qty, entry, curr_px, new_sl, regime):
-    """雷达激活播报"""
+def report_radar_activation(side, qty, entry, curr_px, new_sl, regime, profit_pct=0):
+    """雷达激活播报（文档2.6：通知数值必须匹配实际状态）"""
     if not _is_enabled():
         return
+    profit_str = f"{profit_pct:+.2f}%" if profit_pct != 0 else "—"
     text = (
-        f"📡 *雷达激活 · 保本起步*\n"
+        f"📡 *雷达激活 · 追踪起步*\n"
         f"{_fmt_time()}\n"
         f"\n"
         f"{_fmt_side(side)} | {qty} {UNIT_LABEL}\n"
         f"入场: `{entry:.2f}` → 现价: `{curr_px:.2f}`\n"
         f"雷达止损: `{new_sl:.2f}`\n"
-        f"档位: R{regime}\n"
+        f"档位: R{regime} | 浮盈: {profit_str}\n"
     )
     send_text(text)
 
@@ -335,21 +336,25 @@ def report_supervisor_close(reason, verify_note="", verified=True, swept_dust=Fa
 
 def report_tv_sl_updated(side, live_qty, entry, tv_sl, exchange_stop=None,
                          radar_active=False, radar_sl=None, regime=3,
-                         verify_note="", verified=True):
-    """TV 硬止损更新"""
+                         verify_note="", verified=True, curr_px=None, profit_pct=0):
+    """TV 硬止损更新（文档2.6：通知数值必须匹配实际状态）"""
     if not _is_enabled():
         return
+    profit_str = f"{profit_pct:+.2f}%" if profit_pct != 0 else "—"
     text = (
-        f"🔒 *TV 硬止损更新*\n"
+        f"🔒 *止损更新*\n"
         f"{_fmt_time()}\n"
         f"\n"
         f"{_fmt_side(side)} | {live_qty} {UNIT_LABEL}\n"
         f"入场: `{entry:.2f}`\n"
         f"TV 硬止损: `{tv_sl:.2f}`\n"
-        f"交易所止损: `{exchange_stop:.2f}`\n"
     )
+    if exchange_stop:
+        text += f"交易所止损: `{exchange_stop:.2f}`\n"
+    if curr_px and curr_px > 0:
+        text += f"现价: `{curr_px:.2f}` | 浮盈: {profit_str}\n"
     if radar_active:
-        text += f"雷达: 保本起步 @ `{radar_sl:.2f}`\n"
+        text += f"雷达止损: `{radar_sl:.2f}`\n"
     else:
         text += "雷达: 待命\n"
     if verify_note:
@@ -422,25 +427,28 @@ def report_radar_activated(side, qty, entry, new_sl, radar_progress=1.0, regime=
                            shield_cleared=True, verify_note="", verified=True,
                            breathing_coefficient=None, trail_dist=None,
                            symbol=None, open_kind=None, activation_frac=None,
-                           activation_price=None, trigger_gate="", tier=None):
-    """雷达激活"""
+                           activation_price=None, trigger_gate="", tier=None,
+                           entry_sl=None, curr_px=None, profit_pct=0):
+    """雷达激活（文档2.6：通知数值必须匹配实际状态）"""
     if not _is_enabled():
         return
     kind = str(open_kind or "").strip() or "首次开仓"
+    profit_str = f"{profit_pct:+.2f}%" if profit_pct != 0 else "—"
     text = (
-        f"📡 *雷达激活 · 保本起步 · {kind}*\n"
+        f"📡 *雷达激活 · 追踪起步 · {kind}*\n"
         f"{_fmt_time()}\n"
         f"\n"
         f"{_fmt_side(side)} | {qty} {UNIT_LABEL}\n"
         f"入场: `{entry:.2f}`\n"
-        f"雷达止损: `{new_sl:.2f}`\n"
-        f"档位: R{regime}\n"
-        f"进度: {radar_progress:.0%}\n"
     )
+    if curr_px and curr_px > 0:
+        text += f"现价: `{curr_px:.2f}` | 浮盈: {profit_str}\n"
+    text += f"雷达止损: `{new_sl:.2f}`\n"
+    text += f"档位: R{regime} | 进度: {radar_progress:.0%}\n"
     if trigger_gate:
-        text += f"激活条件: {trigger_gate}\n"
+        text += f"激活门: {trigger_gate}\n"
     if activation_price > 0:
-        text += f"激活价: `{activation_price:.2f}`\n"
+        text += f"门限价: `{activation_price:.2f}`\n"
     if verify_note:
         text += f"核实: {verify_note}\n"
     send_text(text)
@@ -503,10 +511,12 @@ def report_tp_fill(tp_level, tp_price, filled_qty, remain_qty, entry_px, side,
     send_text(text)
 
 
-def report_intervention(qty, entry_px, new_sl, action_msg, verify_note="", verified=True):
-    """干预报告"""
+def report_intervention(qty, entry_px, new_sl, action_msg, verify_note="", verified=True,
+                       curr_px=0, profit_pct=0):
+    """追踪雷达止损移动（文档2.6：通知数值必须匹配实际状态）"""
     if not _is_enabled():
         return
+    profit_str = f"{profit_pct:+.2f}%" if profit_pct != 0 else "—"
     text = (
         f"📈 *追踪雷达*\n"
         f"{_fmt_time()}\n"
@@ -514,8 +524,10 @@ def report_intervention(qty, entry_px, new_sl, action_msg, verify_note="", verif
         f"数量: {qty} {UNIT_LABEL}\n"
         f"入场: `{entry_px:.2f}`\n"
         f"新止损: `{new_sl:.2f}`\n"
-        f"动作: {action_msg}\n"
     )
+    if curr_px and curr_px > 0:
+        text += f"现价: `{curr_px:.2f}` | 浮盈: {profit_str}\n"
+    text += f"动作: {action_msg}\n"
     if verify_note:
         text += f"核实: {verify_note}\n"
     send_text(text)

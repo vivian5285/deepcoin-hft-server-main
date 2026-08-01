@@ -236,13 +236,17 @@ class DeepcoinClient:
 
     def get_principal_wallet_balance(self, ccy="USDT"):
         """
-        USDT 合约本金余额（cashBal）— 唯一合法的档位额度基数。
-        禁止用 availBal / eq(含浮盈) / 剩余保证金参与开仓与超标核查。
+        USDT 合约本金余额（cashBal）— 档位额度基数。
+        Deepcoin 特殊场景：cashBal=0 但 avail_bal>0 时（已开仓未结算/资金在途），
+        降级使用 avail_bal，确保能继续开仓或加仓，不因 cashBal=0 而阻断交易。
         """
         summary = self.get_account_summary(ccy)
         cash = float(summary.get("cash_bal", 0) or 0)
         if cash > 0:
             return cash
+        avail = float(summary.get("avail_bal", 0) or 0)
+        if avail > 0:
+            return avail
         return 0.0
 
     def get_cap_equity_balance(self, ccy="USDT"):
