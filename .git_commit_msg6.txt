@@ -1,0 +1,6 @@
+fix v16.24: _maintain_hard_shield tv_sl journal恢复 + _run_idle_live_reconcile pos=None guard
+
+1. _maintain_hard_shield: tv_sl=0 时从 journal 最后一条 LONG/SHORT 恢复，无则用 ATR 估算
+2. _run_idle_live_reconcile: 添加 defensive pos=None 检查（第608行 pos.get前）
+3. _enforce_tv_direction_or_flat: 已有 pos is None guard
+4. _perform_live_takeover: 已有双保险 pos is None guard

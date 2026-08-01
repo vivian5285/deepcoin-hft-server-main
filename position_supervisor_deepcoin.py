@@ -603,6 +603,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if self._enforce_tv_direction_or_flat(pos, source="空闲巡检"):
             return
 
+        # v16.23 防御性检查：确保 pos 有效，避免后续 pos.get() 崩溃
+        if pos is None:
+            logger.warning("⚠️ [空闲巡检] pos=None，跳过对账")
+            return
+
         if self._is_dust_qty(live_qty) or self._should_finalize_tp_victory(live_qty):
             if not self.current_side:
                 self.current_side = "LONG" if pos.get("posSide") == "long" else "SHORT"
@@ -5520,6 +5525,34 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 reason="维护TV硬止损",
                 force=force,
             ).get("ok", False)
+
+        # v16.23 修复：tv_sl=0 时，从 journal 最后一条 LONG/SHORT 记录中恢复
+        if real_amt > 0 and getattr(self, "tv_sl", 0) <= 0:
+            recovered_sl = 0.0
+            for src in [self.last_tv_signal,
+                        self._load_last_journal_entry(TV_JOURNAL),
+                        self._load_last_tv_open_signal(),
+                        self._load_last_journal_entry(OPEN_JOURNAL)]:
+                if not src:
+                    continue
+                sl = float(src.get("tv_sl", 0) or 0)
+                if sl > 0:
+                    recovered_sl = sl
+                    break
+            if recovered_sl <= 0 and self.watched_entry > 0 and self.current_atr > 0:
+                sl_m = {1: 0.9, 2: 1.05, 3: 1.10, 4: 1.25}.get(int(self.regime or 3), 1.10)
+                if self.current_side == "LONG":
+                    recovered_sl = round(self.watched_entry - self.current_atr * sl_m, 2)
+                else:
+                    recovered_sl = round(self.watched_entry + self.current_atr * sl_m, 2)
+            if recovered_sl > 0:
+                logger.info(f"💧 硬止损维护：从 journal 恢复 tv_sl={recovered_sl:.2f}")
+                self.tv_sl = recovered_sl
+                return self._sync_tv_sl_stop(
+                    real_amt,
+                    reason="journal恢复TV硬止损",
+                    force=True,
+                ).get("ok", False)
 
         if real_amt > 0 and not getattr(self, "_tv_sl_missing_alerted", False):
             logger.error("维护TV硬止损失败：缺少 tv_sl，拒绝 fallback 旧逻辑")
