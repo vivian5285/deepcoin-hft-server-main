@@ -430,6 +430,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         """
         实盘有仓但 VPS 未监控 / 防线缺失 → 补挂 TP123+硬止损，启动雷达哨兵。
         """
+        # v16.22 修复：防止 pos=None 导致崩溃（_recover_missed_flat_on_startup 可能在持仓已平时仍调用）
+        if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
+            logger.warning(f"⚠️ _perform_live_takeover 跳过：无实盘持仓 | source={source}")
+            return False
         real_amt = self._safe_qty(pos.get("size"))
         side = "LONG" if pos.get("posSide") == "long" else "SHORT"
         tv_side = self._resolve_tv_authoritative_side()

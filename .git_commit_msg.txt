@@ -1,0 +1,9 @@
+fix v16.22: 堵死TP无限死循环+重启硬止损漏挂
+
+1. _nuclear_realign_tp: 每轮用实盘最新张数重算TP期望+matched>=expected直接返回成功
+   根因：watched_qty=10但实盘=7时TP期望按10张算→TP1期望2张但只有1张→qty_mismatch永不消失→无限核武
+
+2. recover_state_on_startup: 补回last_tv_signal恢复+ATR全零时强制从open_journal恢复
+   根因：BNB重启后TP=tv_tps=全零(因last_tv_signal未保存)→_hydrate补不全→硬止损tv_sl=0漏挂
+
+3. _ensure_full_defense_stack: 新增recover_mode参数，重启接管时强制走鲁棒核武路径
