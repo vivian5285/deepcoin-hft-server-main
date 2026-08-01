@@ -1,0 +1,16 @@
+fix v16.23: 堵死硬止损漏挂三大根因
+
+根因1：recover_state_on_startup 被 saved_monitoring=False 跳过状态块
+→ tv_sl/current_side 永远不加载 → 硬止损漏挂
+→ 修复：去掉 saved_monitoring 判断，状态文件存在就无条件加载
+
+根因2：recover_mode=True 时 TP 已齐路径不调 _maintain_hard_shield
+→ TP 已齐+硬止损缺失 → 雷达守护也不修复
+→ 修复：TP 已齐/智能修复成功两个分支都强制调 _maintain_hard_shield(force=True)
+
+根因3：OPEN_JOURNAL 缺 tv_sl 字段
+→ _hydrate 从开仓日志恢复时 tv_sl 永远补不上
+→ 修复：_record_open_log 补 atr+tv_sl，_hydrate 从开仓日志读 tv_sl
+
+根因4：_enforce_defense_alignment 中 curr_px 未提前获取
+→ 修复：try 块顶部统一取现价

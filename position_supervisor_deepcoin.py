@@ -910,7 +910,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             "qty": qty,
             "entry": entry,
             "regime": self.regime,
+            "atr": getattr(self, "current_atr", 0) or 0,
             "tv_tps": self.tv_tps,
+            "tv_sl": float(getattr(self, "tv_sl", 0) or 0),
             "tv_price": self.tv_price,
             "last_tv_side": self.last_tv_side,
         })
@@ -6486,6 +6488,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         self._defense_align_in_progress = True
         try:
+            # v16.22 修复：提前取现价，供后续所有分支使用
+            curr_px = deepcoin_client.get_current_price(self.symbol)
             audit = self._audit_tp_levels(live_qty)
 
             if recover_mode and self._tp_audit_ok(audit):
@@ -6493,6 +6497,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     f"✅ 重启接管：盘口 TP 已齐，跳过核武撤挂 | "
                     f"{self._format_audit_summary(audit)}"
                 )
+                # v16.22 修复：TP 已齐时仍要维护硬止损（不能漏挂）
+                if curr_px is None:
+                    curr_px = deepcoin_client.get_current_price(self.symbol)
+                self._maintain_hard_shield(live_qty, curr_px or 0, force=True)
                 if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
                     self._ensure_radar_sl(live_qty, dynamic_sl)
                 self._mark_defense_align_ok()
@@ -6513,6 +6521,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         f"✅ 重启智能修复成功 ({n_actions} 步)，无需核武 | "
                         f"{self._format_audit_summary(audit)}"
                     )
+                    # v16.22 修复：修复后也要维护硬止损
+                    if curr_px is None:
+                        curr_px = deepcoin_client.get_current_price(self.symbol)
+                    self._maintain_hard_shield(live_qty, curr_px or 0, force=True)
                     if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
                         self._ensure_radar_sl(live_qty, dynamic_sl)
                     self._mark_defense_align_ok()
@@ -9490,7 +9502,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._reset_tp_place_guard()
             # v16.21：重启时清除恢复确认记忆（新会话）
             self._clear_recover_confirmed_levels()
-            saved_monitoring = False
+            # v16.22 修复：必须无条件加载状态文件，不能被 monitoring 标志跳过。
+            # 即使 monitoring=False（上次会话非正常退出），只要状态文件存在就要读取，
+            # 因为实盘可能仍有持仓，防御数据（tv_sl/tv_tps）必须恢复。
             if os.path.exists(self.state_file):
                 with open(self.state_file, 'r') as f:
                     s = json.load(f)
