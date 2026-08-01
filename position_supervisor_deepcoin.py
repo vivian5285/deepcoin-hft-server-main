@@ -617,6 +617,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._sweep_dust_and_finalize("空闲巡检：盘口蚂蚁仓自动扫平")
             return
 
+        # v16.24 防御：sweep 后 pos 可能仍为 None，直接防护
+        if pos is None:
+            logger.warning("⚠️ [空闲巡检] sweep后 pos=None，跳过后续对账")
+            return
+
         live_side = "LONG" if pos.get("posSide") == "long" else "SHORT"
         tv_side = self._resolve_tv_authoritative_side()
         if not tv_side or live_side != tv_side:
