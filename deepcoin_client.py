@@ -27,6 +27,7 @@ SYMBOL_TICK_FALLBACK = {
     "ETH-USDT-SWAP": "0.01",
     "XAU-USDT-SWAP": "0.01",
     "BTC-USDT-SWAP": "0.1",
+    "BNB-USDT-SWAP": "0.01",
 }
 
 

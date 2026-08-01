@@ -84,5 +84,39 @@
         "max_mult": 3.0
       }
     ]
+  },
+  "BNB": {
+    "tv_tf_sec": 5400,
+    "reentry_window_bars": 2,
+    "reentry_zone_atr": 0.5,
+    "tiers": [
+      {
+        "name": "weak",
+        "step_trigger_atr": 0.40,
+        "step_advance_atr": 0.25,
+        "breath_tp12": 0.80,
+        "breath_tp23": 1.00,
+        "min_mult": 1.2,
+        "max_mult": 1.5
+      },
+      {
+        "name": "mid",
+        "step_trigger_atr": 0.50,
+        "step_advance_atr": 0.35,
+        "breath_tp12": 1.20,
+        "breath_tp23": 1.60,
+        "min_mult": 2.0,
+        "max_mult": 2.5
+      },
+      {
+        "name": "strong",
+        "step_trigger_atr": 0.60,
+        "step_advance_atr": 0.40,
+        "breath_tp12": 1.50,
+        "breath_tp23": 2.00,
+        "min_mult": 2.5,
+        "max_mult": 3.5
+      }
+    ]
   }
 }

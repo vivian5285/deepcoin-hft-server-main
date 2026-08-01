@@ -32,6 +32,18 @@ DEEPCOIN_SYMBOL_META = {
         "dust_qty": 1,
         "price_precision": 2,
     },
+    "BNB-USDT-SWAP": {
+        "symbol": "BNB-USDT-SWAP",
+        "binance_mark": "BNBUSDT",
+        "unit": "张",
+        "tag": "BNB",
+        "breath": "BNB",
+        "face_value": 0.1,
+        "qty_step": 1,
+        "min_qty": 1,
+        "dust_qty": 1,
+        "price_precision": 2,
+    },
 }
 
 _BINANCE_ALIASES = {
@@ -49,6 +61,11 @@ _DEEPCOIN_ALIASES = {
     "ETHUSD": "ETH-USDT-SWAP",
     "ETH-USDT": "ETH-USDT-SWAP",
     "ETH-USDT-SWAP": "ETH-USDT-SWAP",
+    "BNB": "BNB-USDT-SWAP",
+    "BNBUSDT": "BNB-USDT-SWAP",
+    "BNBUSD": "BNB-USDT-SWAP",
+    "BNB-USDT": "BNB-USDT-SWAP",
+    "BNB-USDT-SWAP": "BNB-USDT-SWAP",
 }
 
 
@@ -100,6 +117,8 @@ def resolve_deepcoin_symbol(raw, default="ETH-USDT-SWAP"):
             sym = "ETH-USDT-SWAP"
         elif b.get("symbol") == "XAUUSDT":
             sym = "XAU-USDT-SWAP"
+        elif b.get("symbol") == "BNBUSDT":
+            sym = "BNB-USDT-SWAP"
         else:
             sym = default
     meta = dict(DEEPCOIN_SYMBOL_META.get(sym, DEEPCOIN_SYMBOL_META["ETH-USDT-SWAP"]))
@@ -152,6 +171,7 @@ def extract_symbol_from_payload(data):
         blob = str(data).upper()
     for token in (
         "ETHUSDT.P", "BINANCE:ETHUSDT", "ETHUSDT", "ETH-USDT-SWAP",
+        "BNBUSDT.P", "BINANCE:BNBUSDT", "BNBUSDT", "BNB-USDT-SWAP",
     ):
         if token in blob:
             return token

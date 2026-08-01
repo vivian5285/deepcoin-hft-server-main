@@ -71,13 +71,41 @@ BREATH_XAU: Dict[str, Any] = {
     "exit_score": 1,
 }
 
+# BNB 基线（跟随 ETH 逻辑）
+BREATH_BNB: Dict[str, Any] = {
+    "name": "BNB",
+    "initial_sl_atr": 0.0,
+    "fee_cover_pct": 0.0008,
+    "stop_exec_buffer": 0.3,
+    "early_be_atr": 0.0,
+    "step_trigger_atr": 0.50,  # 中趋势基线
+    "step_advance_atr": 0.35,  # 中趋势基线
+    "phase_switch_atr": 3.0,
+    "tp1_atr": 1.35,
+    "tp1_floor_atr": 0.0,
+    "tp2_atr": 2.5,
+    "tp2_floor_atr": 0.0,
+    "breath_tp12": 1.20,  # 中趋势基线
+    "breath_tp23": 1.60,  # 中趋势基线
+    "phase2_trail_mult": 1.0,
+    "min_mult": 2.0,
+    "max_mult": 2.5,
+    "ratio_floor": RATIO_FLOOR,
+    "ratio_ceiling": RATIO_CEILING,
+    "tick_size": 0.01,
+    "entry_score": 3,
+    "exit_score": 2,
+}
+
 _BY_BINANCE = {
     "ETHUSDT": BREATH_ETH,
+    "BNBUSDT": BREATH_BNB,
     "XAUUSDT": BREATH_XAU,
 }
 
 _BY_DEEPCOIN = {
     "ETH-USDT-SWAP": BREATH_ETH,
+    "BNB-USDT-SWAP": BREATH_BNB,
     "XAU-USDT-SWAP": BREATH_XAU,
 }
 

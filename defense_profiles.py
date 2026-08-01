@@ -44,12 +44,22 @@ DEFENSE_XAU: Dict[str, Any] = {
     "min_stop_ticks": DEFAULT_MIN_STOP_TICKS,
     "tick_size": DEFAULT_TICK,
 }
+DEFENSE_BNB: Dict[str, Any] = {
+    "name": "BNB",
+    "buffer_multiplier": DEFAULT_BUFFER_MULT,
+    "tp1_pct": DEFAULT_TP1_PCT,
+    "tp2_pct": DEFAULT_TP2_PCT,
+    "min_stop_ticks": DEFAULT_MIN_STOP_TICKS,
+    "tick_size": DEFAULT_TICK,
+}
 
 _BY_SYMBOL = {
     "ETHUSDT": DEFENSE_ETH,
     "XAUUSDT": DEFENSE_XAU,
+    "BNBUSDT": DEFENSE_BNB,
     "ETH-USDT-SWAP": DEFENSE_ETH,
     "XAU-USDT-SWAP": DEFENSE_XAU,
+    "BNB-USDT-SWAP": DEFENSE_BNB,
 }
 
 

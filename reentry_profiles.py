@@ -212,9 +212,36 @@ REENTRY_ETH: Dict[str, Any] = {
     "tick_size": 0.01,
 }
 
+# BNB 重入配置（跟随 ETH 逻辑）
+REENTRY_BNB: Dict[str, Any] = {
+    "name": "BNB",
+    "tv_tf": "90m",
+    "tv_tf_sec": _ETH_TF_SEC,
+    "enabled": True,
+    "activation_tp1_frac": ACTIVATION_TP1_FRAC,
+    "activation_tp1_frac_reentry": ACTIVATION_TP1_FRAC_REENTRY,
+    "radar_act_adx_lo": RADAR_ACT_ADX_LO,
+    "radar_act_adx_hi": RADAR_ACT_ADX_HI,
+    "radar_act_ratio_lo": RADAR_ACT_RATIO_LO,
+    "radar_act_ratio_hi": RADAR_ACT_RATIO_HI,
+    "arm_sl_atr": ARM_SL_ATR,
+    "fee_cover_pct": FEE_COVER_PCT,
+    "arm_mode": ARM_MODE,
+    "tiers": ETH_TIERS,
+    "reentry_zone_atr": _ETH_ZONE,
+    "reentry_window_bars": _ETH_WINDOW_BARS,
+    "limit_discount": LIMIT_DISCOUNT,
+    "limit_ttl_sec": LIMIT_TTL_SEC,
+    "max_reentries": MAX_REENTRIES,
+    "max_unfilled_refreshes": MAX_UNFILLED_REFRESHES,
+    "tick_size": 0.01,
+}
+
 _BY_SYMBOL = {
     "ETHUSDT": REENTRY_ETH,
     "ETH-USDT-SWAP": REENTRY_ETH,
+    "BNBUSDT": REENTRY_BNB,
+    "BNB-USDT-SWAP": REENTRY_BNB,
 }
 
 
