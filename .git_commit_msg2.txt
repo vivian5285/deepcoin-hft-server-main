@@ -1,0 +1,5 @@
+fix v16.22: _close_all残留仓保留tv_sl不重置
+
+根因：BNB减仓失败后tv_sl/tv_tps被重置为0
+→ 重启恢复后硬止损缺失告警
+→ 修复：残留仓保留tv_sl/tv_tps不重置

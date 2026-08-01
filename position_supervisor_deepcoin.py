@@ -9445,8 +9445,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._shield_sltp_ord_id = ""
                 self._shield_sltp_set_at = 0.0
                 self._shield_cancelled_ids = set()
+                # v16.22 修复：全平成功才重置防守价格；全平失败（残留仓）必须保留 tv_sl/tv_tps
+                self.tv_sl = 0.0
+                self.tv_tps = [0.0, 0.0, 0.0]
                 self._snapshot_sizing_principal("全平后本金重置")
             else:
+                # 残留仓：保留 tv_sl 和 tv_tps（不能重置，否则重启后硬止损漏挂）
                 residual = self._get_active_position()
                 if residual:
                     self.watched_qty = self._safe_qty(residual["size"])
