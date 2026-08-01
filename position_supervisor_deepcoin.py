@@ -1314,7 +1314,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         return out
 
-    def _ensure_full_defense_stack(self, live_qty, entry, curr_px, source="接管", manual_fresh=False):
+    def _ensure_full_defense_stack(self, live_qty, entry, curr_px, source="接管", manual_fresh=False,
+                                   recover_mode=False):
         """
         全链防线：TP123 比例限价 + TV tv_sl 硬止损；TP1 成交前雷达待命（呼吸空间）。
         """
@@ -6273,6 +6274,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         last_audit = self._audit_tp_levels(live_qty)
         for r in range(rounds):
+            # v16.22 修复：每轮重取实盘最新张数，防止裁减/减仓后用陈旧数量算错 TP 期望
+            fresh_pos = self._get_active_position()
+            live_qty = self._safe_qty(fresh_pos.get("size")) if fresh_pos else live_qty
             logger.warning(
                 f"☢️ 核武级止盈清场重挂 {r + 1}/{rounds} | 持仓 {live_qty}张 | "
                 f"当前 {last_audit['matched_full']}/{last_audit['expected']} | "
@@ -6285,6 +6289,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._save_state()
             self._cancel_all_tp_limit_orders()
             time.sleep(1.0)
+            # v16.22 修复：传实盘最新张数，防止用陈旧 qty 算错 TP 数量
             placed = self._rebuild_defenses(live_qty, entry, dynamic_sl=None)
             logger.info(f"☢️ 核武轮 {r + 1} 新挂 {placed} 笔限价止盈")
             curr_px = deepcoin_client.get_current_price(self.symbol)
@@ -6292,9 +6297,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
                 self._ensure_radar_sl(live_qty, dynamic_sl)
             time.sleep(1.0)
+            # v16.22 修复：用实盘最新张数重新审计
             last_audit = self._audit_tp_levels(live_qty)
             stop_px = self._resolve_defense_stop_for_audit(dynamic_sl)
-            if self._defenses_fully_ok(live_qty, stop_px):
+            # v16.22 修复：仅当 matched < expected 时才继续；matched >= expected 时直接返回成功
+            if last_audit["matched_full"] >= last_audit["expected"] and not last_audit.get("orphans"):
                 logger.info(f"☢️ 核武重挂成功: {self._format_audit_summary(last_audit)}")
                 return last_audit
             logger.warning(
@@ -9485,13 +9492,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self.current_sl = s.get("current_sl", 0.0)
                     self.regime = s.get("regime", 3)
                     self.current_atr = s.get("current_atr", 30.0)
+                    # v16.22 修复：ATR 全零时强制从 open_journal 恢复，防止 tv_sl fallback 计算错误
+                    if float(self.current_atr or 0) <= 0:
+                        last_open = self._load_last_journal_entry("logs/deepcoin_open_journal.jsonl")
+                        if last_open and float(last_open.get("atr", 0) or 0) > 0:
+                            self.current_atr = float(last_open.get("atr"))
+                            logger.info(f"💧 [重启] 从开仓日志恢复 ATR={self.current_atr:.2f}")
                     self.tv_tps = self._sanitize_tp_prices(s.get("tv_tps", [0.0, 0.0, 0.0]))
+                    # v16.22 修复：重启恢复时必须还原 last_tv_signal，
+                    # 这样 _hydrate_tv_defense_context 才能正确从信源补全 TP123 和 tv_sl
+                    self.last_tv_signal = s.get("last_tv_signal")
                     self.tv_price = float(s.get("tv_price", 0.0) or 0.0)
                     self.best_price = s.get("best_price", 0.0)
                     self.watched_qty = s.get("watched_qty", 0)
                     self.watched_entry = s.get("watched_entry", 0.0)
                     self.initial_qty = s.get("initial_qty", 0)
-                    self.last_tv_signal = s.get("last_tv_signal")
                     self.open_regime = int(s.get("open_regime", s.get("regime", 3)) or 3)
                     self.open_atr = float(s.get("open_atr", s.get("current_atr", 30.0)) or 30.0)
                     self.initial_stop = float(s.get("initial_stop", 0) or 0)
@@ -9566,6 +9581,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
             pos = self._get_active_position()
             if pos and self._safe_qty(pos.get("size", 0)) != 0:
+                # v16.22：立即设标志，阻止 _run_idle_live_reconcile 在重启接管期间干扰
                 self._recover_in_progress = True
                 recover_ok = False
                 recover_err = ""
@@ -9637,6 +9653,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     stack = self._ensure_full_defense_stack(
                         real_amt, self.watched_entry, curr_px or 0,
                         source="VPS重启", manual_fresh=bool(reconcile.get("manual_open")),
+                        recover_mode=True,
                     )
                     audit = stack.get("audit") or {}
                     result = stack.get("result") or {}
