@@ -1,10 +1,10 @@
 # 深币 Deepcoin · ETH/BNB 永续 Webhook 交易系统
 
-**当前版本：`v16.22-tp-direction-guard`**
+**当前版本：`v16.23-hard-shield-recovery`**
 
 > **持仓模式说明**：Deepcoin 没有独立的 `set-position-mode` API，但 `posSide=long/short` 参数已在所有订单（开仓/平仓/限价止盈/条件单）中正确使用，保证双向持仓语义。`reduceOnly=True` 在止盈/止损中已正确设置，防止意外开仓。
 
-与 `VPS完整系统规格_币安单账户版 v1.0` 完全对齐。
+与 `VPS完整系统规格_币安单账户版 v1.0` 完全对齐，支持 ETH/BNB 双币种。
 
 | 项目 | 值 |
 |------|-----|
@@ -14,7 +14,7 @@
 | TV Webhook | `http://187.77.130.144/deepcoin/webhook` |
 | 单位 | **张**（0.1 ETH/张） |
 | 杠杆 | **5x** cross（双向持仓模式） |
-| 健康检查 | `GET /health` → `"version":"v16.22-tp-direction-guard"` |
+| 健康检查 | `GET /health` → `"version":"v16.23-hard-shield-recovery"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
 | 自检 | `bash check_network.sh` 或 `bash check_network.sh --quick` |
