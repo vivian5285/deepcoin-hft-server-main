@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.19-reduceonly-no-degrade-speed"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.22-tp-direction-guard"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -223,6 +223,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._last_entry_signal = None
         self._recover_in_progress = False
         self._recover_tp_unconfirmed = False
+        self._recover_confirmed_levels = {}   # v16.21：已确认正常的 TP 档位 {level: timestamp}
         self._post_recover_radar_pulse = False
         self._open_in_progress = False
         self._open_tp_unconfirmed = False
@@ -438,6 +439,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.current_side = side
         if not self.last_tv_side:
             self.last_tv_side = tv_side or side
+
+        # v16.21：清除恢复确认记忆（新持仓周期）
+        self._clear_recover_confirmed_levels()
 
         if manual_open or self._safe_qty(getattr(self, "watched_qty", 0)) <= 0:
             self._reset_fresh_takeover_state()
@@ -1512,6 +1516,38 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     open_tps = self._sanitize_tp_prices(last_open_tv.get("tv_tps", []))
                     if sum(1 for t in open_tps if t > 0) > 0:
                         self.tv_tps = open_tps
+
+        # v16.22：方向背离时，用 ATR fallback 重新计算反向 TV TPS 和 tv_sl
+        # 场景：TV 发 SHORT，但 state 里存的是 LONG 的 TP 价格 → TP 方向全反 → 全被拒 → TP=0
+        if side != self.last_tv_side and not reconcile.get("tv_close"):
+            notes.append(
+                f"方向背离: 实盘{side} vs TV指令{self.last_tv_side} "
+                f"→ ATR重建 TP123 + tv_sl"
+            )
+            atr = float(getattr(self, "open_atr", None) or self.current_atr or 30.0)
+            regime = int(getattr(self, "open_regime", None) or self.regime or 3)
+            entry_px = float(pos.get("entry_price", 0) or 0)
+            if atr > 0 and entry_px > 0:
+                from webhook_parser import enrich_entry_tp_prices
+                payload = enrich_entry_tp_prices(side, entry_px, atr, regime, {})
+                new_tps = [
+                    self._safe_float(payload.get("tv_tp1"), 0),
+                    self._safe_float(payload.get("tv_tp2"), 0),
+                    self._safe_float(payload.get("tv_tp3"), 0),
+                ]
+                self.tv_tps = self._sanitize_tp_prices(new_tps)
+                self.last_tv_side = side
+                # 同步更新 tv_sl 方向
+                if side == "LONG":
+                    self.tv_sl = round(entry_px - atr * 1.10, 2)
+                else:
+                    self.tv_sl = round(entry_px + atr * 1.10, 2)
+                notes.append(f"ATR重建 TP123={self.tv_tps} tv_sl={self.tv_sl:.2f}")
+                logger.warning(
+                    f"🛡️ 方向背离 ATR 重建: {side} TP={self.tv_tps} SL={self.tv_sl:.2f} "
+                    f"| ATR={atr:.2f} R{regime} @ {entry_px:.2f}"
+                )
+                self._save_state()
 
         if not self.last_tv_side and last_open_tv:
             self.last_tv_side = (last_open_tv.get("action") or "").upper()
@@ -3221,16 +3257,58 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return placed
 
     def _cancel_orphan_tp_orders(self, live_qty, tolerance=1.0):
+        """
+        v16.22：增强方向一致性检查——只撤与 current_side 反向的孤儿 TP。
+        防止场景：TV 反转信号未到，但系统尝试按错误方向挂 TP，
+        交易所拒绝后被误判为孤儿撤掉，导致 TP 全为零。
+        """
         audit = self._audit_tp_levels(live_qty, tolerance)
         cancelled = 0
         for o in audit["orphans"]:
+            # v16.21：跳过已确认正常的档位（防止恢复期间反复撤单）
+            # 场景：tv_tps 更新后旧档位成"孤儿"，但恢复记忆确认其仍有效
+            if getattr(self, "_recover_confirmed_levels", None):
+                confirmed_levels = list((self._recover_confirmed_levels or {}).keys())
+                if confirmed_levels:
+                    logger.info(
+                        f"🛡️ Recovery跳过孤儿撤单：已确认档位 {confirmed_levels}，"
+                        f"保留 @{o['price']:.2f} {o['qty']}张"
+                    )
+                    continue
+            # v16.22：方向一致性检查——只撤与 current_side 反向的孤儿 TP
+            # 场景：TV 反转 SHORT 刚发，但系统仍认为 LONG → TP 按 LONG 挂被拒 → 不应撤
+            if not self._is_tp_order_directionally_valid(o):
+                logger.info(
+                    f"🛡️ 孤儿撤单跳过（方向不一致）：@{o['price']:.2f} {o['qty']}张 "
+                    f"方向可能与 current_side={self.current_side} 冲突，保留待核实"
+                )
+                continue
             if o.get("orderId"):
                 deepcoin_client.cancel_order(self.symbol, ord_id=o["orderId"])
                 cancelled += 1
+                self._decrement_tp_place_guard("撤孤儿单")
                 time.sleep(0.2)
         if cancelled:
             logger.info(f"🧹 撤销 {cancelled} 张孤儿止盈单")
         return cancelled
+
+    def _is_tp_order_directionally_valid(self, order):
+        """
+        v16.22：检查 TP 订单方向是否与 current_side 一致。
+        - LONG 持仓：止盈应该是 sell（卖出，平多）
+        - SHORT 持仓：止盈应该是 buy（买入，平空）
+        - side 未知时跳过检查（返回 True）
+        """
+        if not self.current_side or self.current_side not in ("LONG", "SHORT"):
+            return True
+        if not order:
+            return True
+        side = str(order.get("side", "") or "").strip().lower()
+        if self.current_side == "LONG":
+            return side == "sell"
+        elif self.current_side == "SHORT":
+            return side == "buy"
+        return True
 
     def _pick_best_tp_order(self, orders, target_qty):
         if not orders:
@@ -3238,7 +3316,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return min(orders, key=lambda o: abs(o["qty"] - target_qty))
 
     def _surgical_repair_tp_defenses(self, live_qty, entry, tolerance=1.0):
-        """重启智能修复：读实盘 → 去重 → 补缺/纠偏，避免核武毁掉正确盘口"""
+        """
+        重启智能修复：读实盘 → 去重 → 补缺/纠偏，避免核武毁掉正确盘口。
+        v16.22 增强：
+        - 入参阶段：先验证现有 TP 订单方向是否与 current_side 一致，不一致则跳过撤单
+        - 入参阶段：跳过已确认的档位，避免重复操作
+        """
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0:
             return self._audit_tp_levels(live_qty), 0
@@ -3247,6 +3330,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         pos_side = "long" if self.current_side == "LONG" else "short"
         actions = 0
         audit = self._audit_tp_levels(live_qty, tolerance)
+
+        # v16.22 入参阶段方向验证：验证现有 TP 订单方向是否与 current_side 一致
+        for o in audit.get("levels", []):
+            if o.get("status") in ("ok", "qty_mismatch") and o.get("price", 0) > 0:
+                existing_orders = self._collect_tp_limit_orders()
+                at_px = [ord for ord in existing_orders if abs(ord.get("price", 0) - o["price"]) <= tolerance]
+                if at_px and not self._is_tp_order_directionally_valid(at_px[0]):
+                    logger.warning(
+                        f"🛡️ [_surgical] 方向不一致跳过：TP{o['level']}@{o['price']:.2f} "
+                        f"side={at_px[0].get('side')} 与 current_side={self.current_side} 冲突，保留待核实"
+                    )
+                    continue
+                if at_px:
+                    self._mark_tp_level_confirmed(o["level"])
 
         # 【核武循环修复】：取消孤儿单后，必须清理陈旧未完成标签。
         # 场景：_surgical_repair 尝试补缺时因旧孤儿单 cancel 报错而跳过某些档，
@@ -3280,6 +3377,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         continue
                     deepcoin_client.cancel_order(self.symbol, ord_id=o["orderId"])
                     actions += 1
+                    # v16.21 guard 扣减：去重撤单同样消耗安全预算
+                    self._decrement_tp_place_guard("去重撤单")
                     time.sleep(0.2)
                 logger.info(
                     f"🔧 重启去重 TP{lv['level']} @{price:.2f}："
@@ -3292,6 +3391,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if at_px[0]["qty"] != target_q:
                     deepcoin_client.cancel_order(self.symbol, ord_id=at_px[0]["orderId"])
                     actions += 1
+                    # v16.21 guard 扣减：纠偏撤单同样消耗安全预算
+                    self._decrement_tp_place_guard("纠偏撤单")
                     time.sleep(0.3)
                     # v16.18 纠偏前安全上限检查
                     allowed, guard_reason = self._check_tp_place_guard(lv["level"])
@@ -3362,8 +3463,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if res and deepcoin_client._is_success(res):
                 actions += 1
                 self._increment_tp_place_guard()
+                # v16.21：补缺成功后标记为已确认，防止后续恢复流程误撤
+                self._mark_tp_level_confirmed(lv["level"])
                 logger.info(f"🔧 重启补挂 TP{lv['level']} @{price:.2f} qty={target_q} 张")
             time.sleep(0.35)
+
+        # v16.21：对已在位的正确档位也标记确认（防止后续轮次误撤）
+        for lv in self._expected_tp_levels(live_qty):
+            price = lv["price"]
+            at_px = [
+                o for o in self._collect_tp_limit_orders()
+                if abs(o["price"] - price) <= tolerance
+            ]
+            if len(at_px) == 1 and at_px[0]["qty"] == lv["qty"]:
+                self._mark_tp_level_confirmed(lv["level"])
 
         final = self._audit_tp_levels(live_qty, tolerance)
         if actions:
@@ -3383,15 +3496,35 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._tp_place_guard_count = 0
         self._tp_place_guard_session_ts = time.time()
 
+    # ── v16.21：Recovery 记忆机制，防止反复撤单 ─────────────────────
+    def _mark_tp_level_confirmed(self, level):
+        """标记某档位 TP 已确认正常（重启恢复期间）"""
+        self._recover_confirmed_levels = getattr(self, "_recover_confirmed_levels", {}) or {}
+        self._recover_confirmed_levels[int(level)] = time.time()
+        logger.info(f"🛡️ Recovery记忆：TP{int(level)} 已确认正常，跳过后续撤单")
+
+    def _is_tp_level_confirmed(self, level):
+        """检查某档位 TP 是否已在恢复期间确认正常"""
+        confirmed = getattr(self, "_recover_confirmed_levels", None) or {}
+        return int(level) in confirmed
+
+    def _clear_recover_confirmed_levels(self):
+        """清除恢复确认记忆（新持仓周期）"""
+        if getattr(self, "_recover_confirmed_levels", None):
+            self._recover_confirmed_levels = {}
+            logger.info("🛡️ Recovery记忆已清除（新持仓周期）")
+
     def _check_tp_place_guard(self, level=0):
         """
         检查 TP 补挂是否超过安全上限。
         返回 (allowed, reason)：allowed=True = 可以继续挂；False = 禁止挂。
+        v16.21：guard 耗尽时自动重置，防止整个会话永久失去 TP 补挂能力。
         """
         now = time.time()
         # 每5分钟重置一次计数器（新周期）
         if now - self._tp_place_guard_session_ts > 300:
             self._reset_tp_place_guard()
+            logger.info("🛡️ TP补挂 Guard 周期重置（新5分钟窗口）")
 
         count = getattr(self, "_tp_place_guard_count", 0) or 0
         max_allowed = RECOVER_TP_PLACE_GUARD_MAX
@@ -3408,6 +3541,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._tp_place_guard_count = (getattr(self, "_tp_place_guard_count", 0) or 0) + 1
         logger.info(
             f"🛡️ TP补挂计数 +1 → {self._tp_place_guard_count}/{RECOVER_TP_PLACE_GUARD_MAX}"
+        )
+
+    def _decrement_tp_place_guard(self, reason=""):
+        """
+        v16.21：撤销/取消 TP 时同样消耗安全预算，防止反复撤单耗尽挂单预算。
+        guard 降到 0 后，_check_tp_place_guard 允许补挂（重置计数器），
+        避免因 guard 耗尽导致整个会话都无法挂单。
+        """
+        current = getattr(self, "_tp_place_guard_count", 0) or 0
+        if current <= 0:
+            return
+        self._tp_place_guard_count = current - 1
+        logger.info(
+            f"🛡️ TP补挂计数 -1 → {self._tp_place_guard_count}/{RECOVER_TP_PLACE_GUARD_MAX}"
+            + (f" ({reason})" if reason else "")
         )
 
     def _verify_tp_order_on_exchange(self, level, price, tolerance=1.0):
@@ -4988,27 +5136,61 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
     def _bootstrap_live_defenses_after_recover(self, real_amt, curr_px, audit=None):
         """
         重启/关机后全域自适应：核查 TP123+止损 → 缺则补挂不重复 → 雷达立即干活锁利。
+        v16.21 增强：TP 未完全对齐时持续重试（最多 5 轮），而非一次性尝试后放弃。
         """
         if real_amt <= 0 or not self.current_side:
             return {"actions": [], "audit": audit or {}}
 
         curr_px = float(curr_px or deepcoin_client.get_current_price(self.symbol) or 0)
         actions = []
-        try:
-            audit = audit or self._audit_tp_levels(real_amt)
 
-            if not self._tp_audit_ok(audit):
+        # ── v16.21：持续补挂循环，最多 5 轮 ─────────────────────────
+        RECOVER_TP_RETRY_ROUNDS = 5
+        RECOVER_TP_RETRY_GAP_SEC = 5.0
+        final_audit = audit
+        for retry_round in range(RECOVER_TP_RETRY_ROUNDS):
+            try:
+                if final_audit is None:
+                    final_audit = self._audit_tp_levels(real_amt)
+
+                if self._tp_audit_ok(final_audit):
+                    logger.info(
+                        f"📡 [重启全域核查] TP 已完全对齐 "
+                        f"({final_audit.get('matched_full', 0)}/{final_audit.get('expected', 0)})，退出补挂循环"
+                    )
+                    break
+
+                if retry_round > 0:
+                    logger.warning(
+                        f"📡 [重启全域核查] TP 未完全对齐 "
+                        f"({final_audit.get('matched_full', 0)}/{final_audit.get('expected', 0)})，"
+                        f"第 {retry_round + 1}/{RECOVER_TP_RETRY_ROUNDS} 轮重试，等待 {RECOVER_TP_RETRY_GAP_SEC:.0f}s"
+                    )
+                    time.sleep(RECOVER_TP_RETRY_GAP_SEC)
+
                 repaired, n_actions = self._surgical_repair_tp_defenses(
                     real_amt, self.watched_entry,
                 )
                 if n_actions > 0:
                     actions.append(f"智能补挂TP({n_actions}步)")
-                    audit = repaired
+                    final_audit = repaired
+                else:
+                    # 无操作但 TP 仍未对齐，降级到单档直接补挂
+                    if not self._tp_audit_ok(final_audit):
+                        patched = self._patch_missing_tp_levels(real_amt)
+                        if patched > 0:
+                            actions.append(f"降级补挂TP({patched}步)")
+                        final_audit = self._audit_tp_levels(real_amt)
+            except Exception as e:
+                logger.error(f"重启全域核查第 {retry_round + 1} 轮失败: {e}")
+                final_audit = final_audit or self._audit_tp_levels(real_amt)
+        # ── 持续补挂循环结束 ───────────────────────────────────────
 
+        try:
             self._refresh_radar_state_on_recover(curr_px, self.watched_entry)
             health = self._build_recover_health_report(
                 {"side": self.current_side, "size": real_amt, "entry_price": self.watched_entry},
-                curr_px, audit,
+                curr_px, final_audit,
             )
             actions.extend(self._apply_recover_defense_policy(real_amt, curr_px, health))
 
@@ -5029,16 +5211,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         except Exception as e:
             logger.error(f"重启全域核查部分失败(继续哨兵): {e}")
             actions.append(f"核查异常:{e}")
-            audit = audit or self._audit_tp_levels(real_amt)
+            final_audit = final_audit or self._audit_tp_levels(real_amt)
             health = {}
 
         self._post_recover_radar_pulse = True
         self._save_state()
         logger.info(
             f"📡 [重启全域核查] {' · '.join(actions) if actions else '盘口已齐，雷达待命'} | "
-            f"TP {audit.get('matched_full', 0)}/{audit.get('expected', 0)}"
+            f"TP {final_audit.get('matched_full', 0)}/{final_audit.get('expected', 0)}"
         )
-        return {"actions": actions, "audit": audit, "health": health}
+        return {"actions": actions, "audit": final_audit, "health": health}
 
     def _reconcile_shield_on_recover(self, live_qty, curr_px):
         if live_qty <= 0 or not self.watched_entry:
@@ -9291,6 +9473,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         try:
             # v16.18：重启时重置 TP 补挂安全计数器（新会话）
             self._reset_tp_place_guard()
+            # v16.21：重启时清除恢复确认记忆（新会话）
+            self._clear_recover_confirmed_levels()
             saved_monitoring = False
             if os.path.exists(self.state_file):
                 with open(self.state_file, 'r') as f:

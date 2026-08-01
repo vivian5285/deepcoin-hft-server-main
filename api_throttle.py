@@ -181,11 +181,26 @@ class AccountThrottle:
         - 不与日常预算竞争
         - 不受静默期约束（bypass=1 额外豁免仅用于极端调试）
         - 超出紧急预算时等待后重试，而非拒绝
+        - v16.20 修复：静默期内主动等待 IP 冷却后再发请求，避免立即被限流拒绝
         """
-        # 静默期对紧急通道无约束力（这是关键区别）
         rem = max(0.0, float(self._silence_until) - time.time())
         if rem > 0 and not bypass:
-            # 静默期内不阻塞紧急通道，仅记录日志
+            # ── v16.20 根因修复：静默期 = IP 限流冷却期，先等后发 ──
+            wait = min(float(rem), 30.0)
+            logger.warning(
+                f"[Throttle] 紧急通道检测到 IP 冷却 {rem:.1f}s，主动等候 {wait:.1f}s "
+                f"| emerg={len(self._emerg_window)}/{self.emerg_budget_per_min}"
+            )
+            time.sleep(wait)
+            # 等候结束后重新计算静默剩余（可能因其他操作已延长）
+            rem = max(0.0, float(self._silence_until) - time.time())
+            if rem > 0:
+                logger.warning(
+                    f"[Throttle] 紧急通道等候后静默期仍未结束 {rem:.1f}s，继续等候 | "
+                    f"emerg={len(self._emerg_window)}/{self.emerg_budget_per_min}"
+                )
+                time.sleep(min(float(rem), 30.0))
+        else:
             logger.warning(
                 f"[Throttle] 紧急通道 bypass 静默期 {rem:.1f}s "
                 f"| emerg={len(self._emerg_window)}/{self.emerg_budget_per_min}"
