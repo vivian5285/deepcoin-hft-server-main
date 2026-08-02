@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.25b-pos-none-guard"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.26-symbol-isolated"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -842,21 +842,26 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         record = dict(record)
         record["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        record["symbol"] = self.symbol  # v16.26: journal 按 symbol 隔离
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def _load_last_journal_entry(self, path):
+    def _load_last_journal_entry(self, path, symbol=None):
         if not os.path.exists(path):
             return None
         last = None
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    try:
-                        last = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if symbol and entry.get("symbol") != symbol:
+                    continue
+                last = entry
         return last
 
     def _record_tv_signal(self, payload, raw_action):
@@ -937,7 +942,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         })
 
     def _load_active_tv_direction_from_journal(self):
-        """从 TV 日志末尾向前：跳过尾部 CLOSE，取当前活跃周期的 LONG/SHORT"""
+        """从 TV 日志末尾向前：跳过尾部 CLOSE，取当前活跃周期的 LONG/SHORT（按 symbol 隔离）"""
         if not os.path.exists(TV_JOURNAL):
             return None
         entries = []
@@ -951,7 +956,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 except json.JSONDecodeError:
                     continue
         for entry in reversed(entries):
-            action = (entry.get("action") or "").upper()
+            if entry.get("symbol") != self.symbol:  # v16.26: 按 symbol 隔离
+                continue
             if action.startswith("CLOSE"):
                 continue
             if action in ("LONG", "SHORT"):
@@ -975,7 +981,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if self.last_tv_signal:
             add(self.last_tv_signal.get("action"))
             add(self.last_tv_signal.get("side"))
-        last_tv = self._load_last_journal_entry(TV_JOURNAL)
+        last_tv = self._load_last_journal_entry(TV_JOURNAL, self.symbol)
         if last_tv:
             add(last_tv.get("action"))
             add(last_tv.get("side"))
@@ -989,7 +995,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _strict_tv_opposite_side(self, live_side):
         """仅当「最新 TV 指令」与实盘明确反向时才强平（不用陈旧全量扫描）"""
-        for src in (self.last_tv_signal, self._load_last_journal_entry(TV_JOURNAL)):
+        for src in (self.last_tv_signal, self._load_last_journal_entry(TV_JOURNAL, self.symbol)):
             if not src:
                 continue
             action = (src.get("action") or "").upper()
@@ -1001,7 +1007,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return None
 
     def _load_last_tv_open_signal(self):
-        """TV 日志中最近一条 LONG/SHORT（CLOSE 之后仍可用于方向对账）"""
+        """TV 日志中最近一条 LONG/SHORT（CLOSE 之后仍可用于方向对账，按 symbol 隔离）"""
         if not os.path.exists(TV_JOURNAL):
             return None
         last_open = None
@@ -1013,6 +1019,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if entry.get("symbol") != self.symbol:  # v16.26: 按 symbol 隔离
                     continue
                 action = (entry.get("action") or "").upper()
                 if action in ("LONG", "SHORT"):
@@ -1028,7 +1036,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             side = (self.last_tv_signal.get("side") or "").upper()
             if side in ("LONG", "SHORT"):
                 return side
-        last_tv = self._load_last_journal_entry(TV_JOURNAL)
+        last_tv = self._load_last_journal_entry(TV_JOURNAL, self.symbol)
         if last_tv:
             tv_action = (last_tv.get("action") or "").upper()
             if tv_action in ("LONG", "SHORT"):
@@ -1124,9 +1132,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         sources = [
             self.last_tv_signal,
-            self._load_last_journal_entry(TV_JOURNAL),
+            self._load_last_journal_entry(TV_JOURNAL, self.symbol),
             self._load_last_tv_open_signal(),
-            self._load_last_journal_entry(OPEN_JOURNAL),
+            self._load_last_journal_entry(OPEN_JOURNAL, self.symbol),
         ]
 
         for src in sources:
@@ -1250,9 +1258,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         side = str(side or "").strip().upper()
         sources = [
             self.last_tv_signal,
-            self._load_last_journal_entry(TV_JOURNAL),
+            self._load_last_journal_entry(TV_JOURNAL, self.symbol),
             self._load_last_tv_open_signal(),
-            self._load_last_journal_entry(OPEN_JOURNAL),
+            self._load_last_journal_entry(OPEN_JOURNAL, self.symbol),
         ]
         for src in sources:
             if not src:
@@ -1508,8 +1516,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         saved_watched = self._safe_qty(self.watched_qty)
         saved_initial = self._safe_qty(self.initial_qty)
 
-        last_tv = self._load_last_journal_entry(TV_JOURNAL)
-        last_open = self._load_last_journal_entry(OPEN_JOURNAL)
+        last_tv = self._load_last_journal_entry(TV_JOURNAL, self.symbol)
+        last_open = self._load_last_journal_entry(OPEN_JOURNAL, self.symbol)
         last_open_tv = self._load_last_tv_open_signal()
 
         if last_tv:
@@ -1652,7 +1660,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
     def _trusted_initial_qty(self, live_qty, entry=None):
         live_qty = self._safe_qty(live_qty)
         entry = float(entry or self.watched_entry or 0)
-        last_open = self._load_last_journal_entry(OPEN_JOURNAL)
+        last_open = self._load_last_journal_entry(OPEN_JOURNAL, self.symbol)
         if last_open:
             jq = self._safe_qty(last_open.get("qty", 0))
             je = float(last_open.get("entry", 0) or 0)
@@ -2815,7 +2823,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             or was_monitoring
         )
         if not had_active_book:
-            last_open = self._load_last_journal_entry(OPEN_JOURNAL)
+            last_open = self._load_last_journal_entry(OPEN_JOURNAL, self.symbol)
             if last_open and last_open.get("source") in ("open", "recover"):
                 had_active_book = True
                 prev_watched = prev_watched or self._safe_qty(last_open.get("qty", 0))
@@ -5453,6 +5461,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             return True
 
+        # v16.26 修复：设置前清除所有旧硬止损单（防止重启后 _local_ord 丢失导致双硬止损）
+        self._purge_shield_stop_orders(tier_prices=None)
+        for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
+            oid = str(t.get("ordId") or "").strip()
+            if not oid:
+                continue
+            t_pos_side = str(t.get("posSide", "")).strip()
+            t_ord_type = str(t.get("ordType", "")).strip()
+            is_shield = t_ord_type in ("stop", "trigger", "conditional") and t_pos_side == pos_side
+            if is_shield and oid not in getattr(self, "_shield_cancelled_ids", set()):
+                deepcoin_client.cancel_trigger_order(self.symbol, oid)
+                self._shield_cancelled_ids = self._shield_cancelled_ids or set()
+                self._shield_cancelled_ids.add(oid)
+                logger.info(f"🛡️ [TV硬止损] 清场撤销旧单 {oid} @ {t.get('triggerPrice', '?')}")
+
         # v16.15（根因四修复）：设置前先撤销旧订单（防止 Deepcoin 拒绝重复设置）
         if _local_ord and _local_ord not in getattr(self, "_shield_cancelled_ids", set()):
             deepcoin_client.cancel_trigger_order(self.symbol, _local_ord)
@@ -5538,18 +5561,34 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             ).get("ok", False)
 
         # v16.23 修复：tv_sl=0 时，从 journal 最后一条 LONG/SHORT 记录中恢复
+        # v16.26 修复：journal 按 symbol 隔离 + 价格合理性检查，防止 ETH 数据污染 BNB
         if real_amt > 0 and getattr(self, "tv_sl", 0) <= 0:
+            curr_px = curr_px or deepcoin_client.get_current_price(self.symbol)
             recovered_sl = 0.0
             for src in [self.last_tv_signal,
-                        self._load_last_journal_entry(TV_JOURNAL),
+                        self._load_last_journal_entry(TV_JOURNAL, self.symbol),
                         self._load_last_tv_open_signal(),
-                        self._load_last_journal_entry(OPEN_JOURNAL)]:
+                        self._load_last_journal_entry(OPEN_JOURNAL, self.symbol)]:
                 if not src:
                     continue
                 sl = float(src.get("tv_sl", 0) or 0)
-                if sl > 0:
-                    recovered_sl = sl
-                    break
+                if sl <= 0:
+                    continue
+                # v16.26：价格合理性检查，防止跨 symbol 数据污染
+                # SHORT 止损需 > 当前价，LONG 止损需 < 当前价
+                if curr_px and curr_px > 0:
+                    if self.current_side == "SHORT" and sl <= curr_px * 1.05:
+                        logger.warning(
+                            f"⚠️ [journal恢复] tv_sl={sl} 不合理（SHORT 应>当前{curr_px:.2f}，偏差不足 5%），跳过"
+                        )
+                        continue
+                    if self.current_side == "LONG" and sl >= curr_px * 0.95:
+                        logger.warning(
+                            f"⚠️ [journal恢复] tv_sl={sl} 不合理（LONG 应<当前{curr_px:.2f}，偏差不足 5%），跳过"
+                        )
+                        continue
+                recovered_sl = sl
+                break
             if recovered_sl <= 0 and self.watched_entry > 0 and self.current_atr > 0:
                 sl_m = {1: 0.9, 2: 1.05, 3: 1.10, 4: 1.25}.get(int(self.regime or 3), 1.10)
                 if self.current_side == "LONG":
@@ -8444,7 +8483,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             and now - float(sig["ts"]) < cooldown_sec
         ):
             return True
-        last_open = self._load_last_journal_entry(OPEN_JOURNAL)
+        last_open = self._load_last_journal_entry(OPEN_JOURNAL, self.symbol)
         if not last_open:
             return False
         side = str(last_open.get("side") or "").upper()
@@ -9567,7 +9606,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self.current_atr = s.get("current_atr", 30.0)
                     # v16.22 修复：ATR 全零时强制从 open_journal 恢复，防止 tv_sl fallback 计算错误
                     if float(self.current_atr or 0) <= 0:
-                        last_open = self._load_last_journal_entry("logs/deepcoin_open_journal.jsonl")
+                        last_open = self._load_last_journal_entry(OPEN_JOURNAL, self.symbol)
                         if last_open and float(last_open.get("atr", 0) or 0) > 0:
                             self.current_atr = float(last_open.get("atr"))
                             logger.info(f"💧 [重启] 从开仓日志恢复 ATR={self.current_atr:.2f}")
@@ -9640,7 +9679,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             self.sizing_principal = eq
 
             if self.base_qty <= 0 and os.path.exists(self.state_file):
-                last_open = self._load_last_journal_entry(OPEN_JOURNAL)
+                last_open = self._load_last_journal_entry(OPEN_JOURNAL, self.symbol)
                 if last_open:
                     jq = int(last_open.get("qty", 0) or 0)
                     if jq > 0:
