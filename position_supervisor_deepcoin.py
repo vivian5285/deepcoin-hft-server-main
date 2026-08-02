@@ -1521,67 +1521,67 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         last_open = self._load_last_journal_entry(OPEN_JOURNAL, self.symbol)
         last_open_tv = self._load_last_tv_open_signal()
 
-            if last_tv:
-                self.last_tv_signal = last_tv
-                tv_action = (last_tv.get("action") or "").upper()
-                tv_tps_saved = self._sanitize_tp_prices(last_tv.get("tv_tps", []))
-                tv_tp_count = sum(1 for t in tv_tps_saved if t > 0)
+        if last_tv:
+            self.last_tv_signal = last_tv
+            tv_action = (last_tv.get("action") or "").upper()
+            tv_tps_saved = self._sanitize_tp_prices(last_tv.get("tv_tps", []))
+            tv_tp_count = sum(1 for t in tv_tps_saved if t > 0)
 
-                tv_price_j = float(last_tv.get("price", 0) or 0)
-                # v16.27: 防止旧 journal 数据（跨 symbol 或方向背离）污染 ATR/regime。
-                # 要求 journal price 与实盘入场价的偏差在合理范围内（20%）。
-                price_contaminated = False
-                if tv_price_j > 0 and entry > 0:
-                    if side == "SHORT" and tv_price_j < entry * 0.8:
-                        price_contaminated = True
-                        notes.append(f"⚠️ journal价格{tv_price_j:.2f}<入场80%={entry*0.8:.2f}，跳过ATR/regime覆盖")
-                    elif side == "LONG" and tv_price_j > entry * 1.2:
-                        price_contaminated = True
-                        notes.append(f"⚠️ journal价格{tv_price_j:.2f}>入场120%={entry*1.2:.2f}，跳过ATR/regime覆盖")
-                # 若方向不符（BNB SHORT 但 journal 是 ETH LONG），也跳过 ATR/regime 覆盖
-                journal_side = (last_tv.get("action") or last_tv.get("side") or "").upper()
-                if journal_side in ("LONG", "SHORT") and journal_side != side:
+            tv_price_j = float(last_tv.get("price", 0) or 0)
+            # v16.27: 防止旧 journal 数据（跨 symbol 或方向背离）污染 ATR/regime。
+            # 要求 journal price 与实盘入场价的偏差在合理范围内（20%）。
+            price_contaminated = False
+            if tv_price_j > 0 and entry > 0:
+                if side == "SHORT" and tv_price_j < entry * 0.8:
                     price_contaminated = True
-                    notes.append(f"⚠️ journal方向{journal_side}≠实盘{side}，跳过ATR/regime覆盖")
+                    notes.append(f"⚠️ journal价格{tv_price_j:.2f}<入场80%={entry*0.8:.2f}，跳过ATR/regime覆盖")
+                elif side == "LONG" and tv_price_j > entry * 1.2:
+                    price_contaminated = True
+                    notes.append(f"⚠️ journal价格{tv_price_j:.2f}>入场120%={entry*1.2:.2f}，跳过ATR/regime覆盖")
+            # 若方向不符（BNB SHORT 但 journal 是 ETH LONG），也跳过 ATR/regime 覆盖
+            journal_side = (last_tv.get("action") or last_tv.get("side") or "").upper()
+            if journal_side in ("LONG", "SHORT") and journal_side != side:
+                price_contaminated = True
+                notes.append(f"⚠️ journal方向{journal_side}≠实盘{side}，跳过ATR/regime覆盖")
 
-                if not price_contaminated:
-                    if last_tv.get("regime"):
-                        self.regime = int(last_tv["regime"])
-                    if last_tv.get("atr"):
-                        self.current_atr = float(last_tv["atr"])
-                    if self.tv_price <= 0 and tv_price_j > 0:
-                        self.tv_price = tv_price_j
+            if not price_contaminated:
+                if last_tv.get("regime"):
+                    self.regime = int(last_tv["regime"])
+                if last_tv.get("atr"):
+                    self.current_atr = float(last_tv["atr"])
+                if self.tv_price <= 0 and tv_price_j > 0:
+                    self.tv_price = tv_price_j
 
-                if tv_action in ("LONG", "SHORT"):
-                    self.last_tv_side = tv_action
-                    if tv_tp_count > 0 and not price_contaminated:
-                        self.tv_tps = tv_tps_saved
-                        notes.append(f"TV日志同步止盈价 {self.tv_tps}")
-                    if side != tv_action:
-                        reconcile["direction_mismatch"] = True
-                        notes.append(
-                            f"方向背离: 实盘{side} vs TV最新{tv_action} ({last_tv.get('ts', '')})"
-                        )
-                elif tv_action.startswith("CLOSE"):
-                    reconcile["tv_close"] = True
+            if tv_action in ("LONG", "SHORT"):
+                self.last_tv_side = tv_action
+                if tv_tp_count > 0 and not price_contaminated:
+                    self.tv_tps = tv_tps_saved
+                    notes.append(f"TV日志同步止盈价 {self.tv_tps}")
+                if side != tv_action:
+                    reconcile["direction_mismatch"] = True
                     notes.append(
-                        f"TV最新为{tv_action} ({last_tv.get('ts', '')})，实盘仍有仓 → 应清场"
+                        f"方向背离: 实盘{side} vs TV最新{tv_action} ({last_tv.get('ts', '')})"
                     )
-                    if last_open_tv:
-                        self.last_tv_side = (last_open_tv.get("action") or "").upper()
-                        open_tps = self._sanitize_tp_prices(last_open_tv.get("tv_tps", []))
-                        if sum(1 for t in open_tps if t > 0) > 0:
-                            self.tv_tps = open_tps
+            elif tv_action.startswith("CLOSE"):
+                reconcile["tv_close"] = True
+                notes.append(
+                    f"TV最新为{tv_action} ({last_tv.get('ts', '')})，实盘仍有仓 → 应清场"
+                )
+                if last_open_tv:
+                    self.last_tv_side = (last_open_tv.get("action") or "").upper()
+                    open_tps = self._sanitize_tp_prices(last_open_tv.get("tv_tps", []))
+                    if sum(1 for t in open_tps if t > 0) > 0:
+                        self.tv_tps = open_tps
 
-            # v16.27: 若 journal 没有提供有效 ATR（被上面的污染检查跳过），
-            # 优先从 last_open_tv（开仓日志中的 TV 信号）恢复 ATR/regime
-            if float(self.current_atr or 0) <= 0 and last_open_tv:
-                open_atr = float(last_open_tv.get("atr", 0) or 0)
-                if open_atr > 0:
-                    self.current_atr = open_atr
-                    notes.append(f"💧 从开仓日志恢复ATR={open_atr:.2f}")
-                if last_open_tv.get("regime") and not self.regime:
-                    self.regime = int(last_open_tv["regime"])
+        # v16.27: 若 journal 没有提供有效 ATR（被上面的污染检查跳过），
+        # 优先从 last_open_tv（开仓日志中的 TV 信号）恢复 ATR/regime
+        if float(self.current_atr or 0) <= 0 and last_open_tv:
+            open_atr = float(last_open_tv.get("atr", 0) or 0)
+            if open_atr > 0:
+                self.current_atr = open_atr
+                notes.append(f"💧 从开仓日志恢复ATR={open_atr:.2f}")
+            if last_open_tv.get("regime") and not self.regime:
+                self.regime = int(last_open_tv["regime"])
 
         # v16.22：方向背离时，用 ATR fallback 重新计算反向 TV TPS 和 tv_sl
         # 场景：TV 发 SHORT，但 state 里存的是 LONG 的 TP 价格 → TP 方向全反 → 全被拒 → TP=0
@@ -9323,7 +9323,6 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         # 规格 v1.0 §6 保护：tv_tps 全零说明 TP 价格从未被正确初始化（TV 信号缺字段 / 重启恢复失败）。
         # 用 open_atr + open_regime 做紧急 fallback，不让仓位裸奔。
-        # v16.27: 额外增加价格合理性检查，防止 open_atr=11.69（ETH）错误用于 BNB SHORT 导致 TP 价格离谱。
         if self.tv_tps and all(float(t or 0) <= 0 for t in self.tv_tps):
             if self.current_side and entry > 0:
                 atr = float(getattr(self, "open_atr", None) or self.current_atr or 0)
@@ -9339,13 +9338,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     # v16.27: 价格合理性检查 - TP 应在正确的方向
                     tps_valid = True
                     if self.current_side == "SHORT":
-                        # TP 价格应 < entry（做空止盈在更低价）
                         for tp_px in tps:
                             if tp_px > entry * 0.95:
                                 tps_valid = False
                                 break
                     elif self.current_side == "LONG":
-                        # TP 价格应 > entry（做多止盈在更高价）
                         for tp_px in tps:
                             if tp_px < entry * 1.05:
                                 tps_valid = False
@@ -9355,6 +9352,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         logger.warning(
                             f"⚠️ tv_tps=全零 → ATR紧急Fallback TP123={self.tv_tps} "
                             f"| entry={entry:.2f} ATR={atr:.2f} R{regime}"
+                        )
+                    else:
+                        logger.warning(
+                            f"⛔ ATR紧急Fallback计算出TP价格方向错误，跳过 | "
+                            f"tps={tps} entry={entry:.2f} side={self.current_side}"
                         )
                     logger.warning(
                         f"[钉钉已关闭] TP价格缺失·ATR紧急Fallback | {self.current_side} {live_qty}张 | ATR={atr:.2f} R{regime}"
