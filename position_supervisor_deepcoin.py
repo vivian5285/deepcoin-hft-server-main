@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.24-hard-shield-recovery"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.25-pos-none-guard"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -1729,6 +1729,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     "regime": self.regime,
                     "current_atr": self.current_atr,
                     "tv_tps": self.tv_tps,
+                    "tv_sl": float(getattr(self, "tv_sl", 0) or 0),
                     "tv_price": self.tv_price,
                     "best_price": self.best_price,
                     "initial_qty": self.initial_qty,
@@ -9566,6 +9567,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             self.current_atr = float(last_open.get("atr"))
                             logger.info(f"💧 [重启] 从开仓日志恢复 ATR={self.current_atr:.2f}")
                     self.tv_tps = self._sanitize_tp_prices(s.get("tv_tps", [0.0, 0.0, 0.0]))
+                    self.tv_sl = float(s.get("tv_sl", 0) or 0)
                     # v16.22 修复：重启恢复时必须还原 last_tv_signal，
                     # 这样 _hydrate_tv_defense_context 才能正确从信源补全 TP123 和 tv_sl
                     self.last_tv_signal = s.get("last_tv_signal")
