@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.25-pos-none-guard"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.25b-pos-none-guard"
 
 # 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
 LATE_CLOSE_SUPPRESS_SEC = 5.0
@@ -638,6 +638,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 f"(TV={tv_side}) → 闪电接管+挂TP123"
             )
             self._perform_live_takeover(pos, source="空闲巡检", manual_open=True)
+            # v16.25 防御：takeover 后 pos 可能已失效
+            pos_after = self._query_position()
+            if pos_after is None or self._safe_qty(pos_after.get("size", 0)) <= 0:
+                logger.warning("⚠️ [空闲巡检] takeover后已空仓，跳过后续对账")
+                return
             return
 
         if self._is_material_qty_change(watched, live_qty):
