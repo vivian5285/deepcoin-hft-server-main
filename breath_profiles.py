@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-按品种呼吸参数档（ETH / XAU）。执行引擎共用，只在配置层区分。
+按品种呼吸参数档（ETH / XAU / BNB）。执行引擎共用，只在配置层区分。
 
-v16.8.0 / 马拉松雷达：
+规格 v2.1（binance parity 498757d）：
+  - 雷达激活 = 中点激活（首次=(TP1+TP2)/2，重入=TP2）；TP1 是否成交仅记日志不阻塞
   - 雷达激活臂 = 保本起步（entry±tick±fee），不再用 initial_sl_atr=0.5 跳价
   - 取消 TP1/TP2 强制底线（tp1_floor_atr=tp2_floor_atr=0）
+  - 呼吸空间/步进参数大幅放宽（约40-60%，市价前面跑，雷达保持安全距离跟在后面）
   - 浮盈≥3×ATR 切入阶段二连续追踪（phase_switch_atr=3）
-  - 禁用早保本抢跑（early_be_atr=0）；ADX 三档步进/呼吸由 reentry_profiles overlay
+  - 提前保本检查点已废除（early_be_atr=0）；ADX 三档步进/呼吸由 reentry_profiles overlay
   - 硬止损呼吸垫已迁至 defense_profiles 统一 1.15（本文件不管 buffer）
   - 本文件存基线；运行时 apply_tier_to_breath_profile 覆盖 step/breath/trail
 """
@@ -26,18 +28,18 @@ BREATH_ETH: Dict[str, Any] = {
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.50,  # 中趋势基线
-    "step_advance_atr": 0.35,  # 中趋势基线
+    "step_trigger_atr": 0.85,  # v2.1 中趋势基线（binance parity 498757d）
+    "step_advance_atr": 0.55,  # v2.1 中趋势基线
     "phase_switch_atr": 3.0,  # 浮盈≥3×ATR → 阶段二连续追踪
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,  # 取消强制底线
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 1.20,  # 中趋势基线（规格 §5.3）
-    "breath_tp23": 1.60,  # 中趋势基线（规格 §5.3）
+    "breath_tp12": 2.00,  # v2.1 中趋势基线（规格 §5.3）
+    "breath_tp23": 2.80,  # v2.1 中趋势基线（规格 §5.3）
     "phase2_trail_mult": 1.0,
-    "min_mult": 2.0,   # 中趋势 TP3+ 基线
-    "max_mult": 2.5,   # 中趋势 TP3+ 基线
+    "min_mult": 3.0,   # v2.1 中趋势 TP3+ 基线
+    "max_mult": 4.5,   # v2.1 中趋势 TP3+ 基线
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
@@ -52,18 +54,18 @@ BREATH_XAU: Dict[str, Any] = {
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.5,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.40,  # 中趋势基线
-    "step_advance_atr": 0.30,  # 中趋势基线
+    "step_trigger_atr": 0.85,  # v2.1 中趋势基线（binance parity 498757d）
+    "step_advance_atr": 0.55,  # v2.1 中趋势基线
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 1.00,  # 中趋势基线（规格 §5.3）
-    "breath_tp23": 1.40,  # 中趋势基线（规格 §5.3）
+    "breath_tp12": 2.50,  # v2.1 中趋势基线（规格 §5.3）
+    "breath_tp23": 3.50,  # v2.1 中趋势基线（规格 §5.3）
     "phase2_trail_mult": 1.0,
-    "min_mult": 1.8,   # 中趋势 TP3+ 基线
-    "max_mult": 2.2,   # 中趋势 TP3+ 基线
+    "min_mult": 3.5,   # v2.1 中趋势 TP3+ 基线
+    "max_mult": 5.5,   # v2.1 中趋势 TP3+ 基线
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
@@ -78,18 +80,18 @@ BREATH_BNB: Dict[str, Any] = {
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.50,  # 中趋势基线
-    "step_advance_atr": 0.35,  # 中趋势基线
+    "step_trigger_atr": 0.85,  # v2.1 中趋势基线（跟随 ETH）
+    "step_advance_atr": 0.55,  # v2.1 中趋势基线
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 1.20,  # 中趋势基线
-    "breath_tp23": 1.60,  # 中趋势基线
+    "breath_tp12": 2.00,  # v2.1 中趋势基线
+    "breath_tp23": 2.80,  # v2.1 中趋势基线
     "phase2_trail_mult": 1.0,
-    "min_mult": 2.0,
-    "max_mult": 2.5,
+    "min_mult": 3.0,
+    "max_mult": 4.5,
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,

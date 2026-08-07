@@ -1,13 +1,14 @@
 {
-  "schema": "v3.2-adx-act-70-90",
-  "note": "雷达启动=ADX连续插值70%~90%×1.35×initial_atr；ADX<=17→70%、>=35→90%；首次/重入同一公式；第二层trail不动",
+  "schema": "v2.1-midpoint-activation-highway",
+  "note": "规格 v2.1（binance parity 498757d）：首次开仓雷达激活 = (TP1+TP2)/2；重入开仓 = TP2。TP1是否成交仅记日志不阻塞。提前保本检查点已废除。呼吸空间与步进参数大幅放宽（市价在前面跑，雷达保持安全距离跟在后面）。",
   "radar_act_adx_lo": 17,
   "radar_act_adx_hi": 35,
   "radar_act_ratio_lo": 0.70,
   "radar_act_ratio_hi": 0.90,
   "activation_tp1_frac": 0.70,
   "activation_tp1_frac_reentry": 0.90,
-  "arm_sl_atr": 0.5,
+  "arm_mode": "breakeven_fee",
+  "arm_sl_atr": 0.0,
   "limit_discount": 0.003,
   "limit_ttl_sec": 300,
   "max_reentries": 1,
@@ -24,30 +25,33 @@
     "tiers": [
       {
         "name": "weak",
-        "step_trigger_atr": 0.40,
-        "step_advance_atr": 0.25,
-        "breath_tp12": 0.80,
-        "breath_tp23": 1.00,
-        "min_mult": 1.2,
-        "max_mult": 1.5
-      },
-      {
-        "name": "mid",
-        "step_trigger_atr": 0.50,
-        "step_advance_atr": 0.35,
-        "breath_tp12": 1.20,
-        "breath_tp23": 1.60,
-        "min_mult": 2.0,
-        "max_mult": 2.5
-      },
-      {
-        "name": "strong",
-        "step_trigger_atr": 0.60,
-        "step_advance_atr": 0.40,
+        "note": "弱趋势：呼吸宽松，允许行情充分跑动（v2.1步进放宽40-60%）",
+        "step_trigger_atr": 0.70,
+        "step_advance_atr": 0.42,
         "breath_tp12": 1.50,
         "breath_tp23": 2.00,
         "min_mult": 2.5,
         "max_mult": 3.5
+      },
+      {
+        "name": "mid",
+        "note": "中趋势：平衡配置（v2.1步进放宽40-60%）",
+        "step_trigger_atr": 0.85,
+        "step_advance_atr": 0.55,
+        "breath_tp12": 2.00,
+        "breath_tp23": 2.80,
+        "min_mult": 3.0,
+        "max_mult": 4.5
+      },
+      {
+        "name": "strong",
+        "note": "强趋势：呼吸最宽松，市价在前面跑，雷达保持安全距离（v2.1步进放宽40-60%）",
+        "step_trigger_atr": 1.00,
+        "step_advance_atr": 0.65,
+        "breath_tp12": 2.50,
+        "breath_tp23": 3.50,
+        "min_mult": 4.0,
+        "max_mult": 6.0
       }
     ]
   },
@@ -58,30 +62,33 @@
     "tiers": [
       {
         "name": "weak",
-        "step_trigger_atr": 0.35,
-        "step_advance_atr": 0.20,
-        "breath_tp12": 0.70,
-        "breath_tp23": 0.90,
-        "min_mult": 1.0,
-        "max_mult": 1.3
+        "note": "弱趋势XAU：波动大，呼吸空间必须足够大（v2.1步进放宽40-60%）",
+        "step_trigger_atr": 0.70,
+        "step_advance_atr": 0.50,
+        "breath_tp12": 2.00,
+        "breath_tp23": 2.80,
+        "min_mult": 3.0,
+        "max_mult": 4.5
       },
       {
         "name": "mid",
-        "step_trigger_atr": 0.40,
-        "step_advance_atr": 0.30,
-        "breath_tp12": 1.00,
-        "breath_tp23": 1.40,
-        "min_mult": 1.8,
-        "max_mult": 2.2
+        "note": "中趋势XAU：标准宽松配置（v2.1步进放宽40-60%）",
+        "step_trigger_atr": 0.85,
+        "step_advance_atr": 0.55,
+        "breath_tp12": 2.50,
+        "breath_tp23": 3.50,
+        "min_mult": 3.5,
+        "max_mult": 5.5
       },
       {
         "name": "strong",
-        "step_trigger_atr": 0.50,
-        "step_advance_atr": 0.35,
-        "breath_tp12": 1.30,
-        "breath_tp23": 1.80,
-        "min_mult": 2.2,
-        "max_mult": 3.0
+        "note": "强趋势XAU：呼吸空间最大，市价在前面跑，雷达保持安全距离（v2.1步进放宽40-60%）",
+        "step_trigger_atr": 1.00,
+        "step_advance_atr": 0.65,
+        "breath_tp12": 3.00,
+        "breath_tp23": 4.00,
+        "min_mult": 5.0,
+        "max_mult": 7.0
       }
     ]
   },
@@ -89,33 +96,37 @@
     "tv_tf_sec": 5400,
     "reentry_window_bars": 2,
     "reentry_zone_atr": 0.5,
+    "note": "过渡系数：BNB尚无独立回测标定，使用ETH结构过渡，标注待独立校准",
     "tiers": [
       {
         "name": "weak",
-        "step_trigger_atr": 0.40,
-        "step_advance_atr": 0.25,
-        "breath_tp12": 0.80,
-        "breath_tp23": 1.00,
-        "min_mult": 1.2,
-        "max_mult": 1.5
-      },
-      {
-        "name": "mid",
-        "step_trigger_atr": 0.50,
-        "step_advance_atr": 0.35,
-        "breath_tp12": 1.20,
-        "breath_tp23": 1.60,
-        "min_mult": 2.0,
-        "max_mult": 2.5
-      },
-      {
-        "name": "strong",
-        "step_trigger_atr": 0.60,
-        "step_advance_atr": 0.40,
+        "note": "过渡：弱趋势（未经独立回测校准）",
+        "step_trigger_atr": 0.70,
+        "step_advance_atr": 0.42,
         "breath_tp12": 1.50,
         "breath_tp23": 2.00,
         "min_mult": 2.5,
         "max_mult": 3.5
+      },
+      {
+        "name": "mid",
+        "note": "过渡：中趋势（未经独立回测校准）",
+        "step_trigger_atr": 0.85,
+        "step_advance_atr": 0.55,
+        "breath_tp12": 2.00,
+        "breath_tp23": 2.80,
+        "min_mult": 3.0,
+        "max_mult": 4.5
+      },
+      {
+        "name": "strong",
+        "note": "过渡：强趋势（未经独立回测校准）",
+        "step_trigger_atr": 1.00,
+        "step_advance_atr": 0.65,
+        "breath_tp12": 2.50,
+        "breath_tp23": 3.50,
+        "min_mult": 4.0,
+        "max_mult": 6.0
       }
     ]
   }

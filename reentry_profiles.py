@@ -42,12 +42,28 @@ _DEFAULT_ACT_RATIO_STRONG = 0.88  # 85%–90% 中值：强趋势晚激活
 _INVERTED_LEGACY_RATIOS = frozenset({0.70, 0.85})
 
 _DEFAULT_ETH_TIERS: List[Dict[str, float]] = [
-    {"step_trigger_atr": 0.40, "step_advance_atr": 0.25,
-     "breath_tp12": 0.80, "breath_tp23": 1.00, "min_mult": 1.2, "max_mult": 1.5},
-    {"step_trigger_atr": 0.50, "step_advance_atr": 0.35,
-     "breath_tp12": 1.20, "breath_tp23": 1.60, "min_mult": 2.0, "max_mult": 2.5},
-    {"step_trigger_atr": 0.60, "step_advance_atr": 0.40,
+    # binance parity v2.1 (498757d): step_trigger/step_advance widened ~40-60%,
+    # breath_tp12/breath_tp23 carried over from the already-validated v2.0
+    # values (market runs ahead, radar trails at a safe distance behind it).
+    {"step_trigger_atr": 0.70, "step_advance_atr": 0.42,
      "breath_tp12": 1.50, "breath_tp23": 2.00, "min_mult": 2.5, "max_mult": 3.5},
+    {"step_trigger_atr": 0.85, "step_advance_atr": 0.55,
+     "breath_tp12": 2.00, "breath_tp23": 2.80, "min_mult": 3.0, "max_mult": 4.5},
+    {"step_trigger_atr": 1.00, "step_advance_atr": 0.65,
+     "breath_tp12": 2.50, "breath_tp23": 3.50, "min_mult": 4.0, "max_mult": 6.0},
+]
+_DEFAULT_XAU_TIERS: List[Dict[str, float]] = [
+    # binance parity v2.1 (498757d). XAU previously had no dedicated tier
+    # table in this file and silently fell back to the ETH table via
+    # get_reentry_profile()'s default -- XAU's price scale/volatility profile
+    # is different enough (see breath_profiles.BREATH_XAU) that it should
+    # use its own tuned tiers, matching binance.
+    {"step_trigger_atr": 0.70, "step_advance_atr": 0.50,
+     "breath_tp12": 2.00, "breath_tp23": 2.80, "min_mult": 3.0, "max_mult": 4.5},
+    {"step_trigger_atr": 0.85, "step_advance_atr": 0.55,
+     "breath_tp12": 2.50, "breath_tp23": 3.50, "min_mult": 3.5, "max_mult": 5.5},
+    {"step_trigger_atr": 1.00, "step_advance_atr": 0.65,
+     "breath_tp12": 3.00, "breath_tp23": 4.00, "min_mult": 5.0, "max_mult": 7.0},
 ]
 
 REENTRY_TIERS_JSON = os.path.join(
@@ -173,6 +189,13 @@ _ETH_ZONE = float((_CFG.get("ETH") or {}).get("reentry_zone_atr") or 0.5)
 _ETH_WINDOW_BARS = int((_CFG.get("ETH") or {}).get("reentry_window_bars") or 2)
 _ETH_TF_SEC = int((_CFG.get("ETH") or {}).get("tv_tf_sec") or 5400)
 
+XAU_TIERS: List[Dict[str, float]] = list(
+    ((_CFG.get("XAU") or {}).get("tiers") or _DEFAULT_XAU_TIERS)
+)
+_XAU_ZONE = float((_CFG.get("XAU") or {}).get("reentry_zone_atr") or 0.3)
+_XAU_WINDOW_BARS = int((_CFG.get("XAU") or {}).get("reentry_window_bars") or 3)
+_XAU_TF_SEC = int((_CFG.get("XAU") or {}).get("tv_tf_sec") or 2700)
+
 
 def make_reentry_client_order_id(
     symbol: str, side: str, price: float, ts: Optional[float] = None,
@@ -237,11 +260,37 @@ REENTRY_BNB: Dict[str, Any] = {
     "tick_size": 0.01,
 }
 
+REENTRY_XAU: Dict[str, Any] = {
+    "name": "XAU",
+    "tv_tf": "45m",
+    "tv_tf_sec": _XAU_TF_SEC,
+    "enabled": True,
+    "activation_tp1_frac": ACTIVATION_TP1_FRAC,
+    "activation_tp1_frac_reentry": ACTIVATION_TP1_FRAC_REENTRY,
+    "radar_act_adx_lo": RADAR_ACT_ADX_LO,
+    "radar_act_adx_hi": RADAR_ACT_ADX_HI,
+    "radar_act_ratio_lo": RADAR_ACT_RATIO_LO,
+    "radar_act_ratio_hi": RADAR_ACT_RATIO_HI,
+    "arm_sl_atr": ARM_SL_ATR,
+    "fee_cover_pct": FEE_COVER_PCT,
+    "arm_mode": ARM_MODE,
+    "tiers": XAU_TIERS,
+    "reentry_zone_atr": _XAU_ZONE,
+    "reentry_window_bars": _XAU_WINDOW_BARS,
+    "limit_discount": LIMIT_DISCOUNT,
+    "limit_ttl_sec": LIMIT_TTL_SEC,
+    "max_reentries": MAX_REENTRIES,
+    "max_unfilled_refreshes": MAX_UNFILLED_REFRESHES,
+    "tick_size": 0.01,
+}
+
 _BY_SYMBOL = {
     "ETHUSDT": REENTRY_ETH,
     "ETH-USDT-SWAP": REENTRY_ETH,
     "BNBUSDT": REENTRY_BNB,
     "BNB-USDT-SWAP": REENTRY_BNB,
+    "XAUUSDT": REENTRY_XAU,
+    "XAU-USDT-SWAP": REENTRY_XAU,
 }
 
 

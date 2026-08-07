@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# position_supervisor_deepcoin.py — 与币安 VPS 逻辑完全对齐（深币张数/20x 适配）
+# position_supervisor_deepcoin.py ? ??? VPS ???????????/20x ???
 import logging
 import time
 import math
@@ -80,11 +80,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.27-symbol-isolated"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.28-tp-bugfix"
 
-# 开仓成交后：迟到 CLOSE 忽略窗口（覆盖 1–2s 网络差）
+# ???????? CLOSE ??????? 1?2s ????
 LATE_CLOSE_SUPPRESS_SEC = 5.0
-# v16.17：轮询降低以减少 API 调用，根源解决限流
+# v16.17???????? API ?????????
 SENTINEL_POLL_NORMAL = 20.0
 SENTINEL_POLL_ARMING = 15.0
 SENTINEL_POLL_RADAR = 15.0
@@ -95,7 +95,7 @@ DUST_ORPHAN_CONTRACTS = 1
 TP_COMPLETE_RESIDUAL_RATIO = 0.12
 OPEN_OVERSIZE_RATIO = 1.10
 SIGNAL_DEDUP_SEC = 45
-# v16.17：防线对齐冷却延长以减少不必要的 API 查询
+# v16.17???????????????? API ??
 DEFENSE_ALIGN_COOLDOWN_SEC = 30
 SENTINEL_GRACE_AFTER_RECOVER_SEC = 30
 FLAT_CONFIRM_RETRIES = 6
@@ -108,9 +108,9 @@ REGIME_CAP_COOLDOWN_SEC = 90
 REGIME_CAP_TOLERANCE_CONTRACTS = 0
 CAP_MIN_RETAIN_RATIO = 0.25
 CAP_TRIM_MAX_ROUNDS = 4
-QTY_DRIFT_TOLERANCE_PCT = 0.015  # 微漂 ≤1.5%：仅同步账本
-QTY_ALIGN_MIN_PCT = 0.10         # 偏离 ≥10% 才离谱，触发对齐/档位裁减
-SHIELD_HARD_STOP_PCT = 0.10  # 历史常量（仅哨兵成交分类标签）；止损价 exclusively TV tv_sl
+QTY_DRIFT_TOLERANCE_PCT = 0.015  # ?? ?1.5%??????
+QTY_ALIGN_MIN_PCT = 0.10         # ?? ?10% ????????/????
+SHIELD_HARD_STOP_PCT = 0.10  # ??????????????????? exclusively TV tv_sl
 SHIELD_TIER_PCTS = (SHIELD_HARD_STOP_PCT,)
 SHIELD_TIER_RATIOS = (1.0,)
 SHIELD_STOP_TOLERANCE = 2.0
@@ -120,33 +120,49 @@ SHIELD_FAIL_BACKOFF_MAX_SEC = 300
 SHIELD_QTY_TOLERANCE_PCT = 0.04
 SHIELD_MAX_TIER_ORDERS = 1
 RADAR_DINGTALK_COOLDOWN_SEC = 120
-# TV v6.9.86 雷达呼吸空间（对齐 trailTight / TP2·TP3 trailing，避免 TP1 前被震荡扫出）
+# TV v6.9.86 ????????? trailTight / TP2?TP3 trailing??? TP1 ???????
 TV_TRAIL_TIGHT = 0.62
-TV_TRAIL_TP2_ATR = TV_TRAIL_TIGHT * 0.32   # ≈0.20 ATR — TP1 成交后
-TV_TRAIL_TP3_ATR = TV_TRAIL_TIGHT * 0.48   # ≈0.30 ATR — TP2 成交后
-TV_BOOT_SL_ATR = 0.40                      # strongBull 保本底线 entry ± 0.4 ATR
+TV_TRAIL_TP2_ATR = TV_TRAIL_TIGHT * 0.32   # ?0.20 ATR ? TP1 ???
+TV_TRAIL_TP3_ATR = TV_TRAIL_TIGHT * 0.48   # ?0.30 ATR ? TP2 ???
+TV_BOOT_SL_ATR = 0.40                      # strongBull ???? entry ? 0.4 ATR
 RADAR_FEE_BUFFER_PCT = 0.0015
 RADAR_STOP_MIN_GAP_USD = 2.5
 RADAR_STOP_MIN_GAP_PCT = 0.0012
 MIN_TP_LEG_QTY = 1
-# 同向 TV 智能筛选：① ATR 变化 → 先平后开；② 价差低于该百分比 → 不重复开仓，仅刷新 TP123
+# ?? TV ?????? ATR ?? ? ?????? ???????? ? ????????? TP123
 SAME_DIR_MIN_SPREAD_PCT = 0.15
 SAME_DIR_DEDUP_SEC = 300
-OPEN_SAME_DIR_COOLDOWN_SEC = 180  # 同向重复 OPEN：开仓后冷却期内禁止先平后开
-ATR_SIMILAR_RATIO = 0.03  # 持仓 ATR 与 TV ATR 偏差 ≤3% 视为未变
+OPEN_SAME_DIR_COOLDOWN_SEC = 180  # ???? OPEN??????????????
+ATR_SIMILAR_RATIO = 0.03  # ?? ATR ? TV ATR ?? ?3% ????
 TV_JOURNAL = "logs/deepcoin_tv_journal.jsonl"
 OPEN_JOURNAL = "logs/deepcoin_open_journal.jsonl"
+
+# binance parity (52d26bd): symbol-aware ATR fallback. A flat 30 (correct
+# order-of-magnitude for XAU) badly overstates BNB (~4) and understates
+# nothing meaningfully for ETH (~12), so any code path that falls back to a
+# hardcoded ATR when open_atr/current_atr are both unavailable must use this
+# instead of a flat constant, or it will reconstruct wildly wrong TP/SL
+# distances for whichever symbol isn't XAU.
+_SYMBOL_ATR_FALLBACK = {"ETH": 12.0, "XAU": 20.0, "BNB": 4.0}
+
+
+def symbol_aware_atr_fallback(symbol):
+    sym = str(symbol or "").upper()
+    for tag, val in _SYMBOL_ATR_FALLBACK.items():
+        if tag in sym:
+            return val
+    return 30.0
 # ============================================================
-# 增强对账常量（v16.18 TP恢复安全增强）
+# ???????v16.18 TP???????
 # ============================================================
-# TP恢复安全模式：当实盘持仓 vs 预期持仓不一致时，使用保守策略
-RECOVER_TP_VERIFY_ATTEMPTS = 3       # 交易所 TP 状态验证重试次数
-RECOVER_TP_VERIFY_DELAY_SEC = 1.2    # 验证重试间隔
-RECOVER_TP_PLACE_MAX_ATTEMPTS = 2     # 单档 TP 最大补挂尝试次数（防止50个重复单）
-RECOVER_TP_PLACE_GUARD_MAX = 5        # 全局 TP 补挂次数上限（整个会话）
-RECOVER_TP_FILL_CONFIRM_ROUNDS = 2   # 成交确认轮次
-# 保守模式条件：live_qty 与预期偏差超过此比例才触发
-RECOVER_TP_CONSERVATIVE_THRESHOLD = 0.05  # 5% 偏差阈值
+# TP???????????? vs ???????????????
+RECOVER_TP_VERIFY_ATTEMPTS = 3       # ??? TP ????????
+RECOVER_TP_VERIFY_DELAY_SEC = 1.2    # ??????
+RECOVER_TP_PLACE_MAX_ATTEMPTS = 2     # ?? TP ???????????50?????
+RECOVER_TP_PLACE_GUARD_MAX = 5        # ?? TP ????????????
+RECOVER_TP_FILL_CONFIRM_ROUNDS = 2   # ??????
+# ???????live_qty ?????????????
+RECOVER_TP_CONSERVATIVE_THRESHOLD = 0.05  # 5% ????
 
 
 class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
@@ -155,7 +171,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         from breath_profiles import get_breath_profile
         meta = resolve_deepcoin_symbol(symbol)
         self.symbol = meta["symbol"]
-        self.unit_label = meta.get("unit") or "张"
+        self.unit_label = meta.get("unit") or "?"
         self.tag = meta.get("tag") or ("ETH" if "ETH" in self.symbol else "XAU")
         self.breath_profile = meta.get("breath_profile") or get_breath_profile(self.symbol, "deepcoin")
         self.face_value = float(meta.get("face_value") or 0.1)
@@ -171,18 +187,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             ct = float(info.get("ctVal") or info.get("contractVal") or 0)
             if ct > 0:
                 self.face_value = ct
-                logger.info(f"📐 {self.symbol} face_value={ct} (instruments)")
+                logger.info(f"?? {self.symbol} face_value={ct} (instruments)")
         except Exception as e:
-            logger.warning(f"face_value instruments 失败，用 meta {self.face_value}: {e}")
+            logger.warning(f"face_value instruments ???? meta {self.face_value}: {e}")
 
-        # v16.16 注：Deepcoin 没有 set-position-mode API，但 posSide(long/short)
-        # 参数已在所有订单中正确使用，账户默认行为由 Deepcoin 控制。
-        # 杠杆在每次开仓前通过 set_leverage(5x) 设置。
+        # v16.16 ??Deepcoin ?? set-position-mode API?? posSide(long/short)
+        # ????????????????????? Deepcoin ???
+        # ?????????? set_leverage(5x) ???
         self.binance_mark = meta.get("binance_mark") or "ETHUSDT"
         self.monitoring = False
         self._lock = threading.Lock()
 
-        # 钉钉展示用档位保证金%（双品种文档）
+        # ??????????%???????
         self.regime_settings = {
             1: {"margin": 0.05, "ratios": get_regime_tp_ratios(1), "activation": 0.92, "trail_offset": TV_TRAIL_TP2_ATR},
             2: {"margin": 0.10, "ratios": get_regime_tp_ratios(2), "activation": 0.92, "trail_offset": TV_TRAIL_TP2_ATR},
@@ -191,11 +207,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         }
         self.leverage = EXCHANGE_LEVERAGE
         self.tv_sizing_leverage = EXCHANGE_LEVERAGE
-        # face_value 已按品种 meta 设定，禁止再写死 0.1
+        # face_value ???? meta ???????? 0.1
 
         self.regime = 3
-        self.current_atr = 30.0
+        self.current_atr = symbol_aware_atr_fallback(self.symbol)
         self.best_price = 0.0
+        self._adverse_worst_px = 0.0
+        self._adverse_worst_px_ts = 0.0
         self.current_sl = 0.0
         self.tv_price = 0.0
         self.tv_tps = [0.0, 0.0, 0.0]
@@ -223,7 +241,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._last_entry_signal = None
         self._recover_in_progress = False
         self._recover_tp_unconfirmed = False
-        self._recover_confirmed_levels = {}   # v16.21：已确认正常的 TP 档位 {level: timestamp}
+        self._recover_confirmed_levels = {}   # v16.21??????? TP ?? {level: timestamp}
         self._post_recover_radar_pulse = False
         self._open_in_progress = False
         self._open_tp_unconfirmed = False
@@ -231,24 +249,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._last_signal_fp_ts = 0.0
         self._defense_align_in_progress = False
         self._last_defense_align_ok_ts = 0.0
-        self._last_rebuild_attempt_ts = 0.0  # 【修复】防止_rebuild_defenses死循环
-        self._last_nuclear_realign_ts = 0.0  # 【修复】防止_nuclear_realign_tp死循环
+        self._last_rebuild_attempt_ts = 0.0  # ??????_rebuild_defenses???
+        self._last_nuclear_realign_ts = 0.0  # ??????_nuclear_realign_tp???
         self._guardian_bad_streak = 0
         self._sentinel_grace_until = 0.0
         self._last_regime_cap_ts = 0.0
         self.shield_active = False
         self.shield_tiers_consumed = []
         self.tp_levels_consumed = []
-        # v16.15（根因四修复）：记录 set-position-sltp 最近设置的止盈止损单
-        # 用于 audit 检测 + 幂等撤销，防止重复挂/撤导致死循环
+        # v16.15?????????? set-position-sltp ??????????
+        # ?? audit ?? + ??????????/??????
         self._shield_sltp_ord_id = ""
         self._shield_sltp_set_at = 0.0
         self._shield_cancelled_ids = set()
-        # 规格 v1.0 §5.0：提前保本检查点
+        # ?? v1.0 ?5.0????????
         self._early_be_checkpoint_done = False
-        # 规格 v1.0 §3：永久硬止损冻结价
+        # ?? v1.0 ?3?????????
         self.frozen_hard_sl_px = 0.0
-        # 规格 v1.0 §8-9：防御单幂等标签 + 退出所有权
+        # ?? v1.0 ?8-9???????? + ?????
         _own = blank_ownership_state()
         self.exit_ownership = str(_own["exit_ownership"])
         self.ownership_locked_at = float(_own["ownership_locked_at"] or 0)
@@ -278,14 +296,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.early_be_done = False
         self.breathing_coefficient = 1.0
         self._breath_ratio_history = []
-        self._last_tier_label = ""  # P0：tier_label 从 webhook 透传
+        self._last_tier_label = ""  # P0?tier_label ? webhook ??
 
-        # 自动重入相关字段（v1.0 规格对齐）
+        # ?????????v1.0 ?????
         self.adx_tier = 1
         self.radar_tier = 1
         self.radar_activation_frac = 0.78
         self.radar_pending_arm = True
-        self._last_flat_qty_zero_ts = 0.0  # 上次确认归零时间戳（用于减少重复告警）
+        self._last_flat_qty_zero_ts = 0.0  # ???????????????????
         self.reentry_active = False
         self.reentry_attempt = 0
         self.reentry_limit_order_id = None
@@ -293,12 +311,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.reentry_limit_deadline_ts = 0.0
         self.reentry_window_deadline_ts = 0.0
         self.reentry_order_tag = None
-        self.tp_levels_consumed = []  # 确保已初始化
+        self.tp_levels_consumed = []  # ??????
 
-        # v16.18：TP恢复安全增强
-        self._tp_place_guard_count = 0           # 本会话 TP 补挂总次数（防止重复挂50个单）
-        self._tp_place_guard_session_ts = 0.0  # 本次计数周期起始时间
-        self._tp_recover_verified_levels = {}   # 已通过交易所验证的 TP 档位 {level: timestamp}
+        # v16.18?TP??????
+        self._tp_place_guard_count = 0           # ??? TP ???????????50???
+        self._tp_place_guard_session_ts = 0.0  # ??????????
+        self._tp_recover_verified_levels = {}   # ????????? TP ?? {level: timestamp}
 
         self.state_file = os.path.join(
             _BASE_DIR, f'deepcoin_vps_state_{self.symbol.replace("-", "_")}.json'
@@ -312,16 +330,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             try:
                 import shutil
                 shutil.copy2(legacy, self.state_file)
-                logger.info(f"📦 已迁移旧状态 → {self.state_file}")
+                logger.info(f"?? ?????? ? {self.state_file}")
             except Exception as e:
-                logger.warning(f"旧状态迁移失败: {e}")
+                logger.warning(f"???????: {e}")
         try:
             self._pipeline_boot(exchange="deepcoin")
         except Exception as e:
             logger.warning(f"[{self.symbol}] pipeline boot: {e}")
         logger.info(
-            f"🧠 深币 VPS [{DEEPCOIN_SUPERVISOR_VERSION}/{CLIENT_VERSION}] "
-            f"{self.symbol} 军师已加载：双品种 · {self.leverage}x · pipeline"
+            f"?? ?? VPS [{DEEPCOIN_SUPERVISOR_VERSION}/{CLIENT_VERSION}] "
+            f"{self.symbol} ????????? ? {self.leverage}x ? pipeline"
         )
         self._start_signal_worker()
         self._start_idle_flat_patrol()
@@ -330,7 +348,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         RadarReentryMixin._init_reentry_runtime(self)
 
     def _start_idle_flat_patrol(self):
-        """空仓待命时激进实盘巡检：反向强平 / 同向接管 / 人工异动 / 漏报全平 / 蚂蚁扫尾"""
+        """???????????????? / ???? / ???? / ???? / ????"""
         def loop():
             while True:
                 time.sleep(IDLE_PATROL_INTERVAL_SEC)
@@ -343,7 +361,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         continue
                     self._run_idle_live_reconcile()
                 except Exception as e:
-                    logger.error(f"空闲巡检异常: {e}")
+                    logger.error(f"??????: {e}")
                 finally:
                     self._lock.release()
 
@@ -357,12 +375,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _live_position_qty(self):
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.error("?? _live_position_qty: ???????? ? ??????(???0)")
+            return float("inf")
         if not pos:
             return 0
         return self._safe_qty(pos.get("size"))
 
     def _confirm_position_flat(self, retries=None, delay=None):
-        """REST 延迟/重启抖动时多次复核，避免误报空仓触发常规清场"""
+        """REST ??/??????????????????????"""
         retries = retries if retries is not None else FLAT_CONFIRM_RETRIES
         delay = delay if delay is not None else FLAT_CONFIRM_DELAY_SEC
         for i in range(max(1, int(retries))):
@@ -382,8 +403,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         inferred = self._infer_tp_consumed_sequential(initial_qty, live_qty, curr_px)
         if initial_qty <= live_qty and not inferred:
             logger.warning(
-                f"⚠️ 清除陈旧 tp_levels_consumed={consumed} "
-                f"(开单 {initial_qty}≈现仓 {live_qty}张，无减仓证据)"
+                f"?? ???? tp_levels_consumed={consumed} "
+                f"(?? {initial_qty}??? {live_qty}???????)"
             )
             self.tp_levels_consumed = []
             self._save_state()
@@ -391,7 +412,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if 1 in consumed and self.tv_tps and self.tv_tps[0] > 0:
             if 1 not in inferred and not self._has_tp_limit_at_price(self.tv_tps[0]):
                 logger.warning(
-                    f"⚠️ TP1 已标记成交但无减仓/无 TP1 挂单 → 重置 {consumed}"
+                    f"?? TP1 ?????????/? TP1 ?? ? ?? {consumed}"
                 )
                 self.tp_levels_consumed = []
                 self._save_state()
@@ -409,8 +430,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return True, audit
         return False, audit
 
-    def _resume_live_monitoring(self, pos, source="空闲巡检"):
-        """账本与实盘一致但 monitoring=False → 恢复哨兵与雷达跟踪"""
+    def _resume_live_monitoring(self, pos, source="????"):
+        """???????? monitoring=False ? ?????????"""
         curr_px = deepcoin_client.get_current_price(self.symbol) or 0
         entry = float(pos.get("entry_price", 0) or self.watched_entry or 0)
         self._refresh_radar_state_on_recover(curr_px, entry)
@@ -422,21 +443,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         side = "LONG" if pos.get("posSide") == "long" else "SHORT"
         qty = self._safe_qty(pos.get("size"))
         logger.info(
-            f"📡 [{source}] 恢复实盘监督 {side} {qty}张 "
-            f"| 雷达={'已激活' if self._is_radar_active() else '待命'}"
+            f"?? [{source}] ?????? {side} {qty}? "
+            f"| ??={'???' if self._is_radar_active() else '??'}"
         )
 
-    def _perform_live_takeover(self, pos, source="巡检", manual_open=False, qty_change=None):
+    def _perform_live_takeover(self, pos, source="??", manual_open=False, qty_change=None):
         """
-        实盘有仓但 VPS 未监控 / 防线缺失 → 补挂 TP123+硬止损，启动雷达哨兵。
+        ????? VPS ??? / ???? ? ?? TP123+???????????
         """
-        # v16.22 修复：防止 pos=None 导致崩溃（_recover_missed_flat_on_startup 可能在持仓已平时仍调用）
-        # v16.23 修复：显式 None 检查，防止任何形态的 pos=None 导致崩溃
+        # v16.22 ????? pos=None ?????_recover_missed_flat_on_startup ????????????
+        # v16.23 ????? None ?????????? pos=None ????
         if pos is None:
-            logger.warning(f"⚠️ _perform_live_takeover 跳过：pos=None | source={source}")
+            logger.warning(f"?? _perform_live_takeover ???pos=None | source={source}")
             return False
         if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
-            logger.warning(f"⚠️ _perform_live_takeover 跳过：无实盘持仓 | source={source}")
+            logger.warning(f"?? _perform_live_takeover ???????? | source={source}")
             return False
         real_amt = self._safe_qty(pos.get("size"))
         side = "LONG" if pos.get("posSide") == "long" else "SHORT"
@@ -448,7 +469,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if not self.last_tv_side:
             self.last_tv_side = tv_side or side
 
-        # v16.21：清除恢复确认记忆（新持仓周期）
+        # v16.21????????????????
         self._clear_recover_confirmed_levels()
 
         if manual_open or self._safe_qty(getattr(self, "watched_qty", 0)) <= 0:
@@ -491,7 +512,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.monitoring = True
         self._save_state()
         self._ensure_price_ws()
-        log_source = source.split("·")[0].replace(" ", "")
+        log_source = source.split("?")[0].replace(" ", "")
         self._record_open_log(side, real_amt, self.watched_entry, source=log_source)
         self._ensure_sentinel_running()
         self._sentinel_grace_until = time.time() + SENTINEL_GRACE_AFTER_RECOVER_SEC
@@ -506,22 +527,22 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         reconcile_txt = (" | " + " ; ".join(reconcile_notes)) if reconcile_notes else ""
         extra_notes = stack.get("notes") or []
-        extra_txt = (" | " + " · ".join(extra_notes)) if extra_notes else ""
+        extra_txt = (" | " + " ? ".join(extra_notes)) if extra_notes else ""
         verify_note = (
-            f"[{source}] 接管 {real_amt}张 @ {entry_px:.2f} | "
-            f"开单 {saved_initial}张 | TV {self.last_tv_side} | "
-            f"止盈 {matched}/{expected} 档 | "
+            f"[{source}] ?? {real_amt}? @ {entry_px:.2f} | "
+            f"?? {saved_initial}? | TV {self.last_tv_side} | "
+            f"?? {matched}/{expected} ? | "
             f"tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | "
-            f"雷达={'已激活' if radar_active else '待命(TP1后)'} | "
+            f"??={'???' if radar_active else '??(TP1?)'} | "
             f"{self._format_audit_summary(audit)}{extra_txt}{reconcile_txt}"
         )
         if not verified:
-            verify_note += " | REST 同步略延迟"
+            verify_note += " | REST ?????"
 
         if manual_open:
             self._call_telegram_notify(
                 telegram_notify.report_manual_position_change,
-                action_type=f"人工开仓 · {source}",
+                action_type=f"???? ? {source}",
                 old_qty=0,
                 new_qty=real_amt,
                 new_entry_price=entry_px,
@@ -566,60 +587,63 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if expected > 0 and matched < expected:
             logger.warning(
-                f"[钉钉已关闭] {source} · 止盈未完全对齐 | "
-                f"{side} {real_amt}张 @ {entry_px:.2f} | 仅 {matched}/{expected} 档"
+                f"[?????] {source} ? ??????? | "
+                f"{side} {real_amt}? @ {entry_px:.2f} | ? {matched}/{expected} ?"
             )
         else:
             self._mark_defense_align_ok()
 
-        logger.info(f"✅ [{source}] 实盘接管完成 {side} {real_amt}张 @ {entry_px:.2f}")
+        logger.info(f"? [{source}] ?????? {side} {real_amt}? @ {entry_px:.2f}")
         return True
 
     def _run_idle_live_reconcile(self):
-        """VPS 空仓/待命时周期性对账实盘：全场景生产级应对"""
+        """VPS ??/???????????????????"""
         if self.monitoring or getattr(self, "_recover_in_progress", False):
             return
         if getattr(self, "_open_in_progress", False):
             return
 
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.warning("?? [????] ??????????????? ? ????")
+            return
         live_qty = self._safe_qty(pos.get("size")) if pos else 0
 
         if live_qty <= 0:
             if self._book_thinks_active():
                 if not self._confirm_position_flat():
                     logger.warning(
-                        "📭 [空闲巡检] 首次无仓但复核仍有持仓 → 跳过误清场"
+                        "?? [????] ??????????? ? ?????"
                     )
                     return
                 curr_px = deepcoin_client.get_current_price(self.symbol)
-                logger.warning("📭 [空闲巡检] 账本有仓且复核空仓 → 补发收网钉钉")
+                logger.warning("?? [????] ????????? ? ??????")
                 self._handle_manual_flat_detected(
-                    "仓位归零 (人工强平 / 止盈吃单 / 止损触发)",
+                    "???? (???? / ???? / ????)",
                     curr_px=curr_px,
                 )
             return
 
-        if self._enforce_tv_direction_or_flat(pos, source="空闲巡检"):
+        if self._enforce_tv_direction_or_flat(pos, source="????"):
             return
 
-        # v16.23 防御性检查：确保 pos 有效，避免后续 pos.get() 崩溃
+        # v16.23 ???????? pos ??????? pos.get() ??
         if pos is None:
-            logger.warning("⚠️ [空闲巡检] pos=None，跳过对账")
+            logger.warning("?? [????] pos=None?????")
             return
 
         if self._is_dust_qty(live_qty) or self._should_finalize_tp_victory(live_qty):
             if not self.current_side:
                 self.current_side = "LONG" if pos.get("posSide") == "long" else "SHORT"
             logger.warning(
-                f"🐜 [空闲巡检] 发现残量 {self.current_side} {live_qty}张 → 扫尾"
+                f"?? [????] ???? {self.current_side} {live_qty}? ? ??"
             )
-            self._sweep_dust_and_finalize("空闲巡检：盘口蚂蚁仓自动扫平")
+            self._sweep_dust_and_finalize("??????????????")
             return
 
-        # v16.24 防御：sweep 后 pos 可能仍为 None，直接防护
+        # v16.24 ???sweep ? pos ???? None?????
         if pos is None:
-            logger.warning("⚠️ [空闲巡检] sweep后 pos=None，跳过后续对账")
+            logger.warning("?? [????] sweep? pos=None???????")
             return
 
         live_side = "LONG" if pos.get("posSide") == "long" else "SHORT"
@@ -634,20 +658,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if now - getattr(self, "_last_idle_takeover_ts", 0) < IDLE_TAKEOVER_COOLDOWN_SEC:
                 return
             logger.warning(
-                f"🔍 [空闲巡检] VPS空仓但实盘同向持仓 {live_side} {live_qty}张 "
-                f"(TV={tv_side}) → 闪电接管+挂TP123"
+                f"?? [????] VPS????????? {live_side} {live_qty}? "
+                f"(TV={tv_side}) ? ????+?TP123"
             )
-            self._perform_live_takeover(pos, source="空闲巡检", manual_open=True)
-            # v16.25 防御：takeover 后 pos 可能已失效
+            self._perform_live_takeover(pos, source="????", manual_open=True)
+            # v16.25 ???takeover ? pos ?????
             pos_after = self._query_position()
             if pos_after is None or self._safe_qty(pos_after.get("size", 0)) <= 0:
-                logger.warning("⚠️ [空闲巡检] takeover后已空仓，跳过后续对账")
+                logger.warning("?? [????] takeover???????????")
                 return
             return
 
         if self._is_material_qty_change(watched, live_qty):
             logger.warning(
-                f"🔍 [空闲巡检] 人工异动 {watched} → {live_qty}张 → 重算TP123+止损"
+                f"?? [????] ???? {watched} ? {live_qty}? ? ??TP123+??"
             )
             curr_px = deepcoin_client.get_current_price(self.symbol)
             old_qty = watched
@@ -669,30 +693,30 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if now - getattr(self, "_last_idle_takeover_ts", 0) < IDLE_TAKEOVER_COOLDOWN_SEC:
                 return
             logger.warning(
-                f"🔍 [空闲巡检] 防线不齐 ({audit.get('matched_full', 0)}/"
-                f"{audit.get('expected', 0)} 档) → 续挂TP123+止损"
+                f"?? [????] ???? ({audit.get('matched_full', 0)}/"
+                f"{audit.get('expected', 0)} ?) ? ??TP123+??"
             )
-            self._perform_live_takeover(pos, source="空闲巡检·防线续挂")
+            self._perform_live_takeover(pos, source="?????????")
             return
 
         if not self.monitoring:
-            self._resume_live_monitoring(pos, source="空闲巡检")
+            self._resume_live_monitoring(pos, source="????")
 
     @staticmethod
     def _call_telegram_notify(fn, **kwargs):
-        """通过 TG Bot 发送通知。"""
+        """?? TG Bot ?????"""
         try:
             fn(**kwargs)
         except Exception as e:
-            logger.warning(f"[TG发送失败] {getattr(fn, '__name__', fn)} | {e}")
+            logger.warning(f"[TG????] {getattr(fn, '__name__', fn)} | {e}")
 
     @staticmethod
     def _call_telegram(fn, **kwargs):
-        """通过 TG Bot 发送通知。"""
+        """?? TG Bot ?????"""
         try:
             fn(**kwargs)
         except Exception as e:
-            logger.warning(f"[TG发送失败] {getattr(fn, '__name__', fn)} | {e}")
+            logger.warning(f"[TG????] {getattr(fn, '__name__', fn)} | {e}")
 
     def _start_signal_worker(self):
         if self._signal_worker_started:
@@ -701,7 +725,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         threading.Thread(target=self._signal_worker_loop, daemon=True, name="tv-signal-worker").start()
 
     def _signal_worker_loop(self):
-        """同秒开+平：短停聚合后强制先平后开（终态必须有仓）。"""
+        """???+??????????????????????"""
         while True:
             first = self._signal_queue.get()
             batch = [first]
@@ -728,11 +752,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     act = str((payload or {}).get("action", "")).upper()
                     if bi is not None:
                         logger.info(
-                            f"⚙️ [{self.symbol}] 时序消费 bar={bi} seq={sq} action={act}"
+                            f"?? [{self.symbol}] ???? bar={bi} seq={sq} action={act}"
                         )
                     self._process_signal(payload)
                 except Exception as e:
-                    logger.error(f"❌ 信号处理异常: {e}", exc_info=True)
+                    logger.error(f"? ??????: {e}", exc_info=True)
                 finally:
                     try:
                         self._signal_queue.task_done()
@@ -740,7 +764,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         pass
 
     def _annotate_close_open_chain(self, batch):
-        """同K线同时开+平 → 标记先平后开链（late close 抑制豁免）。"""
+        """?K????+? ? ????????late close ??????"""
         by_bar = {}
         for p in batch or []:
             bi, sq = extract_seq_meta(p or {})
@@ -753,27 +777,27 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             has_open = any(is_open_action(a) for a in acts)
             if not (has_close and has_open):
                 continue
-            exec_chain = " → ".join(
+            exec_chain = " ? ".join(
                 f"seq{sq if sq is not None else '?'}:{a}" for sq, a, _ in items
             )
-            tv_by_seq = " → ".join(
+            tv_by_seq = " ? ".join(
                 f"seq{sq if sq is not None else '?'}:{a}"
                 for sq, a, _ in sorted(items, key=lambda x: (x[0] is None, x[0] or 0))
             )
             logger.info(
-                f"📬 [{self.symbol}] 同秒强制先平后开 | 执行序 {exec_chain} | TV {tv_by_seq}"
+                f"?? [{self.symbol}] ???????? | ??? {exec_chain} | TV {tv_by_seq}"
             )
             if bi is not None:
                 self._close_open_chain_active = True
                 self._last_close_bar_index = int(bi)
             try:
                 logger.info(
-                    f"[钉钉已关闭] 先平后开链·同秒开平 [{self.symbol}] | "
-                    f"执行 {exec_chain} | TV按seq {tv_by_seq} | "
-                    f"终态必须开仓（动作优先于seq）"
+                    f"[?????] ?????????? [{self.symbol}] | "
+                    f"?? {exec_chain} | TV?seq {tv_by_seq} | "
+                    f"????????????seq?"
                 )
             except Exception as e:
-                logger.debug(f"先平后开链日志失败: {e}")
+                logger.debug(f"?????????: {e}")
 
     def _signal_fingerprint(self, payload):
         action = str(payload.get("action", "")).strip().upper()
@@ -823,17 +847,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             and now - self._last_signal_fp_ts < SIGNAL_DEDUP_SEC
         ):
             logger.warning(
-                f"📬 TV信号去重忽略: {action} | {SIGNAL_DEDUP_SEC}s 内重复推送"
+                f"?? TV??????: {action} | {SIGNAL_DEDUP_SEC}s ?????"
             )
             return
         if self._open_in_progress and action in ("LONG", "SHORT"):
-            logger.warning(f"📬 开仓进行中，忽略重复建仓信号 {action}")
+            logger.warning(f"?? ?????????????? {action}")
             return
         self._last_signal_fp = fp
         self._last_signal_fp_ts = now
         depth = self._signal_queue.qsize()
         self._signal_queue.put(payload)
-        logger.info(f"📬 TV信号入队: {action} | 队列深度 {depth + 1}")
+        logger.info(f"?? TV????: {action} | ???? {depth + 1}")
 
     def signal_queue_depth(self):
         return self._signal_queue.qsize()
@@ -842,7 +866,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         record = dict(record)
         record["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        record["symbol"] = self.symbol  # v16.26: journal 按 symbol 隔离
+        record["symbol"] = self.symbol  # v16.26: journal ? symbol ??
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -893,7 +917,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             _, sm = self._calc_vps_add_qty()
             sizing_note = " | " + format_vps_sizing_note(sm, entry_type=et)
         logger.info(
-            f"📡 TV日志: {raw_action} R{self.regime} @ {self.tv_price:.2f} "
+            f"?? TV??: {raw_action} R{self.regime} @ {self.tv_price:.2f} "
             f"TP={self.tv_tps}"
             + sizing_note
             + (f" | pnl={payload.get('pnl_pct')}%" if payload.get("pnl_pct") is not None else "")
@@ -912,7 +936,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             reason=payload.get("reason", ""),
             vps_sizing_meta=open_sizing_meta,
         )
-        # P1 修复：并行 TG 通知（静默失败）
+        # P1 ????? TG ????????
         if raw_action in ("LONG", "SHORT") and self.tv_tps and self.tv_tps[0] > 0:
             self._call_telegram(
                 telegram_notify.report_position_opened,
@@ -942,7 +966,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         })
 
     def _load_active_tv_direction_from_journal(self):
-        """从 TV 日志末尾向前：跳过尾部 CLOSE，取当前活跃周期的 LONG/SHORT（按 symbol 隔离）"""
+        """? TV ??????????? CLOSE????????? LONG/SHORT?? symbol ???"""
         if not os.path.exists(TV_JOURNAL):
             return None
         entries = []
@@ -956,7 +980,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 except json.JSONDecodeError:
                     continue
         for entry in reversed(entries):
-            if entry.get("symbol") != self.symbol:  # v16.26: 按 symbol 隔离
+            if entry.get("symbol") != self.symbol:  # v16.26: ? symbol ??
                 continue
             if action.startswith("CLOSE"):
                 continue
@@ -968,7 +992,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return None
 
     def _collect_credible_tv_directions(self):
-        """可信 TV 方向集合：state 最新信号 > 日志末条 > 活跃周期"""
+        """?? TV ?????state ???? > ???? > ????"""
         sides = []
         seen = set()
 
@@ -990,11 +1014,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return sides
 
     def _live_aligns_with_credible_tv(self, live_side):
-        """人工同向开仓：任一可信 TV 信源与实盘一致 → 应接管，禁止误杀"""
+        """??????????? TV ??????? ? ????????"""
         return live_side in self._collect_credible_tv_directions()
 
     def _strict_tv_opposite_side(self, live_side):
-        """仅当「最新 TV 指令」与实盘明确反向时才强平（不用陈旧全量扫描）"""
+        """????? TV ????????????????????????"""
         for src in (self.last_tv_signal, self._load_last_journal_entry(TV_JOURNAL, self.symbol)):
             if not src:
                 continue
@@ -1007,7 +1031,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return None
 
     def _load_last_tv_open_signal(self):
-        """TV 日志中最近一条 LONG/SHORT（CLOSE 之后仍可用于方向对账，按 symbol 隔离）"""
+        """TV ??????? LONG/SHORT?CLOSE ???????????? symbol ???"""
         if not os.path.exists(TV_JOURNAL):
             return None
         last_open = None
@@ -1020,7 +1044,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if entry.get("symbol") != self.symbol:  # v16.26: 按 symbol 隔离
+                if entry.get("symbol") != self.symbol:  # v16.26: ? symbol ??
                     continue
                 action = (entry.get("action") or "").upper()
                 if action in ("LONG", "SHORT"):
@@ -1028,7 +1052,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return last_open
 
     def _resolve_tv_authoritative_side(self):
-        """TV 战略方向：优先最新信源，避免陈旧全量扫描误杀同向人工单"""
+        """TV ???????????????????????????"""
         if self.last_tv_signal:
             action = (self.last_tv_signal.get("action") or "").upper()
             if action in ("LONG", "SHORT"):
@@ -1074,8 +1098,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return None
 
     def _enforce_tv_direction_or_flat(self, pos, source="sentinel"):
-        """实盘与 TV 明确反向 → 核武全平；同向或信源不明 → 交给接管"""
-        # v16.23 修复：pos=None 时安全返回，防止上层调用链崩溃
+        """??? TV ???? ? ???????????? ? ????"""
+        # v16.23 ???pos=None ???????????????
         if pos is None:
             return False
         if not pos or self._safe_qty(pos.get("size")) <= 0:
@@ -1083,19 +1107,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         live_side = self._live_position_side(pos)
         if self._live_aligns_with_credible_tv(live_side):
             logger.info(
-                f"✅ [{source}] 实盘 {live_side} 与可信 TV 信源同向 → 跳过强平，进入接管"
+                f"? [{source}] ?? {live_side} ??? TV ???? ? ?????????"
             )
             return False
         tv_opposite = self._strict_tv_opposite_side(live_side)
         if not tv_opposite or not live_side:
             return False
         reason = (
-            f"人工反向手单 vs TV：实盘({live_side}) ≠ 最新TV({tv_opposite}) [{source}]"
+            f"?????? vs TV???({live_side}) ? ??TV({tv_opposite}) [{source}]"
         )
-        logger.error(f"🚨 {reason} → 核武全平强制对齐 TV")
+        logger.error(f"?? {reason} ? ???????? TV")
         verify_note = (
-            f"触发源: {source} | 最新TV {tv_opposite} | 实盘反向 {live_side} | "
-            "已核武全平，账本归零待命"
+            f"???: {source} | ??TV {tv_opposite} | ???? {live_side} | "
+            "????????????"
         )
         self._close_all(
             reason,
@@ -1105,7 +1129,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return True
 
     def _journal_tp_prices(self, entry):
-        """从日志条目解析 TP123（支持 tv_tps 列表或 tv_tp1/2/3 字段）"""
+        """??????? TP123??? tv_tps ??? tv_tp1/2/3 ???"""
         if not entry:
             return [0.0, 0.0, 0.0]
         if entry.get("tv_tps"):
@@ -1116,8 +1140,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _hydrate_tv_defense_context(self, pos):
         """
-        人工开仓 / 重启接管：从 TV 日志补全 tp/sl/regime/atr，避免字段缺失导致接管异常。
-        v16.27: 支持 pos=None 但 current_side/watched_entry 已设置的恢复场景。
+        ???? / ?????? TV ???? tp/sl/regime/atr??????????????
+        v16.27: ?? pos=None ? current_side/watched_entry ?????????
         """
         notes = []
         side = self.current_side
@@ -1152,7 +1176,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if not self._tp_prices_valid_for_side(side, entry):
             if tp_ok >= 3:
                 logger.warning(
-                    f"⚠️ 接管: 账本 TP{self.tv_tps} 与 {side}@{entry:.2f} 方向不符 → 重载"
+                    f"?? ??: ?? TP{self.tv_tps} ? {side}@{entry:.2f} ???? ? ??"
                 )
             self.tv_tps = [0.0, 0.0, 0.0]
             tp_ok = 0
@@ -1167,7 +1191,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     and self._tp_prices_valid_for_side(side, entry, tps)
                 ):
                     self.tv_tps = tps
-                    notes.append(f"补全TP123 {tps}")
+                    notes.append(f"??TP123 {tps}")
                     break
 
         if sum(1 for t in (self.tv_tps or []) if t > 0) < 3 and entry > 0 and self.current_atr > 0:
@@ -1179,14 +1203,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             ])
             if self._tp_prices_valid_for_side(side, entry, tps):
                 self.tv_tps = tps
-                notes.append(f"ATR本地补全TP {tps}")
+                notes.append(f"ATR????TP {tps}")
 
         if float(getattr(self, "tv_sl", 0) or 0) <= 0:
             for src in sources:
                 sl = float(src.get("tv_sl", 0) or 0)
                 if sl > 0:
                     self.tv_sl = sl
-                    notes.append(f"补全tv_sl={sl:.2f}")
+                    notes.append(f"??tv_sl={sl:.2f}")
                     break
 
         if float(getattr(self, "tv_sl", 0) or 0) <= 0 and entry > 0 and self.current_atr > 0:
@@ -1195,16 +1219,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.tv_sl = round(entry - self.current_atr * sl_m, 2)
             else:
                 self.tv_sl = round(entry + self.current_atr * sl_m, 2)
-            notes.append(f"ATR估算tv_sl={self.tv_sl:.2f}")
+            notes.append(f"ATR??tv_sl={self.tv_sl:.2f}")
 
         self.monitoring = True
         self._save_state()
         for n in notes:
-            logger.info(f"💧 接管上下文补全: {n}")
+            logger.info(f"?? ???????: {n}")
         return notes
 
     def _reset_fresh_takeover_state(self):
-        """人工/孤儿接管：清空陈旧 TP/雷达状态，避免误判已成交导致只挂 TP12"""
+        # Bug fix (2026-08-02): DO NOT clear tv_tps here.
+        # _hydrate_tv_defense_context needs the original values
+        # to decide whether re-hydration is needed.
         self.tp_levels_consumed = []
         self.shield_tiers_consumed = []
         self._radar_activation_notified = False
@@ -1271,11 +1297,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 continue
             tps = self._journal_tp_prices(src)
             if sum(1 for t in tps if t > 0) >= 3 and self._tp_prices_valid_for_side(side, entry, tps):
-                return tps, f"TV日志TP {tps}"
+                return tps, f"TV??TP {tps}"
         return None, ""
 
     def _ensure_tp123_prices_from_tv(self, entry):
-        """以实盘 entry + open_atr/regime 确保 TP123 三价齐全（人工开仓必跑）"""
+        """??? entry + open_atr/regime ?? TP123 ????????????"""
         side = self.current_side
         entry = float(entry or self.watched_entry or 0)
         if self._tp_prices_valid_for_side(side, entry):
@@ -1284,17 +1310,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         reloaded, note = self._reload_tv_tp_prices_from_sources(side, entry)
         if reloaded:
             self.tv_tps = reloaded
-            logger.info(f"📐 接管重载 TP123 @ entry={entry:.2f} → {self.tv_tps} ({note})")
+            logger.info(f"?? ???? TP123 @ entry={entry:.2f} ? {self.tv_tps} ({note})")
             self._save_state()
             return True
 
         if sum(1 for t in (self.tv_tps or []) if t > 0) >= 3:
             logger.warning(
-                f"⚠️ 陈旧 TP 价位与 {side} @ {entry:.2f} 方向不符 → 丢弃重算"
+                f"?? ?? TP ??? {side} @ {entry:.2f} ???? ? ????"
             )
             self.tv_tps = [0.0, 0.0, 0.0]
 
-        atr = float(getattr(self, "open_atr", None) or self.current_atr or 30)
+        atr = float(getattr(self, "open_atr", None) or self.current_atr or symbol_aware_atr_fallback(self.symbol))
         regime = int(getattr(self, "open_regime", None) or self.regime or 3)
         if not side or entry <= 0:
             return False
@@ -1304,11 +1330,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         ])
         ok = self._tp_prices_valid_for_side(side, entry)
         if ok:
-            logger.info(f"📐 人工接管 ATR 补全 TP123 @ entry={entry:.2f} → {self.tv_tps}")
+            logger.info(f"?? ???? ATR ?? TP123 @ entry={entry:.2f} ? {self.tv_tps}")
         return ok
 
     def _resolve_defense_stop_for_audit(self, radar_sl=None):
-        """审计用止损价：TP1 前仅 tv_sl；TP1 后雷达+tv_sl 合并"""
+        """???????TP1 ?? tv_sl?TP1 ???+tv_sl ??"""
         if radar_sl and float(radar_sl) > 0:
             return float(radar_sl)
         tracked = self._radar_sl_to_pass()
@@ -1318,9 +1344,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _normalize_tp_qty_map(self, qty_map, live_qty):
         """
-        规格 v1.0 §6.2 蚂蚁单处理 + §9.4 零头并入：
-        不足最小张数(MIN_TP_LEG_QTY)的非TP3档零头，全部并入TP3（雷达管理的70%仓位）。
-        不满足最小下单量的非TP3档直接市价平仓，不挂单。
+        ?? v1.0 ?6.2 ????? + ?9.4 ?????
+        ??????(MIN_TP_LEG_QTY)??TP3????????TP3??????70%????
+        ??????????TP3????????????
         """
         if not qty_map:
             return qty_map
@@ -1329,32 +1355,32 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if len(levels) <= 1:
             return qty_map
 
-        # 最后一档默认是 TP3（key=3），但健壮处理任何情况
+        # ??????? TP3?key=3???????????
         last_level = levels[-1]
 
         carry = 0
         out = dict(qty_map)
-        for lvl in levels[:-1]:  # TP1, TP2（不碰 TP3）
+        for lvl in levels[:-1]:  # TP1, TP2??? TP3?
             q = int(out.get(lvl, 0) or 0)
             if 0 < q < MIN_TP_LEG_QTY:
                 carry += q
-                out[lvl] = 0  # 不挂单，留给市价平仓
+                out[lvl] = 0  # ??????????
 
-        # 零头并入 TP3（雷达管理的 70%）
+        # ???? TP3?????? 70%?
         if carry > 0:
             out[last_level] = int(out.get(last_level, 0) or 0) + carry
 
-        # 总数不能超过实际持仓
+        # ??????????
         total = sum(int(out.get(l, 0) or 0) for l in levels)
         if total > live_qty:
             out[last_level] = max(int(out.get(last_level, 0) or 0) - (total - live_qty), 0)
 
         return out
 
-    def _ensure_full_defense_stack(self, live_qty, entry, curr_px, source="接管", manual_fresh=False,
+    def _ensure_full_defense_stack(self, live_qty, entry, curr_px, source="??", manual_fresh=False,
                                    recover_mode=False):
         """
-        全链防线：TP123 比例限价 + TV tv_sl 硬止损；TP1 成交前雷达待命（呼吸空间）。
+        ?????TP123 ???? + TV tv_sl ????TP1 ??????????????
         """
         notes = []
         live_qty = int(self._resolve_live_qty(live_qty) or live_qty)
@@ -1373,12 +1399,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self.initial_qty = trusted_initial
         self._sanitize_tp_consumed(trusted_initial, live_qty, curr_px)
         if not self._ensure_tp123_prices_from_tv(entry):
-            notes.append("TP123补全失败")
+            notes.append("TP123????")
         if float(getattr(self, "tv_sl", 0) or 0) <= 0:
             pos_ctx = {"side": self.current_side, "size": live_qty, "entry_price": entry}
             self._hydrate_tv_defense_context(pos_ctx)
         if float(getattr(self, "tv_sl", 0) or 0) <= 0 and entry > 0:
-            atr = float(getattr(self, "open_atr", None) or self.current_atr or 30)
+            atr = float(getattr(self, "open_atr", None) or self.current_atr or symbol_aware_atr_fallback(self.symbol))
             regime = int(getattr(self, "open_regime", None) or self.regime or 3)
             sl_m = {1: 0.9, 2: 1.05, 3: 1.10, 4: 1.25}.get(regime, 1.10)
             if self.current_side == "LONG":
@@ -1399,7 +1425,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if int(self.initial_qty or 0) <= live_qty:
                     self.initial_qty = live_qty
         except Exception as e:
-            logger.warning(f"接管档位限额跳过: {e}")
+            logger.warning(f"????????: {e}")
 
         tp_repair = {"repaired": False}
         try:
@@ -1409,8 +1435,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if tp_repair.get("repaired"):
                 notes.extend(tp_repair.get("actions") or [])
         except Exception as e:
-            logger.error(f"接管TP修复跳过: {e}")
-            notes.append(f"TP修复跳过:{e}")
+            logger.error(f"??TP????: {e}")
+            notes.append(f"TP????:{e}")
 
         self._refresh_radar_state_on_recover(curr_px, entry)
         radar_sl = self._radar_sl_to_pass() if self._tp1_filled_verified() else None
@@ -1437,8 +1463,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             stop_check and not self._has_trigger_sl_near(stop_check)
         ):
             logger.warning(
-                f"⚠️ [{source}] TP/止损未齐 ({audit.get('matched_full', 0)}/"
-                f"{audit.get('expected', 0)}) → 核武重挂 TP123+tv_sl"
+                f"?? [{source}] TP/???? ({audit.get('matched_full', 0)}/"
+                f"{audit.get('expected', 0)}) ? ???? TP123+tv_sl"
             )
             audit = self._nuclear_realign_tp(live_qty, entry, dynamic_sl=radar_sl, rounds=3)
             shield_ok = self._maintain_hard_shield(live_qty, curr_px, force=True)
@@ -1463,8 +1489,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             progress = self._radar_activation_progress(curr_px) if curr_px > 0 else 0.0
             gate = float(self._radar_activation_price() or 0)
             logger.info(
-                f"📡 [{source}] 雷达待命(等待价格到达阈值) 进度{progress:.0%} | "
-                f"阈值={gate:.2f} | tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | "
+                f"?? [{source}] ????(????????) ??{progress:.0%} | "
+                f"??={gate:.2f} | tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | "
                 f"TP {audit.get('matched_full', 0)}/{audit.get('expected', 0)}"
             )
 
@@ -1474,10 +1500,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             exp = audit.get("expected", 0)
             if exp and audit.get("matched_full", 0) < exp:
                 logger.warning(
-                    f"[钉钉已关闭] {source} · 止盈未完全对齐 | "
-                    f"{self.current_side} {live_qty}张 @ {entry:.2f} | "
-                    f"仅 {audit.get('matched_full', 0)}/{exp} 档 | "
-                    f"tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | 哨兵接力"
+                    f"[?????] {source} ? ??????? | "
+                    f"{self.current_side} {live_qty}? @ {entry:.2f} | "
+                    f"? {audit.get('matched_full', 0)}/{exp} ? | "
+                    f"tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | ????"
                 )
 
         self._post_recover_radar_pulse = True
@@ -1490,7 +1516,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         }
 
     def _smart_recover_defenses(self, real_amt, entry, dynamic_sl=None):
-        """重启智能补挂：审计齐全则跳过，缺档增量补，避免重复挂单"""
+        """???????????????????????????"""
         matched, pending, expected, rebuilt = self._ensure_defenses_on_recover(
             real_amt, entry, dynamic_sl=dynamic_sl,
         )
@@ -1504,7 +1530,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         }
 
     def _reconcile_context_on_recover(self, pos):
-        """重启对账：实盘头寸 vs 账本 vs 最新 TV / 开仓日志"""
+        """????????? vs ?? vs ?? TV / ????"""
         notes = []
         reconcile = {
             "notes": notes,
@@ -1528,21 +1554,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             tv_tp_count = sum(1 for t in tv_tps_saved if t > 0)
 
             tv_price_j = float(last_tv.get("price", 0) or 0)
-            # v16.27: 防止旧 journal 数据（跨 symbol 或方向背离）污染 ATR/regime。
-            # 要求 journal price 与实盘入场价的偏差在合理范围内（20%）。
+            # v16.27: ??? journal ???? symbol ???????? ATR/regime?
+            # ?? journal price ????????????????20%??
             price_contaminated = False
             if tv_price_j > 0 and entry > 0:
                 if side == "SHORT" and tv_price_j < entry * 0.8:
                     price_contaminated = True
-                    notes.append(f"⚠️ journal价格{tv_price_j:.2f}<入场80%={entry*0.8:.2f}，跳过ATR/regime覆盖")
+                    notes.append(f"?? journal??{tv_price_j:.2f}<??80%={entry*0.8:.2f}???ATR/regime??")
                 elif side == "LONG" and tv_price_j > entry * 1.2:
                     price_contaminated = True
-                    notes.append(f"⚠️ journal价格{tv_price_j:.2f}>入场120%={entry*1.2:.2f}，跳过ATR/regime覆盖")
-            # 若方向不符（BNB SHORT 但 journal 是 ETH LONG），也跳过 ATR/regime 覆盖
+                    notes.append(f"?? journal??{tv_price_j:.2f}>??120%={entry*1.2:.2f}???ATR/regime??")
+            # ??????BNB SHORT ? journal ? ETH LONG????? ATR/regime ??
             journal_side = (last_tv.get("action") or last_tv.get("side") or "").upper()
             if journal_side in ("LONG", "SHORT") and journal_side != side:
                 price_contaminated = True
-                notes.append(f"⚠️ journal方向{journal_side}≠实盘{side}，跳过ATR/regime覆盖")
+                notes.append(f"?? journal??{journal_side}???{side}???ATR/regime??")
 
             if not price_contaminated:
                 if last_tv.get("regime"):
@@ -1556,16 +1582,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.last_tv_side = tv_action
                 if tv_tp_count > 0 and not price_contaminated:
                     self.tv_tps = tv_tps_saved
-                    notes.append(f"TV日志同步止盈价 {self.tv_tps}")
+                    notes.append(f"TV??????? {self.tv_tps}")
                 if side != tv_action:
                     reconcile["direction_mismatch"] = True
                     notes.append(
-                        f"方向背离: 实盘{side} vs TV最新{tv_action} ({last_tv.get('ts', '')})"
+                        f"????: ??{side} vs TV??{tv_action} ({last_tv.get('ts', '')})"
                     )
             elif tv_action.startswith("CLOSE"):
                 reconcile["tv_close"] = True
                 notes.append(
-                    f"TV最新为{tv_action} ({last_tv.get('ts', '')})，实盘仍有仓 → 应清场"
+                    f"TV???{tv_action} ({last_tv.get('ts', '')})?????? ? ???"
                 )
                 if last_open_tv:
                     self.last_tv_side = (last_open_tv.get("action") or "").upper()
@@ -1573,24 +1599,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     if sum(1 for t in open_tps if t > 0) > 0:
                         self.tv_tps = open_tps
 
-        # v16.27: 若 journal 没有提供有效 ATR（被上面的污染检查跳过），
-        # 优先从 last_open_tv（开仓日志中的 TV 信号）恢复 ATR/regime
+        # v16.27: ? journal ?????? ATR?????????????
+        # ??? last_open_tv??????? TV ????? ATR/regime
         if float(self.current_atr or 0) <= 0 and last_open_tv:
             open_atr = float(last_open_tv.get("atr", 0) or 0)
             if open_atr > 0:
                 self.current_atr = open_atr
-                notes.append(f"💧 从开仓日志恢复ATR={open_atr:.2f}")
+                notes.append(f"?? ???????ATR={open_atr:.2f}")
             if last_open_tv.get("regime") and not self.regime:
                 self.regime = int(last_open_tv["regime"])
 
-        # v16.22：方向背离时，用 ATR fallback 重新计算反向 TV TPS 和 tv_sl
-        # 场景：TV 发 SHORT，但 state 里存的是 LONG 的 TP 价格 → TP 方向全反 → 全被拒 → TP=0
+        # v16.22???????? ATR fallback ?????? TV TPS ? tv_sl
+        # ???TV ? SHORT?? state ???? LONG ? TP ?? ? TP ???? ? ??? ? TP=0
         if side != self.last_tv_side and not reconcile.get("tv_close"):
             notes.append(
-                f"方向背离: 实盘{side} vs TV指令{self.last_tv_side} "
-                f"→ ATR重建 TP123 + tv_sl"
+                f"????: ??{side} vs TV??{self.last_tv_side} "
+                f"? ATR?? TP123 + tv_sl"
             )
-            atr = float(getattr(self, "open_atr", None) or self.current_atr or 30.0)
+            atr = float(getattr(self, "open_atr", None) or self.current_atr or symbol_aware_atr_fallback(self.symbol))
             regime = int(getattr(self, "open_regime", None) or self.regime or 3)
             entry_px = float(pos.get("entry_price", 0) or 0)
             if atr > 0 and entry_px > 0:
@@ -1603,14 +1629,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 ]
                 self.tv_tps = self._sanitize_tp_prices(new_tps)
                 self.last_tv_side = side
-                # 同步更新 tv_sl 方向
+                # ???? tv_sl ??
                 if side == "LONG":
                     self.tv_sl = round(entry_px - atr * 1.10, 2)
                 else:
                     self.tv_sl = round(entry_px + atr * 1.10, 2)
-                notes.append(f"ATR重建 TP123={self.tv_tps} tv_sl={self.tv_sl:.2f}")
+                notes.append(f"ATR?? TP123={self.tv_tps} tv_sl={self.tv_sl:.2f}")
                 logger.warning(
-                    f"🛡️ 方向背离 ATR 重建: {side} TP={self.tv_tps} SL={self.tv_sl:.2f} "
+                    f"??? ???? ATR ??: {side} TP={self.tv_tps} SL={self.tv_sl:.2f} "
                     f"| ATR={atr:.2f} R{regime} @ {entry_px:.2f}"
                 )
                 self._save_state()
@@ -1621,11 +1647,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if last_open:
             open_side = last_open.get("side")
             if open_side and side != open_side:
-                notes.append(f"开仓日志方向 {open_side} ≠ 实盘 {side}")
+                notes.append(f"?????? {open_side} ? ?? {side}")
             open_entry = float(last_open.get("entry", 0) or 0)
             entry = float(pos.get("entry_price", 0) or 0)
             if open_entry > 0 and abs(entry - open_entry) > 3.0:
-                notes.append(f"入场偏差: 开仓日志 {open_entry:.2f} vs 实盘 {entry:.2f}")
+                notes.append(f"????: ???? {open_entry:.2f} vs ?? {entry:.2f}")
 
         if saved_watched <= 0 and real_amt > 0:
             reconcile["manual_open"] = True
@@ -1634,7 +1660,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if int(getattr(self, "base_qty", 0) or 0) <= 0:
                 self.base_qty = int(real_amt)
             notes.append(
-                f"人工开仓(重启): 账本空仓 → 实盘 {real_amt}张 {side}，已接管为基准仓"
+                f"????(??): ???? ? ?? {real_amt}? {side}????????"
             )
         elif saved_watched > 0 and real_amt > 0:
             entry_px = float(pos.get("entry_price", 0) or 0)
@@ -1646,7 +1672,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.tp_levels_consumed = []
                 self.base_qty = int(real_amt)
                 notes.append(
-                    f"人工新开(入场偏差): 日志 {je:.2f} vs 实盘 {entry_px:.2f} → 重置 TP123"
+                    f"????(????): ?? {je:.2f} vs ?? {entry_px:.2f} ? ?? TP123"
                 )
             elif saved_initial > real_amt:
                 trusted = self._trusted_initial_qty(real_amt, entry_px)
@@ -1655,17 +1681,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self.initial_qty = real_amt
                     self.tp_levels_consumed = []
                     notes.append(
-                        f"人工/重置(重启): 陈旧 initial={saved_initial} > 现仓 {real_amt}张 "
-                        f"但无日志锚定 → 全链 TP123"
+                        f"??/??(??): ?? initial={saved_initial} > ?? {real_amt}? "
+                        f"?????? ? ?? TP123"
                     )
 
         if saved_watched > 0 and self._is_material_qty_change(saved_watched, real_amt):
             action_msg = (
-                "手动加仓" if real_amt > saved_watched
-                else "部分止盈吃单 / 手动减仓"
+                "????" if real_amt > saved_watched
+                else "?????? / ????"
             )
             reconcile["qty_manual_change"] = (saved_watched, real_amt, action_msg)
-            notes.append(f"人工异动(重启): {saved_watched}张 → {real_amt}张 ({action_msg})")
+            notes.append(f"????(??): {saved_watched}? ? {real_amt}? ({action_msg})")
 
         if not self.last_tv_side:
             if not reconcile["direction_mismatch"]:
@@ -1673,17 +1699,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         elif side != self.last_tv_side and not reconcile["tv_close"]:
             if self._live_aligns_with_credible_tv(side):
                 notes.append(
-                    f"陈旧TV方向{self.last_tv_side}与实盘{side}不一致，"
-                    f"但最新TV信源同向 → 以接管为准"
+                    f"??TV??{self.last_tv_side}???{side}????"
+                    f"???TV???? ? ?????"
                 )
                 self.last_tv_side = side
             else:
                 reconcile["direction_mismatch"] = True
-                if not any("方向背离" in n for n in notes):
-                    notes.append(f"方向背离: 实盘{side} vs TV指令{self.last_tv_side}")
+                if not any("????" in n for n in notes):
+                    notes.append(f"????: ??{side} vs TV??{self.last_tv_side}")
 
         for n in notes:
-            logger.warning(f"🔎 重启对账: {n}")
+            logger.warning(f"?? ????: {n}")
         return reconcile
 
     def _trusted_initial_qty(self, live_qty, entry=None):
@@ -1698,8 +1724,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 qty_tol = max(1, int(live_qty * 0.02)) if live_qty > 0 else 1
                 if live_qty > 0 and jq > live_qty + qty_tol:
                     logger.warning(
-                        f"📖 OPEN日志 {jq}张 @ {je:.2f} > 现仓 {live_qty}张 "
-                        f"→ 视作全新人工首仓，不用日志锚定"
+                        f"?? OPEN?? {jq}? @ {je:.2f} > ?? {live_qty}? "
+                        f"? ???????????????"
                     )
                     return live_qty
                 return jq
@@ -1714,15 +1740,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         saved = self._safe_qty(self.initial_qty)
         if saved > live_qty and trusted <= live_qty:
             logger.warning(
-                f"📖 丢弃陈旧 initial_qty={saved}张 → 锚定 {trusted}张 "
-                f"(现仓 {live_qty}张，无日志锚定减仓证据)"
+                f"?? ???? initial_qty={saved}? ? ?? {trusted}? "
+                f"(?? {live_qty}???????????)"
             )
             self.initial_qty = trusted
             self.tp_levels_consumed = []
             self._save_state()
         elif trusted > live_qty:
             logger.warning(
-                f"📖 开单量 {trusted}张 > 现仓 {live_qty}张 → 锚定现仓，清除伪 TP 标记"
+                f"?? ??? {trusted}? > ?? {live_qty}? ? ???????? TP ??"
             )
             self.initial_qty = live_qty
             self.tp_levels_consumed = []
@@ -1738,7 +1764,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return abs(new - old) / max(old, new, 1e-9)
 
     def _is_material_qty_change(self, old_qty, new_qty):
-        """离谱级异动：偏离 ≥10% 才触发对齐；微漂仅同步账本"""
+        """???????? ?10% ?????????????"""
         old = self._safe_qty(old_qty)
         new = self._safe_qty(new_qty)
         delta = abs(new - old)
@@ -1749,7 +1775,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     @staticmethod
     def _sanitize_tp_prices(tp_list):
-        """TV/状态文件里的浮点价统一规整到 2 位小数，避免 1517.4 触发 PriceNotOnTick"""
+        """TV/?????????????? 2 ?????? 1517.4 ?? PriceNotOnTick"""
         out = []
         for t in tp_list:
             try:
@@ -1814,25 +1840,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     "open_settled_qty": int(
                         getattr(self, "_open_settled_qty", 0) or 0
                     ),
-                    # 规格 v1.0 §3：永久硬止损冻结价
+                    # ?? v1.0 ?3?????????
                     "frozen_hard_sl_px": float(getattr(self, "frozen_hard_sl_px", 0) or 0),
-                    # 规格 v1.0 §5.0：提前保本检查点
+                    # ?? v1.0 ?5.0????????
                     "_early_be_checkpoint_done": bool(getattr(self, "_early_be_checkpoint_done", False)),
-                    # 规格 v1.0 §8-9：防御单幂等标签 + 退出所有权
+                    # ?? v1.0 ?8-9???????? + ?????
                     "exit_ownership": str(getattr(self, "exit_ownership", "NONE") or "NONE"),
                     "ownership_locked_at": float(getattr(self, "ownership_locked_at", 0) or 0),
                     "pending_order_tags": dict(getattr(self, "_pending_order_tags", {}) or {}),
                     "mutex_leg": str(getattr(self, "_mutex_leg", "") or ""),
                     "pipeline": self._pipeline_state_blob(),
-                    # 自动重入字段（v1.0 规格对齐）
+                    # ???????v1.0 ?????
                     "reentry_state": self._reentry_state_dict(),
                 }, f)
         except Exception as e:
-            logger.error(f"保存状态失败: {e}")
+            logger.error(f"??????: {e}")
 
     @staticmethod
     def _safe_qty(val, default=0):
-        """Deepcoin API 常返回 '1.000000' 字符串，须先 float 再 int"""
+        """Deepcoin API ??? '1.000000' ?????? float ? int"""
         if val is None or val == "":
             return default
         try:
@@ -1841,8 +1867,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return default
 
     def _get_active_position(self, prefer_ws=False):
-        # 限流重试：关键持仓查询增加重试，避免静默期返回None导致开仓失败
-        # prefer_ws参数保留兼容性但目前不实际使用WebSocket
+        # binance parity (ff01342): distinguish "confirmed flat" (return None,
+        # only when the exchange actually returned a well-formed empty
+        # position list) from "query failed after retries" (return the
+        # sentinel string "QUERY_FAILED"). Collapsing both into None violates
+        # spec 9/12 (a failed/timed-out query must never be read as "no
+        # position" -- it must be retried / block new actions instead).
         for attempt in range(5):
             try:
                 res = deepcoin_client.get_position_info(self.symbol)
@@ -1855,18 +1885,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                                 "posSide": p.get("posSide", "long").lower(),
                             }
                     return None
-                # API返回空数据也返回None
-                if res is not None:
-                    return None
+                # ?????? data ??? list ??????????????????
             except Exception as e:
-                logger.warning(f"[{self.symbol}] 获取持仓异常: {e}")
+                logger.warning(f"[{self.symbol}] ??????: {e}")
             if attempt < 4:
                 time.sleep(0.5 + attempt * 0.3)
-        return None
+        logger.error(f"[{self.symbol}] ??????5??????? QUERY_FAILED??????")
+        return "QUERY_FAILED"
 
     def _get_all_positions(self):
-        """获取所有方向的持仓（对冲模式下可能同时有多空持仓）"""
-        # 限流重试 + 静默期等待（防止限流导致查不到仓位拒绝开仓）
+        """?????????????????????????"""
+        # ???? + ??????????????????????
         for attempt in range(5):
             positions = []
             try:
@@ -1881,47 +1910,47 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                                 "posSide": p.get("posSide", "long").lower(),
                             })
                     return positions
-                # API返回空数据也返回空列表，不重试
+                # API???????????????
                 if res is not None:
                     return []
             except Exception as e:
-                logger.warning(f"[{self.symbol}] 获取持仓异常: {e}")
+                logger.warning(f"[{self.symbol}] ??????: {e}")
             if attempt < 4:
                 time.sleep(0.5 + attempt * 0.3)
         return []
 
     def _verify_flat(self):
-        """验证所有方向的持仓都已清空（对冲模式兼容）。
-        v16.19：采用先快后慢策略——WS 推送后几乎即时确认，不需要固定长等待。
+        """??????????????????????
+        v16.19???????????WS ???????????????????
         """
         for attempt in range(3):
             positions = self._get_all_positions()
             if len(positions) == 0:
                 return True
             if attempt < 2:
-                # v16.19: 0.3s→0.15s / 0.5s→0.25s（WS 时代快速轮询）
+                # v16.19: 0.3s?0.15s / 0.5s?0.25s?WS ???????
                 time.sleep(0.15 if attempt == 0 else 0.25)
         return len(positions) == 0
 
-    def _ensure_flat_before_open(self, reason_tag="开仓前"):
+    def _ensure_flat_before_open(self, reason_tag="???"):
         if self._wait_verify(self._verify_flat, retries=4, delay=0.4):
             return True
-        logger.warning(f"⚠️ {reason_tag}：检测到残留持仓，启动强制平仓")
-        if self._close_all(f"{reason_tag} · 强制清场", reset_state=True):
+        logger.warning(f"?? {reason_tag}???????????????")
+        if self._close_all(f"{reason_tag} ? ????", reset_state=True):
             return self._wait_verify(self._verify_flat, retries=6, delay=0.5)
         return False
 
     def _snapshot_sizing_principal(self, reason=""):
-        """全平/开仓前：锁定 USDT 合约本金余额，供本周期开仓与超标核查共用"""
+        """??/?????? USDT ????????????????????"""
         principal = deepcoin_client.get_principal_wallet_balance()
         if principal > 0:
             self.sizing_principal = principal
             self._save_state()
-            logger.info(f"📸 本金快照 {principal:.2f} USDT ({reason})")
-            if reason and ("全平" in reason or "开仓前" in reason):
+            logger.info(f"?? ???? {principal:.2f} USDT ({reason})")
+            if reason and ("??" in reason or "???" in reason):
                 target_qty = None
                 eff_risk = None
-                if "开仓前" in reason and self.tv_price > 0:
+                if "???" in reason and self.tv_price > 0:
                     t, meta = self._calc_vps_open_qty(self.tv_price)
                     target_qty = t
                     eff_risk = float(meta.get("effective_risk_pct", VPS_RISK_PCT) or VPS_RISK_PCT) / 100.0
@@ -1932,19 +1961,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     telegram_notify.report_principal_snapshot(
                         reason=reason,
                         principal=principal,
-                        regime=self.regime if "开仓前" in reason else None,
+                        regime=self.regime if "???" in reason else None,
                         margin_pct=eff_risk,
                         target_qty=target_qty,
                         leverage=EXCHANGE_LEVERAGE,
                         vps_sizing_meta=vps_meta,
                     )
                 except Exception as e:
-                    logger.warning(f"本金快照钉钉跳过: {e}")
+                    logger.warning(f"????????: {e}")
         return principal
 
     def _resolve_cap_sizing_base(self, wallet_balance=None):
         """
-        档位额度唯一基数：sizing_principal 快照；下单按 VPS 风险系数公式。
+        ?????????sizing_principal ?????? VPS ???????
         """
         wallet = float(
             wallet_balance if wallet_balance is not None
@@ -1958,7 +1987,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return wallet
 
     def _regime_cap_target_qty(self, curr_px, regime=None):
-        """VPS OPEN 公式 → 仓位上限（已废弃 margin% 口径）"""
+        """VPS OPEN ?? ? ???????? margin% ???"""
         regime = int(regime if regime is not None else self.regime)
         qty, meta = self._calc_vps_open_qty(curr_px, regime=regime)
         balance = float(meta.get("principal", 0) or self._resolve_cap_sizing_base())
@@ -1971,30 +2000,30 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         target = int(target_qty or 0)
         trim = int(trim_qty or 0)
         if live <= 0 or target <= 0:
-            return "数量无效，无法裁减"
+            return "?????????"
         if trim <= 0:
             return None
         retain = target / live if live > 0 else 0
         if retain < CAP_MIN_RETAIN_RATIO and live > target * 2:
             return (
-                f"目标仅相当于实盘的 {retain:.1%}，疑似误用「可用保证金」而非「本金快照」"
-                f"（目标 {target} 张 vs 实盘 {live} 张）"
+                f"????????? {retain:.1%}????????????????????"
+                f"??? {target} ? vs ?? {live} ??"
             )
         if trim > live * 0.85 and target < live * 0.15:
             return (
-                f"裁减幅度过大：将平掉 {trim} 张，仅保留 {target} 张，疑似额度基数算错"
+                f"?????????? {trim} ????? {target} ??????????"
             )
         expected = live - target
         if abs(trim - expected) > max(int(live * 0.05), 1):
-            return f"裁减量不符：计划 {trim} 张，应为 {expected} 张"
+            return f"???????? {trim} ???? {expected} ?"
         return None
 
     def _max_add_times_for_regime(self, regime=None):
-        """TV v6.9.93：加仓次数上限跟当前信号档位"""
+        """TV v6.9.93??????????????"""
         return get_regime_max_add_times(int(regime if regime is not None else self.regime or 3))
 
     def _apply_tv_sizing_params(self, payload):
-        """解析 entry_type：OPEN 由 VPS 自主 sizing；加仓用 TV qty_ratio × 首仓 base_qty"""
+        """?? entry_type?OPEN ? VPS ?? sizing???? TV qty_ratio ? ?? base_qty"""
         self.tv_entry_type = normalize_entry_type(payload.get("entry_type"))
         if self.tv_entry_type in (ENTRY_TYPE_PYRAMID, ENTRY_TYPE_PROFIT_ADD):
             self.tv_qty_ratio = resolve_tv_add_qty_ratio(
@@ -2007,10 +2036,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._save_state()
         max_add = self._max_add_times_for_regime()
         logger.info(
-            f"📐 TV参数: type={self.tv_entry_type} "
-            f"| VPS风险={VPS_RISK_PCT}% R{self.regime} "
-            f"| 加仓=base×{self.tv_qty_ratio:.2f}(TV) 最多{max_add}次 "
-            f"| 交易所={EXCHANGE_LEVERAGE}x"
+            f"?? TV??: type={self.tv_entry_type} "
+            f"| VPS??={VPS_RISK_PCT}% R{self.regime} "
+            f"| ??=base?{self.tv_qty_ratio:.2f}(TV) ??{max_add}? "
+            f"| ???={EXCHANGE_LEVERAGE}x"
         )
 
     def _calc_vps_open_qty(self, curr_px, regime=None):
@@ -2028,7 +2057,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return int(qty or 0), meta
 
     def _other_symbols_notional(self, exclude_symbol=None):
-        """账户其它品种名义敞口合计（不含本品种）。"""
+        """????????????????????"""
         exclude = str(exclude_symbol or self.symbol)
         by_sym, total = deepcoin_client.get_all_swap_position_notionals()
         other = 0.0
@@ -2039,7 +2068,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return round(other, 2), by_sym, total
 
     def _assert_notional_cap_or_reject(self, qty, price, sizing_meta=None):
-        """双品种硬顶：其它品种名义 + 本笔名义 ≤ equity×9。"""
+        """???????????? + ???? ? equity?9?"""
         equity = float(
             (sizing_meta or {}).get("principal")
             or self._resolve_cap_sizing_base()
@@ -2055,20 +2084,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         meta["symbol"] = self.symbol
         if ok:
             logger.info(
-                f"📐 敞口校验通过 {self.symbol}: 其它 {existing:.0f}U + 本笔 {new_notional:.0f}U "
-                f"= {meta['total_notional']:.0f}U ≤ 本金 {equity:.0f}U×{MAX_TOTAL_NOTIONAL_MULT:.0f}"
+                f"?? ?????? {self.symbol}: ?? {existing:.0f}U + ?? {new_notional:.0f}U "
+                f"= {meta['total_notional']:.0f}U ? ?? {equity:.0f}U?{MAX_TOTAL_NOTIONAL_MULT:.0f}"
             )
             return True, meta
         logger.error(
-            f"🚫 敞口硬顶拦截 {self.symbol}: 其它 {existing:.0f}U + 本笔 {new_notional:.0f}U "
-            f"= {meta['total_notional']:.0f}U > 上限 {meta['cap']:.0f}U "
-            f"(本金 {equity:.0f}U×{MAX_TOTAL_NOTIONAL_MULT:.0f}) | 盘口 {by_sym}"
+            f"?? ?????? {self.symbol}: ?? {existing:.0f}U + ?? {new_notional:.0f}U "
+            f"= {meta['total_notional']:.0f}U > ?? {meta['cap']:.0f}U "
+            f"(?? {equity:.0f}U?{MAX_TOTAL_NOTIONAL_MULT:.0f}) | ?? {by_sym}"
         )
         logger.warning(
-            f"[钉钉已关闭] 开仓拦截·名义敞口超限 [{self.symbol}] | "
-            f"本金 {equity:.0f}U · 上限 {meta['cap']:.0f}U ({MAX_TOTAL_NOTIONAL_MULT:.0f}x) | "
-            f"其它品种名义 {existing:.0f}U + 本笔 {new_notional:.0f}U = {meta['total_notional']:.0f}U | "
-            f"盘口名义 {by_sym}"
+            f"[?????] ??????????? [{self.symbol}] | "
+            f"?? {equity:.0f}U ? ?? {meta['cap']:.0f}U ({MAX_TOTAL_NOTIONAL_MULT:.0f}x) | "
+            f"?????? {existing:.0f}U + ?? {new_notional:.0f}U = {meta['total_notional']:.0f}U | "
+            f"???? {by_sym}"
         )
         return False, meta
 
@@ -2109,7 +2138,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         ) / 100.0
 
     def _regime_cap_tolerance(self, target_qty):
-        """档位裁减容忍：离谱才管 — 超标 ≤10% 不裁"""
+        """??????????? ? ?? ?10% ??"""
         target = int(target_qty or 0)
         if target <= 0:
             return REGIME_CAP_TOLERANCE_CONTRACTS
@@ -2125,15 +2154,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         excess = live_qty - int(target)
         if excess > REGIME_CAP_TOLERANCE_CONTRACTS and excess <= tol:
             logger.info(
-                f"📎 [档位限额] 微超 {live_qty} > {target} 张 "
-                f"(+{excess}, {excess / max(target, 1):.2%} ≤ {QTY_ALIGN_MIN_PCT:.0%} 容忍)，跳过裁减"
+                f"?? [????] ?? {live_qty} > {target} ? "
+                f"(+{excess}, {excess / max(target, 1):.2%} ? {QTY_ALIGN_MIN_PCT:.0%} ??)?????"
             )
         return live_qty > int(target) + tol, target, margin_pct, reg
 
-    def _trim_position_to_target(self, target_qty, action, reason_tag="叠仓Remediation"):
-        """叠仓Remediation：仅裁减 excess=实盘-目标，带安全校验"""
+    def _trim_position_to_target(self, target_qty, action, reason_tag="??Remediation"):
+        """??Remediation???? excess=??-????????"""
         target_qty = int(target_qty or 0)
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.error(f"?? {reason_tag} ??????? ? ?????? watched_qty={self.watched_qty}")
+            return self._safe_qty(self.watched_qty)
         real = self._safe_qty(pos.get("size")) if pos else 0
         if not pos or target_qty <= 0:
             return real
@@ -2143,17 +2175,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         trim_qty = real - target_qty
         plan_err = self._validate_cap_trim_plan(real, target_qty, trim_qty)
         if plan_err:
-            logger.error(f"✂️ {reason_tag} 中止: {plan_err} | live={real} target={target_qty}")
+            logger.error(f"?? {reason_tag} ??: {plan_err} | live={real} target={target_qty}")
             logger.warning(
-                f"[钉钉已关闭] 档位裁减已中止（安全保护）| "
-                f"场景：{reason_tag} | 实盘 {real}张 → 目标 {target_qty}张 | 原因：{plan_err}"
+                f"[?????] ?????????????| "
+                f"???{reason_tag} | ?? {real}? ? ?? {target_qty}? | ???{plan_err}"
             )
             return real
         close_side = "sell" if action == "LONG" else "buy"
         pos_side = "long" if action == "LONG" else "short"
         logger.warning(
-            f"✂️ {reason_tag}: 裁减 {trim_qty} 张 "
-            f"(实盘 {real} → 目标 {target_qty})"
+            f"?? {reason_tag}: ?? {trim_qty} ? "
+            f"(?? {real} ? ?? {target_qty})"
         )
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5)
@@ -2162,6 +2194,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         new_sz = real
         for _ in range(CAP_TRIM_MAX_ROUNDS):
             pos = self._get_active_position()
+            if pos == "QUERY_FAILED":
+                logger.error(f"?? {reason_tag} ??????????trim ??")
+                break
             if not pos:
                 break
             cur = self._safe_qty(pos.get("size"))
@@ -2175,11 +2210,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             res = deepcoin_client.place_market_order(
                 self.symbol, close_side, pos_side, slice_trim, reduce_only=True,
             )
-            # 根因修复：reduceOnly 失败绝不降级
+            # ?????reduceOnly ??????
             if deepcoin_client.is_reduce_only_rejected(res):
                 logger.warning(
-                    f"⚠️ 裁减 reduceOnly 拒绝 {close_side} {slice_trim}张 "
-                    f"→ force_rest 重查后重新计算裁减量"
+                    f"?? ?? reduceOnly ?? {close_side} {slice_trim}? "
+                    f"? force_rest ??????????"
                 )
                 time.sleep(0.5)
                 fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
@@ -2194,7 +2229,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         )
                         if deepcoin_client.is_reduce_only_rejected(retry_res):
                             logger.error(
-                                f"❌ 裁减重查后 reduceOnly 仍拒绝 {fp_side} {fpsz}张 → 跳过"
+                                f"? ????? reduceOnly ??? {fp_side} {fpsz}? ? ??"
                             )
                         time.sleep(0.5)
                 break
@@ -2204,25 +2239,28 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 retries=6,
                 delay=0.5,
             )
+            if verified == "QUERY_FAILED":
+                logger.error(f"?? {reason_tag} trim ??????????? ??")
+                break
             new_sz = self._safe_qty(verified.get("size")) if verified else cur
             if new_sz <= target_qty + cap_tol:
                 break
         if new_sz < target_qty * 0.5 and real > target_qty * 1.5:
             logger.warning(
-                f"[钉钉已关闭] 档位裁减过度 | "
-                f"目标 {target_qty}张，裁减后仅 {new_sz}张（原 {real}张）"
+                f"[?????] ?????? | "
+                f"?? {target_qty}?????? {new_sz}??? {real}??"
             )
         elif new_sz > target_qty * OPEN_OVERSIZE_RATIO:
             logger.warning(
-                f"[钉钉已关闭] 叠仓裁减未达标 | "
-                f"目标 {target_qty}张，裁减后仍 {new_sz}张"
+                f"[?????] ??????? | "
+                f"?? {target_qty}?????? {new_sz}?"
             )
         return new_sz
 
     def _radar_enforce_regime_cap(self, live_qty, curr_px, force=False):
         """
-        雷达最高权限：实盘超过 TV 档位保证金上限 → reduceOnly 裁减 → 重挂 TP123。
-        雷达移动止损位不变，仅补挂缺失 STOP。
+        ??????????? TV ??????? ? reduceOnly ?? ? ?? TP123?
+        ??????????????? STOP?
         """
         live_qty = self._safe_qty(live_qty)
         if live_qty <= 0 or not self.current_side:
@@ -2246,23 +2284,26 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             and now - getattr(self, "_last_regime_cap_ts", 0) < REGIME_CAP_COOLDOWN_SEC
         ):
             logger.info(
-                f"📡 [雷达档位限额] 超标 {live_qty}>{target} 张 但冷却中 "
-                f"(R{regime} VPS风险{margin_pct:.1%})"
+                f"?? [??????] ?? {live_qty}>{target} ? ???? "
+                f"(R{regime} VPS??{margin_pct:.1%})"
             )
             return None
 
         _, balance, margin_usdt, margin_pct, regime = self._regime_cap_target_qty(curr_px, regime)
         old_qty = live_qty
         logger.warning(
-            f"📡 [雷达档位限额] R{regime} VPS上限 {target} 张 "
-            f"(本金 {balance:.0f}U×VPS风险{margin_pct:.1%}×{self.leverage}x) | "
-            f"实盘 {live_qty} 张 超标 → 强制裁减"
+            f"?? [??????] R{regime} VPS?? {target} ? "
+            f"(?? {balance:.0f}U?VPS??{margin_pct:.1%}?{self.leverage}x) | "
+            f"?? {live_qty} ? ?? ? ????"
         )
 
         new_qty = self._trim_position_to_target(
-            target, self.current_side, reason_tag=f"雷达R{regime}档位限额",
+            target, self.current_side, reason_tag=f"??R{regime}????",
         )
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.warning(f"?? R{regime} trim ????????pos=QUERY_FAILED?????? watched_entry")
+            pos = None
         entry = float(pos["entry_price"]) if pos else self.watched_entry
         self.watched_qty = new_qty
         self.initial_qty = new_qty
@@ -2273,19 +2314,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         sl = self._radar_sl_to_pass()
         result = self._enforce_defense_alignment(
             new_qty, entry, dynamic_sl=sl,
-            reason=f"雷达档位限额 R{regime} 裁减后 TP 对齐", rounds=3,
+            reason=f"?????? R{regime} ??? TP ??", rounds=3,
         )
         if sl and not self._has_trigger_sl_near(sl):
             self._ensure_radar_sl(new_qty, sl)
 
         self._last_regime_cap_ts = now
         verify_note = (
-            f"VPS {balance:.2f}U × R{regime} 风险{margin_pct:.1%} × {self.leverage}x "
-            f"= 下单额 {margin_usdt:.0f}U → 上限 {target} 张 | "
-            f"裁减 {old_qty} → {new_qty} 张 | "
+            f"VPS {balance:.2f}U ? R{regime} ??{margin_pct:.1%} ? {self.leverage}x "
+            f"= ??? {margin_usdt:.0f}U ? ?? {target} ? | "
+            f"?? {old_qty} ? {new_qty} ? | "
             f"TP {result['matched']}/{result['expected']} | "
             f"{self._format_audit_summary(result['audit'])} | "
-            f"雷达SL={'已保留/已补' if sl else '待命'}"
+            f"??SL={'???/??' if sl else '??'}"
         )
         self._call_telegram_notify(
             telegram_notify.report_radar_regime_cap_trim,
@@ -2305,7 +2346,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return {"new_qty": new_qty, "target": target, "result": result}
 
     def _is_dust_qty(self, qty):
-        """深币最小 1 张；无主仓账本时的孤立 1 张视为蚂蚁仓"""
+        """???? 1 ??????????? 1 ??????"""
         q = self._safe_qty(qty)
         if q <= 0:
             return False
@@ -2313,7 +2354,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return q == DUST_ORPHAN_CONTRACTS and ref == 0
 
     def _should_finalize_tp_victory(self, real_amt):
-        """止盈网格已吃完、盘口无 TP 限价单，但可能残留张数 → 扫尾收网"""
+        """??????????? TP ??????????? ? ????"""
         real_amt = self._safe_qty(real_amt)
         if real_amt <= 0:
             return False
@@ -2337,42 +2378,45 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return pos
 
     def _report_flat_close(self, reason, swept_dust=False, close_meta=None, curr_px=0.0):
-        """平仓/止盈收网钉钉：REST 核查重试，与 Pine 四标签对齐"""
+        """??/???????REST ?????? Pine ?????"""
         meta = self._enrich_close_meta_live(close_meta, curr_px)
         flat = self._wait_verify(self._verify_flat, retries=6, delay=0.5)
-        base_note = "盘口无持仓 | 挂单已清空 | 智慧大脑复位待命"
+        base_note = "????? | ????? | ????????"
         if swept_dust:
-            base_note = f"蚂蚁仓已市价扫尾 | {base_note}"
+            base_note = f"???????? | {base_note}"
         if meta.get("pnl_pct") is not None:
-            base_note += f" | 盈亏 {self._safe_float(meta.get('pnl_pct')):+.2f}%"
+            base_note += f" | ?? {self._safe_float(meta.get('pnl_pct')):+.2f}%"
         if meta.get("side"):
-            base_note += f" | 方向 {meta.get('side')}"
+            base_note += f" | ?? {meta.get('side')}"
         if meta.get("entry_px") and float(meta.get("entry_px") or 0) > 0:
-            base_note += f" | 开仓 {float(meta['entry_px']):.2f}"
+            base_note += f" | ?? {float(meta['entry_px']):.2f}"
         if meta.get("closed_qty") and float(meta.get("closed_qty") or 0) > 0:
-            base_note += f" | 平仓 {float(meta['closed_qty']):.0f}张"
+            base_note += f" | ?? {float(meta['closed_qty']):.0f}?"
         if meta.get("live_exit_px") and float(meta.get("live_exit_px") or 0) > 0:
-            base_note += f" | 现价 {float(meta['live_exit_px']):.2f}"
+            base_note += f" | ?? {float(meta['live_exit_px']):.2f}"
         if meta.get("regime"):
-            base_note += f" | TV档位 R{int(meta.get('regime'))}"
+            base_note += f" | TV?? R{int(meta.get('regime'))}"
         if meta.get("atr") and float(meta.get("atr") or 0) > 0:
             base_note += f" | TV ATR {float(meta['atr']):.2f}"
         src_note = format_tv_field_sources(meta.get("field_sources") or {})
-        if src_note and "TV透传" not in src_note:
+        if src_note and "TV??" not in src_note:
             base_note += f" | {src_note}"
         if flat:
             verify_note = base_note
         else:
             pos = self._get_active_position()
+            if pos == "QUERY_FAILED":
+                logger.warning(f"?????????????? | ??????? | reason={reason}")
+                return
             residual = self._safe_qty(pos["size"]) if pos else 0
             if residual > 0 and not self._is_dust_qty(residual):
                 logger.warning(
-                    f"平仓钉钉跳过：空仓核查未通过 | 残留 {residual}张 | reason={reason}"
+                    f"?????????????? | ?? {residual}? | reason={reason}"
                 )
                 return
-            verify_note = f"{base_note} | REST 同步略延迟"
-            logger.info(f"平仓钉钉：REST 延迟，仍推送收网播报 | reason={reason}")
-        display_reason = meta.get("tv_reason") or reason or "仓位归零"
+            verify_note = f"{base_note} | REST ?????"
+            logger.info(f"?????REST ?????????? | reason={reason}")
+        display_reason = meta.get("tv_reason") or reason or "????"
         self._call_telegram_notify(
             telegram_notify.report_supervisor_close,
             reason=display_reason,
@@ -2392,7 +2436,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             closed_qty=meta.get("closed_qty"),
             live_exit_px=meta.get("live_exit_px"),
         )
-        # P1 修复：并行 TG 平仓通知
+        # P1 ????? TG ????
         from webhook_parser import close_type_display_label as _ctdl
         close_px = meta.get("live_exit_px") or meta.get("tv_price") or self.tv_price or 0
         self._call_telegram(
@@ -2406,20 +2450,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             pnl=meta.get("pnl_pct"),
             tier_label=getattr(self, "_last_tier_label", ""),
         )
-        # 自动重入评估（v1.0 规格对齐）
+        # ???????v1.0 ?????
         self._maybe_evaluate_smart_reentry(reason=reason, close_meta=meta, curr_px=curr_px)
 
     def _maybe_evaluate_smart_reentry(self, reason="", close_meta=None, curr_px=0.0):
         """
-        平仓后评估是否启动智能重入（v1.0 规格）。
+        ??????????????v1.0 ????
 
-        触发条件：
-        1. 非硬止损出局（hard_sl / vps_hard_sl）
-        2. 未超过最大重入次数（max=1）
-        3. TP1 未成交（tp1_ever_filled=False）
-        4. 当前趋势档位为强（adx_tier=2）
+        ?????
+        1. ???????hard_sl / vps_hard_sl?
+        2. ??????????max=1?
+        3. TP1 ????tp1_ever_filled=False?
+        4. ?????????adx_tier=2?
 
-        重入方式：限价挂单（雷达保本）
+        ???????????????
         """
         try:
             from smart_reentry_engine import evaluate_flat_for_reentry, open_reentry_window
@@ -2430,10 +2474,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if not reentry_enabled(self.symbol):
             return
 
-        # 硬止损出局 → 禁止重入
+        # ????? ? ????
         hard_sources = ("vps_hard_sl", "hard_sl", "VPS_HARD_SL")
         if reason and any(s in str(reason) for s in hard_sources):
-            logger.info(f"🚫 [{self.symbol}] 硬止损出局，禁止重入")
+            logger.info(f"?? [{self.symbol}] ??????????")
             self._clear_reentry_state()
             return
 
@@ -2444,12 +2488,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         atr = float(meta.get("atr") or getattr(self, "open_atr", 0) or 0)
         attempt = int(getattr(self, "reentry_attempt", 0) or 0)
 
-        # 检查 TP1 是否已成交
+        # ?? TP1 ?????
         tp1_filled = bool(getattr(self, "_tp1_filled_hint", False) or
                          getattr(self, "_ws_tp1_fill_hint", False) or
                          (1 in (getattr(self, "tp_levels_consumed", []) or [])))
 
-        # 检查 ADX 档位
+        # ?? ADX ??
         adx_tier = int(getattr(self, "adx_tier", 1) or 1)
 
         window_ts = open_reentry_window(self.symbol)
@@ -2470,15 +2514,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if not ok:
             logger.info(
-                f"🚫 [{self.symbol}] 不启动重入: {why} | "
+                f"?? [{self.symbol}] ?????: {why} | "
                 f"src={reason} exit={exit_px:.2f} attempt={attempt} "
                 f"tp1_filled={tp1_filled} tier={adx_tier}"
             )
             self._clear_reentry_state()
             return
 
-        # 无菌确认后启动重入
-        if self._ensure_sterile_for_reentry(reason="智能重入"):
+        # ?????????
+        if self._ensure_sterile_for_reentry(reason="????"):
             self._start_smart_reentry_limit(
                 side=side, entry=entry_px, exit_px=exit_px,
                 atr=atr, attempt=attempt, tp1_filled=tp1_filled,
@@ -2486,7 +2530,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
 
     def _clear_reentry_state(self):
-        """清空重入状态"""
+        """??????"""
         self.reentry_active = False
         self.reentry_limit_order_id = None
         self.reentry_limit_px = 0.0
@@ -2494,20 +2538,23 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.reentry_order_tag = None
 
     def _ensure_sterile_for_reentry(self, reason="") -> bool:
-        """确保仓位归零且无挂单"""
+        """??????????"""
         try:
             deepcoin_client.cancel_all_open_orders(self.symbol)
         except Exception:
             pass
         time.sleep(0.5)
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.error(f"?? [{self.symbol}] ??????????????????")
+            return False
         if not pos:
             return True
         qty = self._safe_qty(pos.get("size"))
         return qty <= 0
 
     def _start_smart_reentry_limit(self, side, entry, exit_px, atr, attempt, tp1_filled, adx_tier, reason=""):
-        """挂限价单启动重入"""
+        """????????"""
         try:
             from smart_reentry_engine import plan_reentry_limit
         except ImportError:
@@ -2518,7 +2565,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         pos_side = "long" if side_str == "LONG" else "short"
         tv_price = float(getattr(self, "cycle_tv_price", 0) or 0)
 
-        # 拉 K 线计算限价
+        # ? K ?????
         k5 = deepcoin_client.fetch_klines(self.symbol, interval="5m", limit=3) if hasattr(deepcoin_client, 'fetch_klines') else None
         k3 = deepcoin_client.fetch_klines(self.symbol, interval="3m", limit=3) if hasattr(deepcoin_client, 'fetch_klines') else None
 
@@ -2528,7 +2575,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         )
 
         if not plan:
-            logger.warning(f"🚫 [{self.symbol}] 重入限价中止: {why}")
+            logger.warning(f"?? [{self.symbol}] ??????: {why}")
             return False
 
         lim = float(plan["limit_px"])
@@ -2544,7 +2591,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         )
 
         if not order or not deepcoin_client._is_success(order):
-            logger.warning(f"⚠️ [{self.symbol}] 重入限价挂单失败")
+            logger.warning(f"?? [{self.symbol}] ????????")
             self.reentry_order_tag = None
             return False
 
@@ -2555,20 +2602,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.reentry_limit_deadline_ts = float(plan["deadline_ts"])
 
         logger.info(
-            f"📥 [{self.symbol}] 智能重入限价已挂 {side_str} {qty}@{lim:.2f} "
+            f"?? [{self.symbol}] ???????? {side_str} {qty}@{lim:.2f} "
             f"attempt={attempt} tag={tag}"
         )
 
         try:
             self._call_telegram_notify(
                 telegram_notify.report_system_alert,
-                title=f"智能重入限价已挂 [{self.symbol}]",
+                title=f"???????? [{self.symbol}]",
                 detail=(
                     f"{side_str} attempt={attempt} limit@{lim:.2f} "
                     f"TV@{tv_price:.2f} exit={reason}@{exit_px:.2f} "
                     f"tp1_filled={tp1_filled} tier={adx_tier}"
                 ),
-                level="提示",
+                level="??",
             )
         except Exception:
             pass
@@ -2577,30 +2624,30 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return True
 
     def _reentry_state_dict(self) -> dict:
-        """§8：从 RadarReentryMixin 继承完整的再入状态字典（含新字段）。"""
+        """?8?? RadarReentryMixin ??????????????????"""
         return RadarReentryMixin._reentry_state_dict(self)
 
     def _reentry_tick(self):
-        """重入订单 Tick：检查成交/TTL刷新"""
+        """???? Tick?????/TTL??"""
         if not getattr(self, "reentry_active", False):
             return
 
         pos = self._get_active_position()
-        if not pos:
+        if not pos or pos == "QUERY_FAILED":
             return
 
         qty = self._safe_qty(pos.get("size"))
         if qty > 0:
-            # 成交！启动新开仓流程
+            # ??????????
             self._on_reentry_filled(pos)
             return
 
-        # 检查 TTL
+        # ?? TTL
         now = time.time()
         deadline = float(getattr(self, "reentry_limit_deadline_ts", 0) or 0)
         if deadline > 0 and now >= deadline:
-            logger.info(f"⏰ [{self.symbol}] 重入限价 TTL 到期，重新挂单")
-            self._cancel_reentry_limit(reason="TTL刷新")
+            logger.info(f"? [{self.symbol}] ???? TTL ???????")
+            self._cancel_reentry_limit(reason="TTL??")
             side = str(getattr(self, "cycle_tv_side", "") or "").upper()
             self._start_smart_reentry_limit(
                 side=side,
@@ -2610,22 +2657,22 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 attempt=int(getattr(self, "reentry_attempt", 0) or 0),
                 tp1_filled=False,
                 adx_tier=int(getattr(self, "adx_tier", 1) or 1),
-                reason="TTL刷新",
+                reason="TTL??",
             )
 
     def _cancel_reentry_limit(self, reason=""):
-        """撤销重入限价单"""
+        """???????"""
         oid = getattr(self, "reentry_limit_order_id", None)
         if oid:
             try:
                 deepcoin_client.cancel_order(self.symbol, order_id=oid)
-                logger.info(f"🗑️ [{self.symbol}] 撤重入限价 id={oid} | {reason}")
+                logger.info(f"??? [{self.symbol}] ????? id={oid} | {reason}")
             except Exception as e:
-                logger.debug(f"撤单失败: {e}")
+                logger.debug(f"????: {e}")
         self._clear_reentry_state()
 
     def _on_reentry_filled(self, pos):
-        """重入订单成交处理"""
+        """????????"""
         side_str = str(pos.get("posSide", "") or "").lower()
         side = "LONG" if side_str == "long" else "SHORT"
         entry = float(pos.get("avgPx") or pos.get("entry_price", 0) or 0)
@@ -2634,14 +2681,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if entry <= 0 or qty <= 0:
             return
 
-        logger.info(f"✅ [{self.symbol}] 重入成交 {side} {qty}@{entry:.2f}")
+        logger.info(f"? [{self.symbol}] ???? {side} {qty}@{entry:.2f}")
 
-        # 更新 attempt
+        # ?? attempt
         prev_attempt = int(getattr(self, "reentry_attempt", 0) or 0)
         self.reentry_attempt = prev_attempt + 1
         self._clear_reentry_state()
 
-        # 恢复开仓状态
+        # ??????
         self.current_side = side
         self.watched_entry = entry
         self.watched_qty = qty
@@ -2649,24 +2696,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.monitoring = True
         self.tp_levels_consumed = []
 
-        # 挂硬止损 + TP12
+        # ???? + TP12
         try:
             self._arm_temp_stop_and_tp12_for_reentry(qty, entry, side)
         except Exception as e:
-            logger.error(f"[{self.symbol}] 重入后防线挂单失败: {e}")
+            logger.error(f"[{self.symbol}] ?????????: {e}")
 
         self._save_state()
 
     def _arm_temp_stop_and_tp12(self, live_qty, entry, side, source=""):
-        """Adapter: 统一雷达 mixin 的签名 → 内部已有 _arm_temp_stop_and_tp12_for_reentry。"""
+        """Adapter: ???? mixin ??? ? ???? _arm_temp_stop_and_tp12_for_reentry?"""
         return self._arm_temp_stop_and_tp12_for_reentry(live_qty, entry, side)
 
     def _resolve_atr_scenario_after_open(self, entry, side, live_qty):
-        """Mixin 兼容：空操作（Deepcoin ATR 已在开仓时锁定）。"""
+        """Mixin ???????Deepcoin ATR ?????????"""
         pass
 
     def _arm_temp_stop_and_tp12_for_reentry(self, qty, entry, side):
-        """重入成交后挂硬止损 + TP12"""
+        """????????? + TP12"""
         from breath_stop import initial_stop_price
 
         atr = float(getattr(self, "open_atr", 0) or 0)
@@ -2680,20 +2727,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.current_sl = init
         self.tv_sl = init
 
-        # 挂硬止损
+        # ????
         pos_side = "long" if side == "LONG" else "short"
         deepcoin_client.place_trigger_order(
             self.symbol, "sell" if side == "LONG" else "buy",
             pos_side, qty, init, order_type="market",
         )
 
-        # 挂 TP1/TP2 限价（规格 §3.5：TP1=10%，TP2=20%，剩余70%归雷达）
+        # ? TP1/TP2 ????? ?3.5?TP1=10%?TP2=20%???70%????
         LEG_TP_RATIOS_REENTRY = [0.10, 0.20]
         tps = list(getattr(self, "tv_tps", [0, 0, 0]) or [])
         if len(tps) >= 1 and tps[0] > 0:
             tp1 = tps[0]
             tp1_side = "sell" if side == "LONG" else "buy"
-            # 使用 floor 确保不超过 qty，1 张时 tp1=1, tp2=0
+            # ?? floor ????? qty?1 ?? tp1=1, tp2=0
             tp1_qty = max(1, int(qty * LEG_TP_RATIOS_REENTRY[0]))
             tp2_qty = max(0, int(qty * LEG_TP_RATIOS_REENTRY[1]))
             if qty == 1:
@@ -2709,33 +2756,33 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.symbol, tp2_side, pos_side, tp2, tp2_qty,
             )
 
-        logger.info(f"📌 [{self.symbol}] 重入防线已挂: 硬止损@{init:.2f} TP1/TP2")
+        logger.info(f"?? [{self.symbol}] ??????: ???@{init:.2f} TP1/TP2")
 
     def _sweep_dust_and_finalize(self, reason):
-        """哨兵检测：止盈后蚂蚁仓/无 TP 残张 → 撤单 + reduceOnly 扫尾 + 收网钉钉（对冲模式兼容）
-        ⚠️ 根因修复：reduceOnly 失败绝不降级 → 立即 force_rest 重查持仓后重试。
+        """???????????/? TP ?? ? ?? + reduceOnly ?? + ????????????
+        ?? ?????reduceOnly ?????? ? ?? force_rest ????????
         """
-        logger.warning(f"🐜 止盈扫尾：检测到残量，启动蚂蚁仓强平 → {reason}")
+        logger.warning(f"?? ?????????????????? ? {reason}")
         self.monitoring = False
         deepcoin_client.cancel_all_open_orders(self.symbol)
         time.sleep(0.4)
         for round_i in range(4):
-            # 获取所有方向的持仓
+            # ?????????
             all_positions = self._get_all_positions()
             if not all_positions:
                 break
             for pos in all_positions:
                 close_side = "sell" if pos["posSide"] == "long" else "buy"
                 live_sz = self._safe_qty(pos["size"])
-                logger.info(f"🐜 扫尾{round_i + 1}/4: {close_side} {live_sz}张 {pos['posSide']} reduceOnly")
+                logger.info(f"?? ??{round_i + 1}/4: {close_side} {live_sz}? {pos['posSide']} reduceOnly")
                 res = deepcoin_client.place_market_order(
                     self.symbol, close_side, pos["posSide"], live_sz, reduce_only=True,
                 )
-                # 根因修复：reduceOnly 失败绝不降级
+                # ?????reduceOnly ??????
                 if deepcoin_client.is_reduce_only_rejected(res):
                     logger.warning(
-                        f"⚠️ 蚂蚁仓 reduceOnly 拒绝 {close_side} {live_sz}张 "
-                        f"→ force_rest 重查持仓后再扫"
+                        f"?? ??? reduceOnly ?? {close_side} {live_sz}? "
+                        f"? force_rest ???????"
                     )
                     time.sleep(0.5)
                     fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
@@ -2750,7 +2797,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             )
                             if deepcoin_client.is_reduce_only_rejected(retry_res):
                                 logger.error(
-                                    f"❌ 蚂蚁仓重查后 reduceOnly 仍拒绝 {fp_side} {fpsz}张 → 残仓待下次"
+                                    f"? ?????? reduceOnly ??? {fp_side} {fpsz}? ? ?????"
                                 )
                             time.sleep(0.5)
                 time.sleep(0.5)
@@ -2765,7 +2812,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._shield_sltp_set_at = 0.0
         self._shield_cancelled_ids = set()
         self.current_side = None
-        # 规格 v1.0 §8-9：平仓时清空幂等标签 + 退出所有权
+        # ?? v1.0 ?8-9?????????? + ?????
         self.exit_ownership = "NONE"
         self.ownership_locked_at = 0.0
         self._pending_order_tags = {}
@@ -2775,14 +2822,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._report_flat_close(reason, swept_dust=True)
 
     def _apply_recover_live_alignment(self, side, reconcile):
-        """重启对账备注：TV 平仓日志不回放；方向背离由 _enforce_tv_direction_or_flat 核武处理"""
+        """???????TV ????????????? _enforce_tv_direction_or_flat ????"""
         extra_notes = []
         if reconcile.get("tv_close"):
             action = (self.last_tv_signal or {}).get("action", "CLOSE")
             msg = (
-                f"TV日志末条为 {action}，重启不回放平仓 → 以实盘 {side} 继续闪电接管"
+                f"TV????? {action}???????? ? ??? {side} ??????"
             )
-            logger.warning(f"🔄 [重启] {msg}")
+            logger.warning(f"?? [??] {msg}")
             extra_notes.append(msg)
             last_open_tv = self._load_last_tv_open_signal()
             if last_open_tv:
@@ -2793,15 +2840,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         elif reconcile.get("direction_mismatch"):
             tv_side = self._resolve_tv_authoritative_side()
             extra_notes.append(
-                f"方向背离: 实盘{side} vs TV{tv_side} → 已由核武全平强制对齐 TV"
+                f"????: ??{side} vs TV{tv_side} ? ?????????? TV"
             )
         elif not self.last_tv_side:
             self.last_tv_side = side
         return extra_notes
 
     def _scan_and_sweep_dust_on_startup(self, was_monitoring=False):
-        """重启首检：发现蚂蚁仓/止盈残张 → 扫尾收网，避免误接管为正常持仓"""
+        """??????????/???? ? ???????????????"""
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.error("?? [????] ??????????? ? ???????")
+            return False
         if not pos or self._safe_qty(pos.get("size")) <= 0:
             return False
         if not self.current_side:
@@ -2813,31 +2863,34 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 DUST_ORPHAN_CONTRACTS, int(ref * TP_COMPLETE_RESIDUAL_RATIO)
             ):
                 logger.info(
-                    f"🔄 [重启扫描] 活跃主仓 {real_amt}张 (ref={ref})，跳过蚂蚁扫尾"
+                    f"?? [????] ???? {real_amt}? (ref={ref})???????"
                 )
                 return False
         if not self._is_dust_qty(real_amt) and not self._should_finalize_tp_victory(real_amt):
             return False
         if self._safe_qty(self.initial_qty) > 0 or self._safe_qty(self.watched_qty) > 0:
-            reason = "仓位归零 (止盈吃单 / 人工全平 / TV 强制平仓)"
+            reason = "???? (???? / ???? / TV ????)"
         else:
-            reason = "重启扫描：盘口蚂蚁仓自动扫平"
+            reason = "??????????????"
         logger.warning(
-            f"🐜 [重启扫描] {self.current_side} 残量 {real_amt}张 "
-            f"(initial={self.initial_qty}, watched={self.watched_qty}) → 扫尾强平"
+            f"?? [????] {self.current_side} ?? {real_amt}? "
+            f"(initial={self.initial_qty}, watched={self.watched_qty}) ? ????"
         )
         self._sweep_dust_and_finalize(reason)
-        # 规格 §9.4：扫尾后必须验证持仓归零，防止蚂蚁单残留
+        # ?? ?9.4????????????????????
         flat = self._wait_verify(self._verify_flat, retries=4, delay=0.5)
         if not flat:
             logger.warning(
-                f"🐜 [重启扫描] 扫尾后验证未通过，请人工核查 {self.symbol} 盘口"
+                f"?? [????] ?????????????? {self.symbol} ??"
             )
         return True
 
     def _recover_missed_flat_on_startup(self, was_monitoring=False):
-        """重启对账：服务宕机期间已全平，但账本仍有仓 → 补发收网钉钉"""
+        """????????????????????? ? ??????"""
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.warning("?? [????] ??????????????????")
+            return False
         if pos and self._safe_qty(pos.get("size")) > 0:
             return False
 
@@ -2866,13 +2919,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             delay=STARTUP_FLAT_CONFIRM_DELAY_SEC,
         ):
             logger.info(
-                "📭 [重启对账] 首次无仓但多次复核仍有持仓 → 跳过误补发收网"
+                "?? [????] ????????????? ? ???????"
             )
             return False
 
         logger.warning(
-            f"📭 [重启对账] 账本/日志曾有仓 (watched={prev_watched}, side={prev_side}, "
-            f"monitoring={was_monitoring}) 但盘口已全平 → 补发收网播报"
+            f"?? [????] ??/????? (watched={prev_watched}, side={prev_side}, "
+            f"monitoring={was_monitoring}) ?????? ? ??????"
         )
         deepcoin_client.cancel_all_open_orders(self.symbol)
         self.monitoring = False
@@ -2881,8 +2934,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.base_qty = 0
         self.add_count = 0
         self.current_side = None
-        # v16.27: 全量清空防守上下文，防止陈旧数据（tv_sl/tv_tps/journal）
-        # 在下次重启时重新污染当前品种的 ATR/regime/tp/sl。
+        # v16.27: ?????????????????tv_sl/tv_tps/journal?
+        # ??????????????? ATR/regime/tp/sl?
         self.last_tv_signal = None
         self.last_tv_side = None
         self.tv_sl = 0.0
@@ -2900,13 +2953,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._save_state()
 
         verify_note = (
-            f"重启对账补发 | 原账本 {prev_watched}张 {prev_side or ''} | "
-            f"盘口无持仓 | 挂单已清空 | 智慧大脑复位待命"
+            f"?????? | ??? {prev_watched}? {prev_side or ''} | "
+            f"????? | ????? | ????????"
         )
-        recover_meta = self._infer_flat_close_meta(hint_reason="重启对账补发收网")
+        recover_meta = self._infer_flat_close_meta(hint_reason="????????")
         self._call_telegram_notify(
             telegram_notify.report_supervisor_close,
-            reason=recover_meta.get("tv_reason", "仓位归零 (重启对账补发)"),
+            reason=recover_meta.get("tv_reason", "???? (??????)"),
             verify_note=verify_note,
             verified=True,
             swept_dust=False,
@@ -2924,6 +2977,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _verify_position(self, expected_side=None):
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.warning("?? [????] _verify_position ??????? ? ???????")
+            return None
         if not pos or self._safe_qty(pos.get("size")) <= 0:
             return None
         side = "LONG" if pos["posSide"] == "long" else "SHORT"
@@ -2984,7 +3040,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         initial_qty = self._safe_qty(initial_qty)
         ratios = self.regime_settings[self._tp_split_regime()]["ratios"]
         o1, o2, o3 = self._calculate_tp_quantities(initial_qty, ratios)
-        # v13.81：只返回 TP1+TP2 限价切片；TP3 量留给雷达
+        # v13.81???? TP1+TP2 ?????TP3 ?????
         return [
             {"level": 1, "price": self.tv_tps[0], "qty": o1},
             {"level": 2, "price": self.tv_tps[1], "qty": o2},
@@ -3002,8 +3058,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _infer_tp_consumed_sequential(self, initial_qty, live_qty, curr_px=0.0):
         """
-        顺序推断已成交 TP。硬约束防 R4 TP1=5% 误判：
-        限价仍在盘口 → 未成交；减仓 <2% 噪声忽略；TP1 须价到区域。
+        ??????? TP????? R4 TP1=5% ???
+        ?????? ? ?????? <2% ?????TP1 ??????
         """
         initial_qty = self._safe_qty(initial_qty)
         live_qty = self._safe_qty(live_qty)
@@ -3053,30 +3109,30 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if initial_qty <= live_qty and saved and not inferred:
             logger.warning(
-                f"⚠️ 无减仓但 tp_levels_consumed={saved} → 清空（避免漏挂 TP1）"
+                f"?? ???? tp_levels_consumed={saved} ? ??????? TP1?"
             )
             saved = []
         elif initial_qty <= live_qty and saved and inferred and saved != inferred:
             logger.info(
-                f"🎯 无减仓以推断为准: TP{saved} → TP{inferred or '无'}"
+                f"?? ????????: TP{saved} ? TP{inferred or '?'}"
             )
             saved = inferred
 
         if len(saved) >= 3 and live_qty > DUST_ORPHAN_CONTRACTS:
             logger.warning(
-                f"⚠️ tp_levels_consumed={saved} 但仍有 {live_qty} 张 → "
-                f"按开单 {initial_qty} 张重算为 TP{inferred or '无'}"
+                f"?? tp_levels_consumed={saved} ??? {live_qty} ? ? "
+                f"??? {initial_qty} ???? TP{inferred or '?'}"
             )
             saved = inferred
         elif inferred and (not saved or len(inferred) < len(saved)):
             if saved != inferred:
                 logger.info(
-                    f"🎯 已成交档修正: TP{saved or '无'} → TP{inferred} "
-                    f"(开单 {initial_qty} → 现仓 {live_qty}张)"
+                    f"?? ??????: TP{saved or '?'} ? TP{inferred} "
+                    f"(?? {initial_qty} ? ?? {live_qty}?)"
                 )
             saved = inferred
         elif saved and inferred and saved != inferred:
-            logger.info(f"🎯 已成交档以减仓为准: TP{saved} → TP{inferred}")
+            logger.info(f"?? ?????????: TP{saved} ? TP{inferred}")
             saved = inferred
 
         if saved != list(getattr(self, "tp_levels_consumed", []) or []):
@@ -3093,8 +3149,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _split_remaining_tp_quantities(self, live_qty, ratios=None):
         """
-        TP1+TP2 各保证至少1张（剩余数量足够时），剩余按比例分配。
-        TP3 永不挂限价（由雷达管理），接收所有剩余。
+        TP1+TP2 ?????1???????????????????
+        TP3 ????????????????????
         """
         live_qty = self._safe_qty(live_qty)
         ratios = ratios or self.regime_settings[self._tp_split_regime()]["ratios"]
@@ -3103,12 +3159,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if not remaining or live_qty <= 0:
             return {}
 
-        # 仅剩一档（通常是TP3），全给该档
+        # ????????TP3??????
         if len(remaining) == 1:
             return {remaining[0] + 1: live_qty}
 
-        # TP1+TP2 各保底1张，剩余给TP3
-        # 如果live_qty不足2张，则全给TP1，TP2=0
+        # TP1+TP2 ???1?????TP3
+        # ??live_qty??2?????TP1?TP2=0
         if live_qty < 2:
             out = {1: live_qty}
             if 2 in remaining:
@@ -3117,15 +3173,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 out[3] = 0
             return out
 
-        # 使用 floor() 确保总量不超过 live_qty
+        # ?? floor() ??????? live_qty
         tp1_qty = max(1, int(math.floor(live_qty * ratios[0])))
-        tp2_qty = max(1, int(math.floor(live_qty * ratios[1])))
-        # 确保 tp1 + tp2 不超过 live_qty，必要时压缩
+        tp2_qty = max(1, int(math.ceil(live_qty * ratios[1])))
+        # ?? tp1 + tp2 ??? live_qty??????
         if tp1_qty + tp2_qty > live_qty:
-            # 优先保证 TP1，TP2 压缩到最小
+            # ???? TP1?TP2 ?????
             tp1_qty = max(1, live_qty - 1)
             tp2_qty = max(0, live_qty - tp1_qty)
-        # 剩余给 TP3（雷达管理，不挂限价）
+        # ??? TP3???????????
         tp3_qty = max(0, live_qty - tp1_qty - tp2_qty)
 
         out = {}
@@ -3144,7 +3200,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         qty_map = self._split_remaining_tp_quantities(live_qty)
         qty_map = self._normalize_tp_qty_map(qty_map, live_qty)
         levels = []
-        for level in (1, 2):  # v13.81: TP3 永不挂限价
+        for level in (1, 2):  # v13.81: TP3 ?????
             if level in consumed:
                 continue
             price = self.tv_tps[level - 1]
@@ -3152,10 +3208,44 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             levels.append({"level": level, "qty": qty, "price": price})
         return levels
 
-    def _audit_tp_levels(self, live_qty, tolerance=1.0):
-        """严格审计：每档价位唯一 + 张数符合 regime 比例 + 无孤儿单"""
+    def _audit_tp_levels(self, live_qty, tolerance=0.1):
+        """??????????? + ???? regime ?? + ????"""
         live_qty = self._resolve_live_qty(live_qty)
         orders = self._collect_tp_limit_orders()
+        # binance parity (eb0dc4c): a transient pending-orders query failure
+        # must not be read as "0 orders on the book" -- that manufactures a
+        # false "all levels missing / severe" audit result, which under
+        # binance's history triggered a cancel-place loop roughly every 70s
+        # during API propagation delay / IP rate-limit windows. Callers that
+        # gate on audit severity must check this flag before escalating.
+        query_failed = not getattr(deepcoin_client, "_last_pending_orders_query_ok", True)
+        # binance parity (26d5c65): a *successful* query that comes back
+        # empty can still be stale (propagation lag) rather than genuinely
+        # confirming every TP order vanished. If we aligned successfully
+        # recently and the position/expected-TP-count says orders should
+        # exist, treat an empty result the same as a failed query instead of
+        # "all missing" -- prevents cancel/re-place cycling off a lagged read.
+        expected_now = self._expected_tp_count()
+        if (
+            not orders and not query_failed
+            and self._safe_qty(live_qty) > 0 and expected_now > 0
+            and (time.time() - float(getattr(self, "_last_defense_align_ok_ts", 0) or 0)) < 1800.0
+        ):
+            logger.warning(
+                f"[{self.symbol}] TP query empty but recently aligned -> "
+                f"treat as unreadable, skip cancel/replace this cycle"
+            )
+            return {
+                "matched_full": 0,
+                "expected": expected_now,
+                "levels": [],
+                "issues": ["orders_unreadable"],
+                "orphans": [],
+                "pending_prices": [],
+                "live_qty": live_qty,
+                "query_failed": True,
+                "orders_unreadable": True,
+            }
         levels = []
         matched_full = 0
         issues = []
@@ -3168,16 +3258,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             actual_qty = 0
             if len(at_px) == 0:
                 status = "missing"
-                issues.append(f"TP{lv['level']} @{lv['price']:.2f} 缺失")
+                issues.append(f"TP{lv['level']} @{lv['price']:.2f} ??")
             elif len(at_px) > 1:
                 status = "duplicate"
                 actual_qty = sum(o["qty"] for o in at_px)
-                issues.append(f"TP{lv['level']} @{lv['price']:.2f} 重复 {len(at_px)} 张")
+                issues.append(f"TP{lv['level']} @{lv['price']:.2f} ?? {len(at_px)} ?")
             elif at_px[0]["qty"] != lv["qty"]:
                 status = "qty_mismatch"
                 actual_qty = at_px[0]["qty"]
                 issues.append(
-                    f"TP{lv['level']} {actual_qty}张 ≠ 期望 {lv['qty']}张 "
+                    f"TP{lv['level']} {actual_qty}? ? ?? {lv['qty']}? "
                     f"({self.regime_settings[self._tp_split_regime()]['ratios']})"
                 )
             else:
@@ -3191,7 +3281,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if not any(abs(o["price"] - p) <= tolerance for p in expected_prices)
         ]
         for o in orphans:
-            issues.append(f"孤儿止盈 @{o['price']:.2f} {o['qty']}张")
+            issues.append(f"???? @{o['price']:.2f} {o['qty']}?")
 
         expected = self._expected_tp_count()
         pending_prices = sorted({o["price"] for o in orders})
@@ -3203,6 +3293,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             "orphans": orphans,
             "pending_prices": pending_prices,
             "live_qty": live_qty,
+            "query_failed": query_failed,
         }
 
     def _format_audit_summary(self, audit):
@@ -3210,24 +3301,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         for lv in audit.get("levels", []):
             if lv["price"] <= 0:
                 continue
-            icon = "✅" if lv["status"] == "ok" else "❌"
-            line = f"{icon}TP{lv['level']} {lv['qty']}张@{lv['price']:.2f}"
+            icon = "?" if lv["status"] == "ok" else "?"
+            line = f"{icon}TP{lv['level']} {lv['qty']}?@{lv['price']:.2f}"
             if lv["status"] != "ok":
                 line += f"({lv['status']})"
             parts.append(line)
 
-        # 规格 v1.0：tv_tps 全零时说明 TP 价格未初始化（TV 信号缺字段 / 重启恢复失败）
+        # ?? v1.0?tv_tps ????? TP ???????TV ????? / ???????
         if not parts:
             tv_tps = getattr(self, "tv_tps", None) or []
             if all((float(t or 0) <= 0) for t in tv_tps):
-                parts.append("⚠️ TP价格未初始化（tv_tps=全零）")
+                parts.append("?? TP???????tv_tps=???")
             else:
-                # 规格 §6.2：TP1/TP2 零头并入 TP3（雷达管理），这是正常状态不是错误
-                parts.append("ℹ️ TP1/TP2零头已并入TP3（雷达管理）")
+                # ?? ?6.2?TP1/TP2 ???? TP3?????????????????
+                parts.append("?? TP1/TP2?????TP3??????")
 
         if audit.get("issues"):
-            parts.append("问题:" + "; ".join(audit["issues"][:3]))
-        return " | ".join(parts) if parts else "无有效 TP"
+            parts.append("??:" + "; ".join(audit["issues"][:3]))
+        return " | ".join(parts) if parts else "??? TP"
 
     def _count_matched_tp_orders(self, tp_pxs, tolerance=1.0, live_qty=None):
         if live_qty is not None and live_qty > 0:
@@ -3276,7 +3367,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         live_qty = self._resolve_live_qty(live_qty)
         audit = self._audit_tp_levels(live_qty, tolerance)
         if self._defense_needs_immediate_fix(audit):
-            logger.warning("补挂跳过：检测到重复/缺失/偏差，改走核武对齐")
+            logger.warning("??????????/??/?????????")
             return 0
         close_side = "sell" if self.current_side == "LONG" else "buy"
         pos_side = "long" if self.current_side == "LONG" else "short"
@@ -3289,36 +3380,36 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             orders = self._collect_tp_limit_orders()
             at_px = [o for o in orders if abs(o["price"] - px) <= tolerance]
             if len(at_px) == 1 and at_px[0]["qty"] == q:
-                logger.info(f"  ✓ TP{lv['level']} @ {px:.2f} 已存在 {at_px[0]['qty']}张，跳过")
+                logger.info(f"  ? TP{lv['level']} @ {px:.2f} ??? {at_px[0]['qty']}????")
                 continue
-            # 【紧急修复】撤销前确认交易所侧有该订单
+            # ???????????????????
             for o in at_px:
                 if o.get("orderId"):
                     deepcoin_client.cancel_order(self.symbol, ord_id=o["orderId"])
                     time.sleep(0.25)
-            # 撤销后再次确认交易所侧没有该价格的订单，防止重复挂单
+            # ??????????????????????????
             time.sleep(0.3)
             orders_after = self._collect_tp_limit_orders()
             at_px_after = [o for o in orders_after if abs(o.get("px", o.get("price", 0)) - px) <= tolerance]
             if at_px_after:
-                logger.warning(f"  ⚠️ 撤销后仍有 TP@{px:.2f}，跳过本次挂单")
+                logger.warning(f"  ?? ????? TP@{px:.2f}???????")
                 continue
-            # v16.18：补挂安全上限检查（防止重复挂50个单）
+            # v16.18???????????????50???
             allowed, guard_reason = self._check_tp_place_guard(lv["level"])
             if not allowed:
                 logger.warning(
-                    f"  ⛔ 补挂跳过：TP{lv['level']}@{px:.2f} | {guard_reason} | "
-                    f"累计{getattr(self, '_tp_place_guard_count', 0)}/{RECOVER_TP_PLACE_GUARD_MAX}"
+                    f"  ? ?????TP{lv['level']}@{px:.2f} | {guard_reason} | "
+                    f"??{getattr(self, '_tp_place_guard_count', 0)}/{RECOVER_TP_PLACE_GUARD_MAX}"
                 )
                 continue
-            logger.info(f"  + 补挂 TP{lv['level']} @ {px:.2f} qty={q}张")
+            logger.info(f"  + ?? TP{lv['level']} @ {px:.2f} qty={q}?")
             res = deepcoin_client.place_limit_order(
                 self.symbol, close_side, pos_side, px, q, reduce_only=True,
             )
-            # 根因修复：reduceOnly 失败 → 重查持仓修正数量
+            # ?????reduceOnly ?? ? ????????
             if deepcoin_client.is_reduce_only_rejected(res):
                 logger.warning(
-                    f"⚠️ 补挂 TP{lv['level']} reduceOnly 拒绝 → force_rest 重查持仓"
+                    f"?? ?? TP{lv['level']} reduceOnly ?? ? force_rest ????"
                 )
                 time.sleep(0.3)
                 fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
@@ -3341,46 +3432,46 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _cancel_orphan_tp_orders(self, live_qty, tolerance=1.0):
         """
-        v16.22：增强方向一致性检查——只撤与 current_side 反向的孤儿 TP。
-        防止场景：TV 反转信号未到，但系统尝试按错误方向挂 TP，
-        交易所拒绝后被误判为孤儿撤掉，导致 TP 全为零。
+        v16.22??????????????? current_side ????? TP?
+        ?????TV ?????????????????? TP?
+        ????????????????? TP ????
         """
         audit = self._audit_tp_levels(live_qty, tolerance)
         cancelled = 0
         for o in audit["orphans"]:
-            # v16.21：跳过已确认正常的档位（防止恢复期间反复撤单）
-            # 场景：tv_tps 更新后旧档位成"孤儿"，但恢复记忆确认其仍有效
+            # v16.21???????????????????????
+            # ???tv_tps ???????"??"????????????
             if getattr(self, "_recover_confirmed_levels", None):
                 confirmed_levels = list((self._recover_confirmed_levels or {}).keys())
                 if confirmed_levels:
                     logger.info(
-                        f"🛡️ Recovery跳过孤儿撤单：已确认档位 {confirmed_levels}，"
-                        f"保留 @{o['price']:.2f} {o['qty']}张"
+                        f"??? Recovery???????????? {confirmed_levels}?"
+                        f"?? @{o['price']:.2f} {o['qty']}?"
                     )
                     continue
-            # v16.22：方向一致性检查——只撤与 current_side 反向的孤儿 TP
-            # 场景：TV 反转 SHORT 刚发，但系统仍认为 LONG → TP 按 LONG 挂被拒 → 不应撤
+            # v16.22????????????? current_side ????? TP
+            # ???TV ?? SHORT ????????? LONG ? TP ? LONG ??? ? ???
             if not self._is_tp_order_directionally_valid(o):
                 logger.info(
-                    f"🛡️ 孤儿撤单跳过（方向不一致）：@{o['price']:.2f} {o['qty']}张 "
-                    f"方向可能与 current_side={self.current_side} 冲突，保留待核实"
+                    f"??? ??????????????@{o['price']:.2f} {o['qty']}? "
+                    f"????? current_side={self.current_side} ????????"
                 )
                 continue
             if o.get("orderId"):
                 deepcoin_client.cancel_order(self.symbol, ord_id=o["orderId"])
                 cancelled += 1
-                self._decrement_tp_place_guard("撤孤儿单")
+                self._decrement_tp_place_guard("????")
                 time.sleep(0.2)
         if cancelled:
-            logger.info(f"🧹 撤销 {cancelled} 张孤儿止盈单")
+            logger.info(f"?? ?? {cancelled} ??????")
         return cancelled
 
     def _is_tp_order_directionally_valid(self, order):
         """
-        v16.22：检查 TP 订单方向是否与 current_side 一致。
-        - LONG 持仓：止盈应该是 sell（卖出，平多）
-        - SHORT 持仓：止盈应该是 buy（买入，平空）
-        - side 未知时跳过检查（返回 True）
+        v16.22??? TP ??????? current_side ???
+        - LONG ???????? sell???????
+        - SHORT ???????? buy???????
+        - side ?????????? True?
         """
         if not self.current_side or self.current_side not in ("LONG", "SHORT"):
             return True
@@ -3400,10 +3491,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _surgical_repair_tp_defenses(self, live_qty, entry, tolerance=1.0):
         """
-        重启智能修复：读实盘 → 去重 → 补缺/纠偏，避免核武毁掉正确盘口。
-        v16.22 增强：
-        - 入参阶段：先验证现有 TP 订单方向是否与 current_side 一致，不一致则跳过撤单
-        - 入参阶段：跳过已确认的档位，避免重复操作
+        ?????????? ? ?? ? ??/??????????????
+        v16.22 ???
+        - ?????????? TP ??????? current_side ???????????
+        - ????????????????????
         """
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0:
@@ -3414,26 +3505,26 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         actions = 0
         audit = self._audit_tp_levels(live_qty, tolerance)
 
-        # v16.22 入参阶段方向验证：验证现有 TP 订单方向是否与 current_side 一致
+        # v16.22 ????????????? TP ??????? current_side ??
         for o in audit.get("levels", []):
             if o.get("status") in ("ok", "qty_mismatch") and o.get("price", 0) > 0:
                 existing_orders = self._collect_tp_limit_orders()
                 at_px = [ord for ord in existing_orders if abs(ord.get("price", 0) - o["price"]) <= tolerance]
                 if at_px and not self._is_tp_order_directionally_valid(at_px[0]):
                     logger.warning(
-                        f"🛡️ [_surgical] 方向不一致跳过：TP{o['level']}@{o['price']:.2f} "
-                        f"side={at_px[0].get('side')} 与 current_side={self.current_side} 冲突，保留待核实"
+                        f"??? [_surgical] ????????TP{o['level']}@{o['price']:.2f} "
+                        f"side={at_px[0].get('side')} ? current_side={self.current_side} ????????"
                     )
                     continue
                 if at_px:
                     self._mark_tp_level_confirmed(o["level"])
 
-        # 【核武循环修复】：取消孤儿单后，必须清理陈旧未完成标签。
-        # 场景：_surgical_repair 尝试补缺时因旧孤儿单 cancel 报错而跳过某些档，
-        # 核武第二轮 _scorched_earth 撤掉刚补上的 TP 后，
-        # _rebuild_defenses 会因陈旧标签阻止重挂 → TP 消失 → 核武循环。
-        # 清理策略：只清 "acked" 标签（有 order_id 证明已成功挂出，
-        # 但标签未被正确清理的陈旧记录）。
+        # ????????????????????????????
+        # ???_surgical_repair ?????????? cancel ?????????
+        # ????? _scorched_earth ?????? TP ??
+        # _rebuild_defenses ?????????? ? TP ?? ? ?????
+        # ??????? "acked" ???? order_id ????????
+        # ????????????????
         self._gc_stale_pending_defense_tags(save=True)
         time.sleep(0.2)
 
@@ -3460,12 +3551,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         continue
                     deepcoin_client.cancel_order(self.symbol, ord_id=o["orderId"])
                     actions += 1
-                    # v16.21 guard 扣减：去重撤单同样消耗安全预算
-                    self._decrement_tp_place_guard("去重撤单")
+                    # v16.21 guard ???????????????
+                    self._decrement_tp_place_guard("????")
                     time.sleep(0.2)
                 logger.info(
-                    f"🔧 重启去重 TP{lv['level']} @{price:.2f}："
-                    f"撤 {len(at_px) - 1} 留 {keep['qty']} 张"
+                    f"?? ???? TP{lv['level']} @{price:.2f}?"
+                    f"? {len(at_px) - 1} ? {keep['qty']} ?"
                 )
                 time.sleep(0.35)
                 at_px = [keep]
@@ -3474,24 +3565,24 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if at_px[0]["qty"] != target_q:
                     deepcoin_client.cancel_order(self.symbol, ord_id=at_px[0]["orderId"])
                     actions += 1
-                    # v16.21 guard 扣减：纠偏撤单同样消耗安全预算
-                    self._decrement_tp_place_guard("纠偏撤单")
+                    # v16.21 guard ???????????????
+                    self._decrement_tp_place_guard("????")
                     time.sleep(0.3)
-                    # v16.18 纠偏前安全上限检查
+                    # v16.18 ?????????
                     allowed, guard_reason = self._check_tp_place_guard(lv["level"])
                     if not allowed:
                         logger.warning(
-                            f"  ⛔ 纠偏跳过：TP{lv['level']}@{price:.2f} | {guard_reason}"
+                            f"  ? ?????TP{lv['level']}@{price:.2f} | {guard_reason}"
                         )
                     else:
                         res = deepcoin_client.place_limit_order(
                             self.symbol, close_side, pos_side, price, target_q,
                             reduce_only=True,
                         )
-                        # 根因修复：reduceOnly 失败 → 重查持仓修正数量
+                        # ?????reduceOnly ?? ? ????????
                         if deepcoin_client.is_reduce_only_rejected(res):
                             logger.warning(
-                                f"⚠️ 纠偏 TP{lv['level']} reduceOnly 拒绝 → force_rest 重查"
+                                f"?? ?? TP{lv['level']} reduceOnly ?? ? force_rest ??"
                             )
                             time.sleep(0.3)
                             fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
@@ -3510,25 +3601,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             actions += 1
                             self._increment_tp_place_guard()
                             logger.info(
-                                f"🔧 重启纠偏 TP{lv['level']} @{price:.2f} → {target_q} 张"
+                                f"?? ???? TP{lv['level']} @{price:.2f} ? {target_q} ?"
                             )
                     time.sleep(0.35)
                 continue
 
-            # v16.18 补缺前安全上限检查
+            # v16.18 ?????????
             allowed, guard_reason = self._check_tp_place_guard(lv["level"])
             if not allowed:
                 logger.warning(
-                    f"  ⛔ 补缺跳过：TP{lv['level']}@{price:.2f} | {guard_reason}"
+                    f"  ? ?????TP{lv['level']}@{price:.2f} | {guard_reason}"
                 )
                 continue
             res = deepcoin_client.place_limit_order(
                 self.symbol, close_side, pos_side, price, target_q, reduce_only=True,
             )
-            # 根因修复：reduceOnly 失败 → 重查持仓修正数量
+            # ?????reduceOnly ?? ? ????????
             if deepcoin_client.is_reduce_only_rejected(res):
                 logger.warning(
-                    f"⚠️ 补缺 TP{lv['level']} reduceOnly 拒绝 → force_rest 重查"
+                    f"?? ?? TP{lv['level']} reduceOnly ?? ? force_rest ??"
                 )
                 time.sleep(0.3)
                 fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
@@ -3546,12 +3637,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if res and deepcoin_client._is_success(res):
                 actions += 1
                 self._increment_tp_place_guard()
-                # v16.21：补缺成功后标记为已确认，防止后续恢复流程误撤
+                # v16.21???????????????????????
                 self._mark_tp_level_confirmed(lv["level"])
-                logger.info(f"🔧 重启补挂 TP{lv['level']} @{price:.2f} qty={target_q} 张")
+                logger.info(f"?? ???? TP{lv['level']} @{price:.2f} qty={target_q} ?")
             time.sleep(0.35)
 
-        # v16.21：对已在位的正确档位也标记确认（防止后续轮次误撤）
+        # v16.21?????????????????????????
         for lv in self._expected_tp_levels(live_qty):
             price = lv["price"]
             at_px = [
@@ -3564,87 +3655,87 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         final = self._audit_tp_levels(live_qty, tolerance)
         if actions:
             logger.info(
-                f"🔧 重启智能修复完成 {actions} 步 | "
+                f"?? ???????? {actions} ? | "
                 f"{final['matched_full']}/{final['expected']} | "
                 f"{self._format_audit_summary(final)}"
             )
         return final, actions
 
     # ============================================================
-    # v16.18：TP 恢复安全增强
+    # v16.18?TP ??????
     # ============================================================
 
     def _reset_tp_place_guard(self):
-        """重置 TP 补挂次数计数器（新会话/新持仓周期）"""
+        """?? TP ???????????/??????"""
         self._tp_place_guard_count = 0
         self._tp_place_guard_session_ts = time.time()
 
-    # ── v16.21：Recovery 记忆机制，防止反复撤单 ─────────────────────
+    # ?? v16.21?Recovery ??????????? ?????????????????????
     def _mark_tp_level_confirmed(self, level):
-        """标记某档位 TP 已确认正常（重启恢复期间）"""
+        """????? TP ?????????????"""
         self._recover_confirmed_levels = getattr(self, "_recover_confirmed_levels", {}) or {}
         self._recover_confirmed_levels[int(level)] = time.time()
-        logger.info(f"🛡️ Recovery记忆：TP{int(level)} 已确认正常，跳过后续撤单")
+        logger.info(f"??? Recovery???TP{int(level)} ????????????")
 
     def _is_tp_level_confirmed(self, level):
-        """检查某档位 TP 是否已在恢复期间确认正常"""
+        """????? TP ????????????"""
         confirmed = getattr(self, "_recover_confirmed_levels", None) or {}
         return int(level) in confirmed
 
     def _clear_recover_confirmed_levels(self):
-        """清除恢复确认记忆（新持仓周期）"""
+        """???????????????"""
         if getattr(self, "_recover_confirmed_levels", None):
             self._recover_confirmed_levels = {}
-            logger.info("🛡️ Recovery记忆已清除（新持仓周期）")
+            logger.info("??? Recovery????????????")
 
     def _check_tp_place_guard(self, level=0):
         """
-        检查 TP 补挂是否超过安全上限。
-        返回 (allowed, reason)：allowed=True = 可以继续挂；False = 禁止挂。
-        v16.21：guard 耗尽时自动重置，防止整个会话永久失去 TP 补挂能力。
+        ?? TP ???????????
+        ?? (allowed, reason)?allowed=True = ??????False = ????
+        v16.21?guard ?????????????????? TP ?????
         """
         now = time.time()
-        # 每5分钟重置一次计数器（新周期）
+        # ?5??????????????
         if now - self._tp_place_guard_session_ts > 300:
             self._reset_tp_place_guard()
-            logger.info("🛡️ TP补挂 Guard 周期重置（新5分钟窗口）")
+            logger.info("??? TP?? Guard ??????5?????")
 
         count = getattr(self, "_tp_place_guard_count", 0) or 0
         max_allowed = RECOVER_TP_PLACE_GUARD_MAX
         if count >= max_allowed:
             logger.warning(
-                f"🛡️ TP补挂安全拦截：已补 {count} 次 >= {max_allowed} 上限，"
-                f"禁止本次补挂（level={level}）| 请人工核查"
+                f"??? TP????????? {count} ? >= {max_allowed} ???"
+                f"???????level={level}?| ?????"
             )
             return False, f"guard_limit:{count}>={max_allowed}"
         return True, ""
 
     def _increment_tp_place_guard(self):
-        """记录一次 TP 补挂操作"""
+        """???? TP ????"""
         self._tp_place_guard_count = (getattr(self, "_tp_place_guard_count", 0) or 0) + 1
         logger.info(
-            f"🛡️ TP补挂计数 +1 → {self._tp_place_guard_count}/{RECOVER_TP_PLACE_GUARD_MAX}"
+            f"??? TP???? +1 ? {self._tp_place_guard_count}/{RECOVER_TP_PLACE_GUARD_MAX}"
         )
 
     def _decrement_tp_place_guard(self, reason=""):
         """
-        v16.21：撤销/取消 TP 时同样消耗安全预算，防止反复撤单耗尽挂单预算。
-        guard 降到 0 后，_check_tp_place_guard 允许补挂（重置计数器），
-        避免因 guard 耗尽导致整个会话都无法挂单。
+        v16.21???/?? TP ???????????????????????
+        guard ?? 0 ??_check_tp_place_guard ????????????
+        ??? guard ??????????????
         """
         current = getattr(self, "_tp_place_guard_count", 0) or 0
         if current <= 0:
             return
         self._tp_place_guard_count = current - 1
         logger.info(
-            f"🛡️ TP补挂计数 -1 → {self._tp_place_guard_count}/{RECOVER_TP_PLACE_GUARD_MAX}"
+            f"??? TP???? -1 ? {self._tp_place_guard_count}/{RECOVER_TP_PLACE_GUARD_MAX}"
             + (f" ({reason})" if reason else "")
         )
 
     def _verify_tp_order_on_exchange(self, level, price, tolerance=1.0):
         """
-        直接查交易所，确认指定档位 TP 是否存在。
-        返回 (exists, actual_orders)。
+        ????????????? TP ?????
+        ?? (exists, actual_orders)?
         """
         price = round(float(price), 2)
         all_orders = list(deepcoin_client.get_pending_orders(self.symbol))
@@ -3664,14 +3755,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _verify_live_tp_completeness(self, live_qty, initial_qty=None):
         """
-        v16.18 核心对账：比较 live_qty 与 expected_qty，推断哪些 TP 被成交。
+        v16.18 ??????? live_qty ? expected_qty????? TP ????
 
-        策略：
-        1. 用当前档位 TP 比例 + live_qty 反推 expected_initial
-        2. 用 saved_initial（如果提供）做交叉验证
-        3. 推断已成交 TP 档位集合
+        ???
+        1. ????? TP ?? + live_qty ?? expected_initial
+        2. ? saved_initial???????????
+        3. ????? TP ????
 
-        返回 {
+        ?? {
             "live_qty": float,
             "inferred_initial": float or None,
             "inferred_consumed": list[int],
@@ -3684,14 +3775,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         regime = self._tp_split_regime()
         ratios = self.regime_settings[regime]["ratios"]
 
-        # 计算各档理论张数
+        # ????????
         initial_guess = initial_qty if initial_qty and initial_qty > 0 else live_qty
         tp1_qty_theory = self._calculate_tp_quantities(initial_guess, ratios)[0]
         tp2_qty_theory = self._calculate_tp_quantities(initial_guess, ratios)[1]
 
-        # 反推：如果只有 TP2 成交（TP1 未挂/未成交），expected_live_qty = initial - tp2
-        # 如果 TP1 成交，expected_live_qty = initial - tp1
-        # 两种场景都计算
+        # ??????? TP2 ???TP1 ??/?????expected_live_qty = initial - tp2
+        # ?? TP1 ???expected_live_qty = initial - tp1
+        # ???????
         scenarios = {}
         for consumed_pattern, label in [
             ([], "none"),
@@ -3710,7 +3801,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 "label": label,
             }
 
-        # 找最接近 initial_qty 的场景
+        # ???? initial_qty ???
         saved_initial = self._safe_qty(
             initial_qty if initial_qty and initial_qty > 0 else getattr(self, "initial_qty", 0)
         )
@@ -3726,13 +3817,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         inferred_consumed = (best or scenarios["none"])["consumed"]
         inferred_initial = (best or scenarios["none"])["inferred_initial"]
 
-        # 计算偏差百分比
+        # ???????
         if saved_initial > 0:
             discrepancy_pct = abs(inferred_initial - saved_initial) / saved_initial
         else:
             discrepancy_pct = abs(inferred_initial - live_qty) / max(live_qty, 1)
 
-        # 置信度评估
+        # ?????
         if discrepancy_pct <= 0.03:
             confidence = "high"
         elif discrepancy_pct <= RECOVER_TP_CONSERVATIVE_THRESHOLD:
@@ -3747,10 +3838,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         )
 
         logger.info(
-            f"📊 [TP对账] live={live_qty} | saved_init={saved_initial} | "
-            f"inferred_init={inferred_initial:.1f} | 偏差={discrepancy_pct:.1%} | "
-            f"推断已成交={inferred_consumed} | 置信={confidence} | "
-            f"保守模式={'是' if needs_conservative else '否'}"
+            f"?? [TP??] live={live_qty} | saved_init={saved_initial} | "
+            f"inferred_init={inferred_initial:.1f} | ??={discrepancy_pct:.1%} | "
+            f"?????={inferred_consumed} | ??={confidence} | "
+            f"????={'?' if needs_conservative else '?'}"
         )
 
         return {
@@ -3766,11 +3857,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _conservative_tp_recover(self, live_qty, entry, dynamic_sl=None, rounds=1):
         """
-        v16.18 保守 TP 恢复模式：
-        - 不信任本地 tp_levels_consumed（可能过时）
-        - 直接读取交易所 TP 挂单，验证哪些档位实际存在
-        - 只补挂交易所确认缺失的档位
-        - 限制补挂次数防止重复
+        v16.18 ?? TP ?????
+        - ????? tp_levels_consumed??????
+        - ??????? TP ?????????????
+        - ?????????????
+        - ??????????
         """
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0:
@@ -3779,7 +3870,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         close_side = "sell" if self.current_side == "LONG" else "buy"
         pos_side = "long" if self.current_side == "LONG" else "short"
 
-        # 重置会话计数（新持仓周期）
+        # ?????????????
         if not getattr(self, "_tp_place_guard_session_ts", 0) or \
            time.time() - self._tp_place_guard_session_ts > 300:
             self._reset_tp_place_guard()
@@ -3794,50 +3885,50 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if price <= 0 or target_q <= 0:
                 continue
 
-            # Step 1: 直接查交易所验证该档是否存在
+            # Step 1: ??????????????
             exists, exchange_orders = self._verify_tp_order_on_exchange(level, price)
             if exists:
                 logger.info(
-                    f"  ✓ [保守] TP{level} @{price:.2f} 交易所确认存在 "
-                    f"({len(exchange_orders)} 单)，跳过"
+                    f"  ? [??] TP{level} @{price:.2f} ??????? "
+                    f"({len(exchange_orders)} ?)???"
                 )
                 results["skipped"] += 1
                 results["levels"].append({"level": level, "price": price, "status": "exists_exchange"})
                 continue
 
-            # Step 2: 检查补挂安全上限
+            # Step 2: ????????
             allowed, guard_reason = self._check_tp_place_guard(level)
             if not allowed:
                 logger.warning(
-                    f"  ⛔ [保守] TP{level} @{price:.2f} 交易所缺失但补挂被安全拦截 | {guard_reason}"
+                    f"  ? [??] TP{level} @{price:.2f} ????????????? | {guard_reason}"
                 )
                 results["guarded"] += 1
                 results["levels"].append({"level": level, "price": price, "status": "guarded"})
                 continue
 
-            # Step 3: 验证交易所侧确实没有（双重确认）
+            # Step 3: ????????????????
             time.sleep(RECOVER_TP_VERIFY_DELAY_SEC)
             exists2, _ = self._verify_tp_order_on_exchange(level, price)
             if exists2:
                 logger.info(
-                    f"  ✓ [保守] TP{level} @{price:.2f} 双重验证确认存在，跳过"
+                    f"  ? [??] TP{level} @{price:.2f} ???????????"
                 )
                 results["skipped"] += 1
                 results["levels"].append({"level": level, "price": price, "status": "exists_double_check"})
                 continue
 
-            # Step 4: 补挂
+            # Step 4: ??
             logger.info(
-                f"  + [保守] TP{level} @{price:.2f} qty={target_q}张 "
-                f"（交易所确认缺失，尝试补挂）"
+                f"  + [??] TP{level} @{price:.2f} qty={target_q}? "
+                f"??????????????"
             )
             res = deepcoin_client.place_limit_order(
                 self.symbol, close_side, pos_side, price, target_q, reduce_only=True,
             )
-            # 根因修复：reduceOnly 失败 → 重查持仓修正数量
+            # ?????reduceOnly ?? ? ????????
             if deepcoin_client.is_reduce_only_rejected(res):
                 logger.warning(
-                    f"⚠️ [保守] TP{level} reduceOnly 拒绝 → force_rest 重查持仓"
+                    f"?? [??] TP{level} reduceOnly ?? ? force_rest ????"
                 )
                 time.sleep(0.3)
                 fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
@@ -3856,23 +3947,23 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._increment_tp_place_guard()
                 results["placed"] += 1
                 results["levels"].append({"level": level, "price": price, "status": "placed"})
-                logger.info(f"  ✅ [保守] TP{level} 补挂成功")
+                logger.info(f"  ? [??] TP{level} ????")
             else:
                 results["levels"].append({"level": level, "price": price, "status": "failed"})
-                logger.warning(f"  ❌ [保守] TP{level} 补挂失败: {res}")
+                logger.warning(f"  ? [??] TP{level} ????: {res}")
             time.sleep(0.5)
 
         logger.info(
-            f"📊 [保守TP恢复] live={live_qty}张 | "
-            f"补挂={results['placed']} | 跳过={results['skipped']} | "
-            f"拦截={results['guarded']} | "
-            f"累计补挂={getattr(self, '_tp_place_guard_count', 0)}/{RECOVER_TP_PLACE_GUARD_MAX}"
+            f"?? [??TP??] live={live_qty}? | "
+            f"??={results['placed']} | ??={results['skipped']} | "
+            f"??={results['guarded']} | "
+            f"????={getattr(self, '_tp_place_guard_count', 0)}/{RECOVER_TP_PLACE_GUARD_MAX}"
         )
         return results
 
     def _cancel_stop_orders(self, scope="all"):
         cancelled = 0
-        # v16.15（根因四修复）：撤销前初始化本轮已撤销列表，防止重复 REST
+        # v16.15?????????????????????????? REST
         self._shield_cancelled_ids = set()
         for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
             if scope == "radar" and not self._is_radar_trigger_order(t):
@@ -3882,12 +3973,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             oid = str(t.get("ordId") or "").strip()
             if not oid:
                 continue
-            # v16.15（根因四修复）：幂等撤销——本轮已撤销的直接跳过
+            # v16.15????????????????????????
             if oid in self._shield_cancelled_ids:
                 continue
             deepcoin_client.cancel_trigger_order(self.symbol, oid)
             self._shield_cancelled_ids.add(oid)
-            # 同时检查是否撤销了本地记录的 sltp 订单
+            # ?????????????? sltp ??
             _local = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
             if _local == oid:
                 self._shield_sltp_ord_id = ""
@@ -3907,19 +3998,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return None
 
     def _legacy_shield_stop_price(self, entry=None):
-        """已废弃：止损价 exclusively 来自 TV tv_sl"""
+        """??????? exclusively ?? TV tv_sl"""
         return None
 
     def _shield_stop_price(self, entry=None):
-        """VPS 自主硬止损价（tv_sl 账本字段存 VPS 计算结果）"""
+        """VPS ???????tv_sl ????? VPS ?????"""
         tv = round(float(getattr(self, "tv_sl", 0) or 0), 2)
         return tv if tv > 0 else None
 
     def _refresh_vps_hard_sl(self, entry=None, side=None, regime=None, atr=None,
                              tv_sl_ref=None, source=""):
         """
-        规格 v1.0 §3：硬止损 = |TV.price − TV.stop_loss| × 1.15。
-        不再使用开仓价×档位% 旧路径。
+        ?? v1.0 ?3???? = |TV.price ? TV.stop_loss| ? 1.15?
+        ??????????% ????
         """
         entry = float(entry or self.watched_entry or self.tv_price or 0)
         side = (side or self.current_side or "").strip().upper()
@@ -3939,19 +4030,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         self._save_state()
         logger.info(
-            f"[{self.symbol}] VPS硬止损刷新@{hard:.2f} (source={source})"
+            f"[{self.symbol}] VPS?????@{hard:.2f} (source={source})"
         )
         return True
 
     def _defense_buffer_mult(self):
-        """硬止损呼吸垫：统一 1.15（规格 3.4），与 adx_tier 无关。"""
+        """????????? 1.15??? 3.4??? adx_tier ???"""
         return float(TEMP_STOP_BUFFER_MULT)
 
     def _temp_hard_stop_from_tv(self, entry=None, side=None, tv_sl=None):
         """
-        永久硬止损价（规格 v1.0 §3）：
-          dist = |TV价 − TV.SL| × 1.15（统一呼吸垫，不分档）
-          挂在成交价外侧。禁止 1.5×ATR / 滑点×2 旧路径。
+        ????????? v1.0 ?3??
+          dist = |TV? ? TV.SL| ? 1.15???????????
+          ?????????? 1.5?ATR / ???2 ????
         """
         fill = float(entry if entry is not None else (self.watched_entry or self.tv_price or 0))
         side = str(side or self.current_side or "").strip().upper()
@@ -3971,11 +4062,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _lock_frozen_hard_sl_from_tv(self, entry=None, side=None, source=""):
         """
-        规格 v1.0 §3.3：用 |TV.price−TV.stop_loss|×1.15 锁定 frozen_hard_sl_px。
-        已锁定则不覆盖。禁止用 0.5×ATR 雷达激活臂冒充永久硬止损。
-
-        v16.11（根因一保险）：最小 ATR 距离兜底。
-        若 TV 传来的 stop_loss 导致距离 < 0.5×ATR，视为异常数据，自动扩大并告警。
+        Spec v1.0 3.3: |TV.price - TV.stop_loss| x 1.15 -> frozen_hard_sl_px.
+        TV-only, no ATR fallback (binance parity, c0f9275/b3b4afd).
         """
         cur = float(self._frozen_hard_px() or 0)
         if cur > 0:
@@ -3983,35 +4071,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         hard = float(self._temp_hard_stop_from_tv(entry=entry, side=side) or 0)
         if hard <= 0:
             logger.error(
-                f"[{self.symbol}] 无法锁定永久硬止损（缺 TV.stop_loss）| {source}"
+                f"[{self.symbol}] hard stop unavailable, missing TV.stop_loss | {source}"
             )
             return 0.0
 
-        # v16.11（根因一保险）：最小 ATR 距离兜底检查
-        fill_px = float(entry if entry is not None else (self.watched_entry or 0))
-        atr_val = float(getattr(self, "open_atr", 0) or 0)
-        if atr_val > 0 and fill_px > 0:
-            side_check = str(side or self.current_side or "").strip().upper()
-            if side_check in ("LONG", "SHORT"):
-                dist = abs(fill_px - hard)
-                min_dist = atr_val * 0.5
-                if dist < min_dist:
-                    logger.warning(
-                        f"[{self.symbol}] ⚠️ 硬止损距离异常：TV距离 {dist:.4f} < 0.5×ATR({atr_val:.4f}) "
-                        f"| entry={fill_px:.2f} hard={hard:.2f} → 自动扩大至 {min_dist:.4f}"
-                    )
-                    logger.warning(
-                        f"[钉钉已关闭] 硬止损距离异常·ATR兜底 | "
-                        f"TV.stop_loss 距离过小 [{self.symbol}] | "
-                        f"entry={fill_px:.2f} hard={hard:.2f} | "
-                        f"dist={dist:.4f} < 0.5×ATR({atr_val:.4f}) | "
-                        f"已自动扩大至 {min_dist:.4f}（方向 {side_check}）"
-                    )
-                    # 用 ATR 兜底距离重新计算硬止损价
-                    if side_check == "LONG":
-                        hard = round(fill_px - min_dist, 2)
-                    else:
-                        hard = round(fill_px + min_dist, 2)
+        # binance c0f9275/b3b4afd parity: ATR-based widening fallback removed.
+        # Hard stop is TV-only; a short TV distance is honored as-is instead of
+        # being force-widened to 0.5xATR (that fallback caused cancel/replace
+        # death spirals on the binance side and is banned by spec v1.0 3.3).
 
         self.frozen_hard_sl_px = float(hard)
         try:
@@ -4019,7 +4086,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         except Exception:
             pass
         logger.info(
-            f"[{self.symbol}] 锁定永久硬止损@{hard:.2f} "
+            f"[{self.symbol}] ???????@{hard:.2f} "
             f"(TV.sl_ref={float(getattr(self, 'tv_sl_ref', 0) or 0):.2f} "
             f"buffer={float(self._defense_buffer_mult()):.2f}) | {source}"
         )
@@ -4029,7 +4096,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return round(float(getattr(self, "frozen_hard_sl_px", 0) or 0), 2)
 
     def _hard_stop_distance_meta(self, fill=None, tv_sl=None, tv_entry=None, atr=None):
-        """调试/钉钉：硬止损距离拆解。"""
+        """??/???????????"""
         fill = float(fill if fill is not None else (self.watched_entry or 0))
         tv_entry = float(tv_entry if tv_entry is not None else (getattr(self, "tv_price", 0) or fill))
         tv_sl = float(tv_sl if tv_sl is not None else (getattr(self, "tv_sl_ref", 0) or 0))
@@ -4038,25 +4105,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _apply_tv_sl_from_payload(self, payload, source=""):
         """
-        规格 v1.0 §3：TV.stop_loss 决定永久硬止损。
-        距离 = |TV.price − TV.stop_loss| × 1.15。
-        禁止再用开仓价×档位%的旧 VPS 自主路径。
+        ?? v1.0 ?3?TV.stop_loss ????????
+        ?? = |TV.price ? TV.stop_loss| ? 1.15?
+        ??????????%?? VPS ?????
         """
         tv_ref = payload.get("tv_sl")
         if tv_ref is None or tv_ref == "":
-            return self._lock_frozen_hard_sl_from_tv(source=source or "信号")
+            return self._lock_frozen_hard_sl_from_tv(source=source or "??")
         ref_px = round(self._safe_float(tv_ref, 0), 2)
         if ref_px <= 0:
-            return self._lock_frozen_hard_sl_from_tv(source=source or "TV空值")
+            return self._lock_frozen_hard_sl_from_tv(source=source or "TV??")
         entry = float(self.tv_price or self.watched_entry or 0)
         side = str(payload.get("action") or payload.get("side") or self.current_side or "").upper()
         if side not in ("LONG", "SHORT"):
             side = self.current_side
         self.tv_sl_ref = ref_px
-        return self._lock_frozen_hard_sl_from_tv(entry=entry, side=side, source=source or "TV参考")
+        return self._lock_frozen_hard_sl_from_tv(entry=entry, side=side, source=source or "TV??")
 
     def _locked_initial_atr(self):
-        """开仓 ATR 锁定：优先 webhook open_atr，全程固定。"""
+        """?? ATR ????? webhook open_atr??????"""
         atr = float(getattr(self, "open_atr", 0) or 0)
         if atr > 0:
             return atr
@@ -4064,11 +4131,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return atr if atr > 0 else 0.0
 
     def _atr_1h_engine(self):
-        """已废除：ATR 只信 TV webhook。"""
+        """????ATR ?? TV webhook?"""
         return None
 
     def _refresh_breathing_coefficient(self, force=False):
-        """呼吸系数固定 1.0（ATR 只用 TV 锁值）。"""
+        """?????? 1.0?ATR ?? TV ????"""
         init = float(getattr(self, "open_atr", 0) or 0)
         self.breathing_coefficient = 1.0
         self._breath_coeff_meta = {
@@ -4085,8 +4152,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _should_ignore_late_close(self, payload=None):
         """
-        开仓成交后 LATE_CLOSE_SUPPRESS_SEC 内的迟到 CLOSE → 忽略。
-        同窗先平后开链（_close_open_chain_active）不忽略。
+        ????? LATE_CLOSE_SUPPRESS_SEC ???? CLOSE ? ???
+        ????????_close_open_chain_active?????
         """
         if getattr(self, "_close_open_chain_active", False):
             return False
@@ -4097,19 +4164,22 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if age < 0 or age > float(LATE_CLOSE_SUPPRESS_SEC):
             return False
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.warning("?? _should_ignore_late_close ??????? ? ??????")
+            return False
         if not pos or float(pos.get("size") or 0) <= 0:
             return False
         return True
 
     def _apply_breath_stop_tick(self, curr_px=0.0):
-        """雷达/止损 tick：呼吸系数追踪（非 ADX）。"""
+        """??/?? tick????????? ADX??"""
         entry = float(self.watched_entry or 0)
         side = str(self.current_side or "").strip().upper()
         if entry <= 0 or side not in ("LONG", "SHORT"):
             return None
         atr = self._locked_initial_atr()
         profile = getattr(self, "breath_profile", None)
-        # §5.2/§5.3：档位分级呼吸参数叠加
+        # ?5.2/?5.3???????????
         try:
             self._apply_tier_breath_overlay()
         except Exception:
@@ -4166,7 +4236,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         }
 
     def _clamp_radar_to_tv_floor(self, radar_sl):
-        """雷达保本线不得低于 TV 硬止损底线"""
+        """????????? TV ?????"""
         if not radar_sl:
             return radar_sl
         floor = self._shield_stop_price()
@@ -4180,7 +4250,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return radar
 
     def _sync_tv_sl_stop(self, live_qty, reason="", force=False):
-        """挂/更新 TV 硬止损触发单（幂等）；雷达止损独立运行"""
+        """?/?? TV ???????????????????"""
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0 or not self.current_side or not self.watched_entry:
             return {"ok": False, "skipped": True, "reason": "no_position"}
@@ -4201,7 +4271,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         ok = self._place_shield_stops(
             live_qty,
-            reason=reason or f"TV硬止损 @ {target:.2f}",
+            reason=reason or f"TV??? @ {target:.2f}",
             force=True,
         )
         if ok:
@@ -4209,25 +4279,28 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._save_state()
             tv_floor = round(float(getattr(self, "tv_sl", 0) or 0), 2)
             logger.warning(
-                f"🛡️ [TV硬止损] {reason or '同步止损'} | {live_qty} 张 @ {target:.2f} "
+                f"??? [TV???] {reason or '????'} | {live_qty} ? @ {target:.2f} "
                 f"| tv_sl={tv_floor or 'fallback'}"
             )
         return {"ok": ok, "skipped": False, "target": target}
 
     def _handle_tv_sl_update(self, payload):
-        """UPDATE_SL：撤旧挂新 tv_sl（幂等），雷达线独立继续运行"""
+        """UPDATE_SL????? tv_sl??????????????"""
         side = str(payload.get("side") or "").strip().upper()
         if not self._apply_tv_sl_from_payload(payload, source="UPDATE_SL"):
-            logger.warning("UPDATE_SL 无效或未携带 tv_sl")
+            logger.warning("UPDATE_SL ?????? tv_sl")
             return
 
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.warning("UPDATE_SL ?????????? ? ????? tv_sl")
+            return
         if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
-            logger.info("UPDATE_SL 到达但盘口已空仓 → 仅更新账本 tv_sl")
+            logger.info("UPDATE_SL ???????? ? ????? tv_sl")
             return
         pos_side = "LONG" if pos.get("posSide") == "long" else "SHORT"
         if side and side != pos_side:
-            logger.warning(f"UPDATE_SL side={side} 与实盘 {pos_side} 不符，已忽略")
+            logger.warning(f"UPDATE_SL side={side} ??? {pos_side} ??????")
             return
 
         result = self._sync_tv_sl_stop(
@@ -4236,7 +4309,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             force=True,
         )
         if result.get("skipped") and result.get("reason") == "idempotent":
-            logger.info(f"UPDATE_SL 幂等跳过 tv_sl={self.tv_sl:.2f} 已在盘口")
+            logger.info(f"UPDATE_SL ???? tv_sl={self.tv_sl:.2f} ????")
         elif result.get("ok"):
             exchange_stop = float(result.get("target") or self.tv_sl)
             radar_sl = None
@@ -4250,8 +4323,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             live_qty = self._resolve_live_qty(pos["size"])
             verify_note = (
                 f"UPDATE_SL tv_sl={self.tv_sl:.2f} @ {exchange_stop:.2f}"
-                + (f" | 雷达 {radar_sl:.2f}" if radar_sl else "")
-                + f" | 持仓 {live_qty} 张 @ {self.watched_entry:.2f}"
+                + (f" | ?? {radar_sl:.2f}" if radar_sl else "")
+                + f" | ?? {live_qty} ? @ {self.watched_entry:.2f}"
             )
             if not verified:
                 verify_note += f" | {telegram_notify.VERIFY_DELAY_MARK}"
@@ -4270,14 +4343,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
         else:
             logger.warning(
-                f"[钉钉已关闭] TV硬止损更新失败 | UPDATE_SL tv_sl={self.tv_sl:.2f} | 核实未通过，哨兵将继续重试"
+                f"[?????] TV??????? | UPDATE_SL tv_sl={self.tv_sl:.2f} | ?????????????"
             )
 
     def _place_tp_levels_only(self, live_qty, retries=2):
         """
-        规格 v1.0 §8-9：防御 TP 限价必须带 newClientOrderId（幂等标签）。
-        本地已有同档未完成标签 → 拒挂（宁可错过）。
-        仅挂 TP1+TP2；TP3 永不挂限价。
+        ?? v1.0 ?8-9??? TP ????? newClientOrderId???????
+        ??????????? ? ?????????
+        ?? TP1+TP2?TP3 ??????
         """
         close_side = "sell" if self.current_side == "LONG" else "buy"
         pos_side = "long" if self.current_side == "LONG" else "short"
@@ -4285,22 +4358,22 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if live_qty <= 0:
             return 0
 
-        # 【关键修复】先撤销所有旧TP订单，等待确认完成后再挂新单
-        # 防止旧单未撤干净导致重复挂单
+        # ????????????TP??????????????
+        # ??????????????
         self._cancel_all_tp_limit_orders(max_rounds=4)
-        time.sleep(1.0)  # 等待撤销确认
-        # 验证旧单已全部撤销
+        time.sleep(1.0)  # ??????
+        # ?????????
         existing_before = self._collect_tp_limit_orders()
         if existing_before:
             logger.warning(
-                f"[{self.symbol}] 挂新TP前检测到{len(existing_before)}张旧单未撤干净，等待..."
+                f"[{self.symbol}] ??TP????{len(existing_before)}??????????..."
             )
             time.sleep(2.0)
             existing_before = self._collect_tp_limit_orders()
             if existing_before:
                 prices = [f"@{o['price']:.2f}" for o in existing_before]
                 logger.error(
-                    f"[{self.symbol}] 旧TP仍未撤净，放弃本次挂单: {prices}"
+                    f"[{self.symbol}] ?TP???????????: {prices}"
                 )
                 return 0
 
@@ -4308,20 +4381,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         for lv in self._expected_tp_levels(live_qty):
             level = int(lv.get("level") or 0)
             if level >= 3:
-                continue  # TP3 永不挂限价
+                continue  # TP3 ?????
             kind = f"TP{level}"
             q, px = float(lv["qty"] or 0), float(lv["price"] or 0)
             if q <= 0 or px <= 0:
                 continue
 
-            # 【关键修复】挂单前必须再次确认交易所侧没有该档的TP订单
+            # ????????????????????????TP??
             existing_orders = self._collect_tp_limit_orders()
             at_px_existing = [o for o in existing_orders if abs(o.get("price", 0) - px) <= 1.0]
             if at_px_existing:
                 logger.warning(
-                    f"[{self.symbol}] 交易所侧已有 TP@{px:.2f} ({len(at_px_existing)}张)，复用现有订单"
+                    f"[{self.symbol}] ?????? TP@{px:.2f} ({len(at_px_existing)}?)???????"
                 )
-                # 复用交易所侧已有订单，不挂新单
+                # ???????????????
                 existing = at_px_existing[0]
                 existing_oid = str(existing.get("ordId") or existing.get("orderId") or "")
                 if existing_oid:
@@ -4330,38 +4403,38 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self._save_state()
                 continue
 
-            # 幂等标签拦截（规格 v1.0 §8-9）
-            # 【关键修复】有未完成标签时，必须确认交易所侧没有对应订单才能清理
+            # ????????? v1.0 ?8-9?
+            # ????????????????????????????????
             blocked, tag0, meta0 = self._has_open_pending_defense_tag(kind)
             if blocked:
                 logger.warning(
-                    f"[{self.symbol}] 本地未完成标签 tag={tag0} kind={kind} → "
-                    f"开始核实原订单是否已失败 | px={px:.2f}"
+                    f"[{self.symbol}] ??????? tag={tag0} kind={kind} ? "
+                    f"???????????? | px={px:.2f}"
                 )
-                # 有 order_id → 查交易所侧
+                # ? order_id ? ?????
                 if meta0.get("order_id"):
                     if not self._confirm_stale_before_clear(tag0, meta0):
                         logger.warning(
-                            f"[{self.symbol}] 标签 {tag0} 对应订单仍在处理中 → 拒绝清理，本次跳过"
+                            f"[{self.symbol}] ?? {tag0} ????????? ? ?????????"
                         )
                         continue
                     self._complete_pending_defense_tag(tag=tag0)
                     self._save_state()
                     time.sleep(0.15)
                 else:
-                    # 无 order_id（仅有本地标签）
+                    # ? order_id????????
                     age = time.time() - float(meta0.get("ts", 0) or 0)
                     if age >= 45.0:
                         logger.warning(
-                            f"[{self.symbol}] 标签 {tag0} 无 order_id 且陈旧 {age:.0f}s ≥ 45s → 直接清理"
+                            f"[{self.symbol}] ?? {tag0} ? order_id ??? {age:.0f}s ? 45s ? ????"
                         )
                         self._complete_pending_defense_tag(tag=tag0)
                         self._save_state()
                         time.sleep(0.15)
                     else:
                         logger.warning(
-                            f"[{self.symbol}] 标签 {tag0} 无 order_id 且仅 {age:.0f}s < 45s → "
-                            f"拒绝清理（可能还在处理中），本次跳过"
+                            f"[{self.symbol}] ?? {tag0} ? order_id ?? {age:.0f}s < 45s ? "
+                            f"??????????????????"
                         )
                         continue
 
@@ -4372,25 +4445,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             except Exception:
                 pass
             last = None
-            # v16.11（根因二修复）：TP 挂单失败时强制重试 3 次
+            # v16.11????????TP ????????? 3 ?
             max_retries = 3
             for attempt in range(max_retries):
-                # v16.18 补挂安全上限检查
+                # v16.18 ????????
                 allowed, guard_reason = self._check_tp_place_guard(level)
                 if not allowed:
                     logger.warning(
-                        f"⛔ _place_tp_levels_only 跳过：TP{level}@{px:.2f} | {guard_reason}"
+                        f"? _place_tp_levels_only ???TP{level}@{px:.2f} | {guard_reason}"
                     )
                     break
                 res = deepcoin_client.place_limit_order(
                     self.symbol, close_side, pos_side, px, q,
                     reduce_only=True, cl_ord_id=tag,
                 )
-                # 根因修复：reduceOnly 限价单失败 → 查实盘持仓 → 重算可平量
+                # ?????reduceOnly ????? ? ????? ? ?????
                 if deepcoin_client.is_reduce_only_rejected(res):
                     logger.warning(
-                        f"⚠️ TP{level} reduceOnly 拒绝 {close_side} {q}张 → "
-                        f"force_rest 重查持仓后修正挂单量"
+                        f"?? TP{level} reduceOnly ?? {close_side} {q}? ? "
+                        f"force_rest ??????????"
                     )
                     time.sleep(0.3)
                     fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
@@ -4401,19 +4474,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                                 live_qty = self._safe_qty(fp.get("size", 0))
                                 break
                     if live_qty <= 0:
-                        logger.info(f"TP{level} 无持仓可平，跳过挂单")
+                        logger.info(f"TP{level} ??????????")
                         break
-                    # 递归调用，只改数量（保留 level/px/pos_side/tag 不变）
+                    # ???????????? level/px/pos_side/tag ???
                     new_q = min(q, live_qty)
-                    logger.info(f"🔄 TP{level} 修正数量 {q}→{new_q}张（持仓={live_qty}）")
+                    logger.info(f"?? TP{level} ???? {q}?{new_q}????={live_qty}?")
                     q = new_q
-                    # 用修正后的数量重试一次
+                    # ???????????
                     res = deepcoin_client.place_limit_order(
                         self.symbol, close_side, pos_side, px, q,
                         reduce_only=True, cl_ord_id=tag,
                     )
                     if deepcoin_client.is_reduce_only_rejected(res):
-                        logger.error(f"❌ TP{level} 重试仍拒绝 → 跳过该档")
+                        logger.error(f"? TP{level} ????? ? ????")
                         break
                 if res and deepcoin_client._is_success(res):
                     last = res
@@ -4428,21 +4501,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 except Exception:
                     pass
                 logger.error(
-                    f"[{self.symbol}] UPDATE_TP 挂 TP{level} @ {px:.2f} "
-                    f"失败（已释放标签，max_retries={max_retries}）"
+                    f"[{self.symbol}] UPDATE_TP ? TP{level} @ {px:.2f} "
+                    f"?????????max_retries={max_retries}?"
                 )
                 continue
             oid = str(last.get("orderId") or last.get("algoId") or "")
             self._register_pending_defense_tag(tag, kind, price=px, order_id=oid)
             placed += 1
-            logger.info(f"📈 UPDATE_TP 挂 TP{level} {q} @ {px:.2f} tag={tag}")
+            logger.info(f"?? UPDATE_TP ? TP{level} {q} @ {px:.2f} tag={tag}")
             time.sleep(0.25)
         return placed
 
     def _handle_tv_tp_update(self, payload):
         """
-        UPDATE_TP（v6.9.108 动能止盈升级）：
-        只撤换限价 TP123，绝不触碰硬止损 / 雷达。
+        UPDATE_TP?v6.9.108 ????????
+        ????? TP123???????? / ???
         """
         side = str(payload.get("side") or "").strip().upper()
         new_tps = self._sanitize_tp_prices([
@@ -4451,17 +4524,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._safe_float(payload.get("tv_tp3"), 0),
         ])
         if sum(1 for t in new_tps if t > 0) < 3:
-            logger.warning(f"UPDATE_TP 无效：TP 不全 {new_tps}")
+            logger.warning(f"UPDATE_TP ???TP ?? {new_tps}")
             return
 
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.warning("UPDATE_TP ?????????? ? ??")
+            return
         if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
-            logger.info("UPDATE_TP 到达但盘口已空仓 → 忽略")
+            logger.info("UPDATE_TP ???????? ? ??")
             return
 
         pos_side = self._pos_side_label(pos)
         if side and side != pos_side:
-            logger.warning(f"UPDATE_TP side={side} 与实盘 {pos_side} 不符，已忽略")
+            logger.warning(f"UPDATE_TP side={side} ??? {pos_side} ??????")
             return
 
         live_qty = self._resolve_live_qty(pos["size"])
@@ -4479,10 +4555,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if not validate_tp_prices_for_side(pos_side, entry, new_tps):
             logger.warning(
-                f"UPDATE_TP 方向校验失败 {pos_side} entry={entry:.2f} tps={new_tps} → 忽略"
+                f"UPDATE_TP ?????? {pos_side} entry={entry:.2f} tps={new_tps} ? ??"
             )
             logger.warning(
-                f"[钉钉已关闭] UPDATE_TP 已拒绝 | {pos_side} entry `{entry:.2f}` | 新TP {new_tps} 与持仓方向不符"
+                f"[?????] UPDATE_TP ??? | {pos_side} entry `{entry:.2f}` | ?TP {new_tps} ???????"
             )
             return
 
@@ -4490,12 +4566,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if curr_px > 0:
             if pos_side == "LONG" and tp1 <= curr_px:
                 logger.warning(
-                    f"UPDATE_TP 新TP1={tp1:.2f} ≤ 市价 {curr_px:.2f} → 忽略（防即时成交）"
+                    f"UPDATE_TP ?TP1={tp1:.2f} ? ?? {curr_px:.2f} ? ?????????"
                 )
                 return
             if pos_side == "SHORT" and tp1 >= curr_px:
                 logger.warning(
-                    f"UPDATE_TP 新TP1={tp1:.2f} ≥ 市价 {curr_px:.2f} → 忽略（防即时成交）"
+                    f"UPDATE_TP ?TP1={tp1:.2f} ? ?? {curr_px:.2f} ? ?????????"
                 )
                 return
 
@@ -4503,7 +4579,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.tv_tps = new_tps
         self._save_state()
 
-        # TP补全后解锁雷达激活（规格 §5.1：绝对价格锚定需要TP1/TP2）
+        # TP???????????? ?5.1?????????TP1/TP2?
         self._unblock_radar_activation()
 
         same_ledger = (
@@ -4515,26 +4591,26 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         )
         audit_before = self._audit_tp_levels(live_qty)
         if same_ledger and self._tp_audit_ok(audit_before):
-            logger.info(f"UPDATE_TP 幂等跳过：TP 已是 {new_tps}")
+            logger.info(f"UPDATE_TP ?????TP ?? {new_tps}")
             return
 
         cancelled = self._cancel_all_tp_limit_orders(max_rounds=4)
-        time.sleep(1.5)  # 【关键修复】增加等待时间确保撤销完成
+        time.sleep(1.5)  # ??????????????????
         leftover = self._collect_tp_limit_orders()
         if leftover:
             logger.warning(
-                f"UPDATE_TP 撤旧 TP 未净（剩 {len(leftover)}）→ 再次尝试撤销"
+                f"UPDATE_TP ?? TP ???? {len(leftover)}?? ??????"
             )
-            # 【关键修复】旧单未撤净，追加一轮撤销
+            # ??????????????????
             self._cancel_all_tp_limit_orders(max_rounds=3)
             time.sleep(1.5)
             leftover = self._collect_tp_limit_orders()
             if leftover:
                 logger.error(
-                    f"UPDATE_TP 撤旧 TP 仍未净（剩 {len(leftover)}）→ 放弃挂新单，等待下次"
+                    f"UPDATE_TP ?? TP ????? {len(leftover)}?? ??????????"
                 )
                 logger.warning(
-                    f"[钉钉已关闭] UPDATE_TP 撤单失败 | 旧限价 TP 未清净 {len(leftover)} 张，未挂新价，硬止损/雷达未动"
+                    f"[?????] UPDATE_TP ???? | ??? TP ??? {len(leftover)} ??????????/????"
                 )
                 if old_tps and sum(1 for t in old_tps if float(t or 0) > 0) >= 2:
                     self.tv_tps = self._sanitize_tp_prices(old_tps)
@@ -4553,13 +4629,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             verified = self._tp_audit_ok(audit)
 
         verify_note = (
-            f"动能 UPDATE_TP | {old_tps} → {new_tps} | "
-            f"撤旧 {cancelled} | 新挂 {placed} | "
-            f"止盈 {audit.get('matched_full', 0)}/{audit.get('expected', 0)} | "
-            f"持仓 {live_qty} 张 @ {entry:.2f} | "
-            f"市价 {curr_px:.2f} | 硬止损/雷达未触碰"
+            f"?? UPDATE_TP | {old_tps} ? {new_tps} | "
+            f"?? {cancelled} | ?? {placed} | "
+            f"?? {audit.get('matched_full', 0)}/{audit.get('expected', 0)} | "
+            f"?? {live_qty} ? @ {entry:.2f} | "
+            f"?? {curr_px:.2f} | ???/?????"
         )
-        logger.info(f"🚀 UPDATE_TP 完成 verified={verified} | {verify_note}")
+        logger.info(f"?? UPDATE_TP ?? verified={verified} | {verify_note}")
         self._call_telegram_notify(
             telegram_notify.report_tv_tp_updated,
             side=pos_side,
@@ -4575,7 +4651,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         )
         if not verified:
             logger.warning(
-                f"[钉钉已关闭] UPDATE_TP 对齐未完成 | {self._format_audit_summary(audit)} | 哨兵将继续核对"
+                f"[?????] UPDATE_TP ????? | {self._format_audit_summary(audit)} | ???????"
             )
 
     def _shield_tier_prices(self, entry=None):
@@ -4618,7 +4694,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return 0.0
 
     def _resolve_defense_regime(self, curr_px):
-        """FAVORABLE=雷达已/应激活 | SHIELD=维护TV硬止损"""
+        """FAVORABLE=???/??? | SHIELD=??TV???"""
         if curr_px <= 0 or not self.watched_entry:
             return "SHIELD"
         if self._is_radar_active() or self._should_radar_trail(curr_px):
@@ -4691,9 +4767,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         stop_px = self._shield_stop_price()
         progress = self._radar_activation_progress(curr_px) if curr_px > 0 else 1.0
         verify_note = (
-            f"先挂雷达保本 @ {new_sl:.2f} 已核实"
-            + (f" | 替换 TV硬止损 @ {stop_px:.2f}" if stop_px else "")
-            + f" | 持仓 {real_amt} 张"
+            f"?????? @ {new_sl:.2f} ???"
+            + (f" | ?? TV??? @ {stop_px:.2f}" if stop_px else "")
+            + f" | ?? {real_amt} ?"
         )
         if not sl_verified:
             verify_note += f" | {telegram_notify.VERIFY_DELAY_MARK}"
@@ -4703,7 +4779,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             live_qty=real_amt,
             entry=self.watched_entry,
             cancelled_count=max(cancelled_hint, 1),
-            reason=reason or "雷达交棒 · 先挂保本再撤 tv_sl",
+            reason=reason or "???? ? ?????? tv_sl",
             radar_progress=progress,
             verify_note=verify_note,
         )
@@ -4712,9 +4788,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _perform_radar_handoff(self, real_amt, curr_px, reason=""):
         """
-        【规格 v1.0 · §5.1 雷达延迟激活】
-        价格到达TP1-TP2中点（首次开仓）或TP2（重入开仓）时触发雷达交棒。
-        不再要求 TP1 先成交。
+        ??? v1.0 ? ?5.1 ???????
+        ????TP1-TP2?????????TP2??????????????
+        ???? TP1 ????
         """
         real_amt = float(self._resolve_live_qty(real_amt) or 0)
         if real_amt <= 0:
@@ -4722,14 +4798,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if getattr(self, "_open_in_progress", False) or getattr(
             self, "_defense_align_in_progress", False
         ):
-            logger.info(f"📡 雷达交棒拒绝：开仓/防线重建中 | {reason or ''}")
+            logger.info(f"?? ?????????/????? | {reason or ''}")
             return False
-        # 规格 §5.1：价格必须到达TP1-TP2中点（首次）或TP2（重入）
+        # ?? ?5.1???????TP1-TP2???????TP2????
         if not self._should_radar_trail(curr_px):
             gate = float(self._radar_activation_price() or 0)
             logger.info(
-                f"📡 雷达交棒拒绝：价格未达激活阈值 | 现价={float(curr_px or 0):.2f} "
-                f"| 阈值={gate:.2f} | {reason or ''}"
+                f"?? ??????????????? | ??={float(curr_px or 0):.2f} "
+                f"| ??={gate:.2f} | {reason or ''}"
             )
             return False
         if not self._should_radar_trail(curr_px):
@@ -4753,8 +4829,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if not self._can_safely_place_radar_sl(curr_px, safe_sl):
             gap = self._radar_min_stop_gap(curr_px)
             logger.info(
-                f"📡 雷达交棒延迟：保本 {safe_sl:.2f} 距现价 {curr_px:.2f} "
-                f"不足 {gap:.2f} USDT，保留 tv_sl 呼吸空间"
+                f"?? ????????? {safe_sl:.2f} ??? {curr_px:.2f} "
+                f"?? {gap:.2f} USDT??? tv_sl ????"
             )
             return False
 
@@ -4775,25 +4851,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         )
         if not sl_verified:
             logger.warning(
-                f"📡 雷达交棒中止：保本 @ {safe_sl:.2f} 未核实，不撤 tv_sl 不交棒"
+                f"?? ????????? @ {safe_sl:.2f} ?????? tv_sl ???"
             )
             if had_tv_shield and old_tv:
                 self._maintain_hard_shield(real_amt, curr_px, force=True)
             return False
 
         if had_tv_shield:
-            # TODO(v13.81+): 币安单系统已禁止雷达激活时撤 tv_sl/硬止损（永久硬止损并行）。
-            # Deepcoin 仍 _disarm_shield — 勿在未测双 STOP 槽位前改，避免裸仓窗口。
-            self._disarm_shield("雷达交棒 · 保本已挂", notify=False)
+            # TODO(v13.81+): ?????????????? tv_sl/?????????????
+            # Deepcoin ? _disarm_shield ? ????? STOP ????????????
+            self._disarm_shield("???? ? ????", notify=False)
 
         logger.info(
-            f"📡 雷达交棒成功：保本 @ {safe_sl:.2f} | best={self.best_price:.2f} | "
-            f"现价 {curr_px:.2f}"
+            f"?? ????????? @ {safe_sl:.2f} | best={self.best_price:.2f} | "
+            f"?? {curr_px:.2f}"
         )
         if had_tv_shield and not getattr(self, "_shield_handoff_notified", False):
             self._notify_shield_handoff_to_radar(
                 real_amt, curr_px, safe_sl,
-                reason=reason or "雷达交棒 · 先挂保本再撤 tv_sl",
+                reason=reason or "???? ? ?????? tv_sl",
                 sl_verified=True,
                 cancelled_hint=1 if old_tv else 0,
             )
@@ -4808,14 +4884,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if real_amt <= 0:
             return 0
         ok = self._perform_radar_handoff(
-            real_amt, curr_px, reason=reason or "雷达接管",
+            real_amt, curr_px, reason=reason or "????",
         )
         return 1 if ok else 0
 
     def _should_disarm_shield_for_favorable(self, curr_px):
-        """TP1 成交且雷达已激活 → 才撤 tv_sl 交棒移动保本（TP1 前保留宽硬止损）
-        TODO(v13.81+): 币安 _should_disarm_shield_for_favorable 已恒 False（不撤硬止损）；
-        本函数仍 True 时会走 _perform_radar_handoff → _disarm_shield，待对齐规格再改。"""
+        """TP1 ???????? ? ?? tv_sl ???????TP1 ????????
+        TODO(v13.81+): ?? _should_disarm_shield_for_favorable ?? False????????
+        ???? True ??? _perform_radar_handoff ? _disarm_shield?????????"""
         if not self._tp1_filled_verified():
             return False
         stop_px = self._shield_stop_price()
@@ -4842,17 +4918,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _process_directional_defenses(self, real_amt, curr_px):
         """
-        双层风控：雷达移动保本（VPS）+ TV tv_sl 硬止损底线（双轨独立挂单）。
-        雷达线不得低于 tv_sl；UPDATE_SL 只更新底线，雷达逻辑独立运行。
+        ????????????VPS?+ TV tv_sl ??????????????
+        ??????? tv_sl?UPDATE_SL ???????????????
         """
-        self._disarm_premature_radar(real_amt, curr_px, source="哨兵防线")
+        self._disarm_premature_radar(real_amt, curr_px, source="????")
         if self._resolve_defense_regime(curr_px) == "FAVORABLE":
             if self._should_radar_trail(curr_px) or self._is_radar_active():
                 self._process_radar_trailing(real_amt, curr_px)
         self._maintain_hard_shield(real_amt, curr_px)
 
     def _should_activate_shield(self, curr_px):
-        """始终维护 TV 硬止损底线（可与雷达并行）"""
+        """???? TV ?????????????"""
         if not self.watched_entry or not self.current_side:
             return False
         return True
@@ -4876,8 +4952,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _has_shield_stop_at_price(self, tp, tier_prices=None):
         tier_prices = tier_prices or self._shield_tier_prices()
-        # v16.15（根因四修复）：本地有 set-position-sltp 记录时，直接返回 True
-        # 避免因交易所查询不到而误判，导致反复挂单
+        # v16.15??????????? set-position-sltp ???????? True
+        # ????????????????????
         _local_ord = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
         _cancelled = getattr(self, "_shield_cancelled_ids", set()) or set()
         _set_at = float(getattr(self, "_shield_sltp_set_at", 0) or 0)
@@ -4918,7 +4994,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             oid = str(t.get("ordId") or "").strip()
             if not oid:
                 continue
-            # v16.15（根因四修复）：幂等撤销——本轮已撤销的直接跳过
+            # v16.15????????????????????????
             if oid in self._shield_cancelled_ids:
                 continue
             deepcoin_client.cancel_trigger_order(self.symbol, oid)
@@ -5007,9 +5083,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         buckets = self._shield_orders_at_tiers(tier_prices)
         result["buckets"] = buckets
 
-        # v16.15（根因四修复）：本地已记录 set-position-sltp 的 order_id，
-        # 且不在本轮已撤销列表中 → 视为已设置（防止 Deepcoin 内部订单查询不到导致的死循环）
-        # 条件：order_id 非空 + 未被标记撤销 + 最近5分钟内设置（防重启后残留）
+        # v16.15????????????? set-position-sltp ? order_id?
+        # ??????????? ? ???????? Deepcoin ???????????????
+        # ???order_id ?? + ?????? + ??5?????????????
         _local_ord_id = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
         _cancelled_ids = getattr(self, "_shield_cancelled_ids", set()) or set()
         _set_at = float(getattr(self, "_shield_sltp_set_at", 0) or 0)
@@ -5030,7 +5106,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 continue
             orders = buckets.get(idx, [])
             if not orders:
-                # v16.15（根因四修复）：本地已有 set-position-sltp 记录时，跳过条件单缺失判断
+                # v16.15???????????? set-position-sltp ?????????????
                 if not _local_valid:
                     has_missing = True
                     result["issues"].append(f"tier{idx + 1}_missing")
@@ -5048,7 +5124,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         for idx, orders in buckets.items():
             if idx not in remaining and orders:
-                # v16.15：本地已有 set-position-sltp 记录时，不把交易所订单视为孤儿
+                # v16.15????? set-position-sltp ???????????????
                 if not _local_valid:
                     has_duplicate = True
                     result["issues"].append(f"tier{idx + 1}_orphan:{len(orders)}")
@@ -5096,7 +5172,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return False
 
     def _try_acquire_recover_singleton(self):
-        """多 worker 导入时仅允许一个进程执行重启接管，避免双钉钉/双撤挂"""
+        """? worker ??????????????????????/???"""
         try:
             os.makedirs("logs", exist_ok=True)
             if os.path.exists(RECOVER_LOCK_FILE):
@@ -5109,12 +5185,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 holder_alive = self._recover_lock_pid_alive(info)
                 if age < RECOVER_LOCK_TTL_SEC and holder_alive:
                     logger.info(
-                        f"🔄 跳过重复重启接管 (进程 {info} 仍存活, {age:.0f}s 前)"
+                        f"?? ???????? (?? {info} ???, {age:.0f}s ?)"
                     )
                     return False
                 if age < RECOVER_LOCK_TTL_SEC and not holder_alive:
                     logger.info(
-                        f"🔄 旧接管锁已失效 (原 {info})，重新执行闪电接管"
+                        f"?? ??????? (? {info})?????????"
                     )
             with open(RECOVER_LOCK_FILE, "w", encoding="utf-8") as f:
                 f.write(f"pid={os.getpid()} ts={datetime.now().isoformat()}")
@@ -5124,7 +5200,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return True
 
     def _build_recover_health_report(self, pos, curr_px, tp_audit, shield_audit=None):
-        """重启全域核查：实盘头寸 + TV + TP123 + 硬止损 + 浮盈/浮亏防线路由"""
+        """??????????? + TV + TP123 + ??? + ??/??????"""
         entry = float(pos.get("entry_price", self.watched_entry) or 0)
         curr_px = float(curr_px or 0)
         favorable = self._favorable_move_pct(curr_px) if curr_px > 0 else 0.0
@@ -5137,17 +5213,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         shield_ok = self._shield_orders_adequate(shield_audit)
 
         if should_radar or radar_active:
-            pnl_label = f"浮盈·雷达区 (进度 {radar_progress:.0%})"
-            defense_plan = "雷达移动保本 + TV硬止损底线 (双轨)"
+            pnl_label = f"?????? (?? {radar_progress:.0%})"
+            defense_plan = "?????? + TV????? (??)"
         elif adverse > 0.001:
-            pnl_label = f"浮亏 {adverse:.1%}"
-            defense_plan = "持有 TP123 + TV硬止损全平"
+            pnl_label = f"?? {adverse:.1%}"
+            defense_plan = "?? TP123 + TV?????"
         elif favorable > 0.001:
-            pnl_label = f"微盈 {favorable:.1%}·未达雷达激活"
-            defense_plan = "持有 TP123 + TV硬止损 (朝TP1迈进中)"
+            pnl_label = f"?? {favorable:.1%}???????"
+            defense_plan = "?? TP123 + TV??? (?TP1???)"
         else:
-            pnl_label = "保本附近"
-            defense_plan = "持有 TP123 + TV硬止损"
+            pnl_label = "????"
+            defense_plan = "?? TP123 + TV???"
 
         stop_px = self._shield_stop_price(entry)
         if should_radar or radar_active:
@@ -5156,15 +5232,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if self._is_radar_active() else None
             )
             shield_status = (
-                f"TV底线 @ {stop_px:.2f}" if stop_px else "TV底线待核实"
+                f"TV?? @ {stop_px:.2f}" if stop_px else "TV?????"
             )
             if radar_sl:
-                shield_status += f" | 雷达 @ {radar_sl:.2f}"
+                shield_status += f" | ?? @ {radar_sl:.2f}"
         elif shield_ok:
-            shield_status = f"已挂 @ {stop_px:.2f}" if stop_px else "已核实"
+            shield_status = f"?? @ {stop_px:.2f}" if stop_px else "???"
         else:
             shield_status = (
-                f"待补挂 @ {stop_px:.2f}" if stop_px
+                f"??? @ {stop_px:.2f}" if stop_px
                 else shield_audit.get("status", "missing")
             )
 
@@ -5191,7 +5267,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         }
 
     def _apply_recover_defense_policy(self, real_amt, curr_px, health):
-        """重启一次性防线：TV tv_sl 硬止损 + 雷达（若应激活）双轨维护"""
+        """????????TV tv_sl ??? + ????????????"""
         actions = []
         if health.get("should_radar") or health.get("radar_active"):
             if not self._is_radar_active():
@@ -5199,27 +5275,27 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             sl = self._clamp_radar_to_tv_floor(self.current_sl) if self._is_radar_active() else None
             if sl and not self._has_trigger_sl_near(sl):
                 if self._ensure_radar_sl(real_amt, sl):
-                    actions.append(f"雷达止损@{sl:.2f}")
+                    actions.append(f"????@{sl:.2f}")
                 else:
-                    actions.append(f"雷达止损待补@{sl:.2f}")
+                    actions.append(f"??????@{sl:.2f}")
             elif sl:
-                actions.append(f"雷达止损已齐@{sl:.2f}")
+                actions.append(f"??????@{sl:.2f}")
 
         ok = self._maintain_hard_shield(real_amt, curr_px, force=True)
         stop_px = self._shield_stop_price()
         tv_note = (
-            "TV硬止损"
+            "TV???"
             if getattr(self, "tv_sl", 0) > 0
-            else "TV tv_sl 缺失"
+            else "TV tv_sl ??"
         )
         tag = f"{tv_note}@{stop_px:.2f}" if stop_px else tv_note
-        actions.append(f"{tag}已齐" if ok else f"{tag}待补")
+        actions.append(f"{tag}??" if ok else f"{tag}??")
         return actions
 
     def _bootstrap_live_defenses_after_recover(self, real_amt, curr_px, audit=None):
         """
-        重启/关机后全域自适应：核查 TP123+止损 → 缺则补挂不重复 → 雷达立即干活锁利。
-        v16.21 增强：TP 未完全对齐时持续重试（最多 5 轮），而非一次性尝试后放弃。
+        ??/??????????? TP123+?? ? ??????? ? ?????????
+        v16.21 ???TP ????????????? 5 ??????????????
         """
         if real_amt <= 0 or not self.current_side:
             return {"actions": [], "audit": audit or {}}
@@ -5227,7 +5303,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         curr_px = float(curr_px or deepcoin_client.get_current_price(self.symbol) or 0)
         actions = []
 
-        # ── v16.21：持续补挂循环，最多 5 轮 ─────────────────────────
+        # ?? v16.21?????????? 5 ? ?????????????????????????
         RECOVER_TP_RETRY_ROUNDS = 5
         RECOVER_TP_RETRY_GAP_SEC = 5.0
         final_audit = audit
@@ -5238,16 +5314,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
                 if self._tp_audit_ok(final_audit):
                     logger.info(
-                        f"📡 [重启全域核查] TP 已完全对齐 "
-                        f"({final_audit.get('matched_full', 0)}/{final_audit.get('expected', 0)})，退出补挂循环"
+                        f"?? [??????] TP ????? "
+                        f"({final_audit.get('matched_full', 0)}/{final_audit.get('expected', 0)})???????"
                     )
                     break
 
                 if retry_round > 0:
                     logger.warning(
-                        f"📡 [重启全域核查] TP 未完全对齐 "
-                        f"({final_audit.get('matched_full', 0)}/{final_audit.get('expected', 0)})，"
-                        f"第 {retry_round + 1}/{RECOVER_TP_RETRY_ROUNDS} 轮重试，等待 {RECOVER_TP_RETRY_GAP_SEC:.0f}s"
+                        f"?? [??????] TP ????? "
+                        f"({final_audit.get('matched_full', 0)}/{final_audit.get('expected', 0)})?"
+                        f"? {retry_round + 1}/{RECOVER_TP_RETRY_ROUNDS} ?????? {RECOVER_TP_RETRY_GAP_SEC:.0f}s"
                     )
                     time.sleep(RECOVER_TP_RETRY_GAP_SEC)
 
@@ -5255,19 +5331,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     real_amt, self.watched_entry,
                 )
                 if n_actions > 0:
-                    actions.append(f"智能补挂TP({n_actions}步)")
+                    actions.append(f"????TP({n_actions}?)")
                     final_audit = repaired
                 else:
-                    # 无操作但 TP 仍未对齐，降级到单档直接补挂
+                    # ???? TP ??????????????
                     if not self._tp_audit_ok(final_audit):
                         patched = self._patch_missing_tp_levels(real_amt)
                         if patched > 0:
-                            actions.append(f"降级补挂TP({patched}步)")
+                            actions.append(f"????TP({patched}?)")
                         final_audit = self._audit_tp_levels(real_amt)
             except Exception as e:
-                logger.error(f"重启全域核查第 {retry_round + 1} 轮失败: {e}")
+                logger.error(f"??????? {retry_round + 1} ???: {e}")
                 final_audit = final_audit or self._audit_tp_levels(real_amt)
-        # ── 持续补挂循环结束 ───────────────────────────────────────
+        # ?? ???????? ???????????????????????????????????????
 
         try:
             self._refresh_radar_state_on_recover(curr_px, self.watched_entry)
@@ -5282,25 +5358,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 sl = self._radar_sl_to_pass()
                 if sl and not self._has_trigger_sl_near(sl):
                     if self._ensure_radar_sl(real_amt, sl):
-                        actions.append(f"雷达SL@{sl:.2f}")
+                        actions.append(f"??SL@{sl:.2f}")
                 if self._is_radar_active() and not getattr(self, "_radar_activation_notified", False):
                     self._report_radar_first_activation(
                         real_amt, curr_px, self._clamp_radar_to_tv_floor(self.current_sl),
                         self._has_trigger_sl_near(self.current_sl),
                     )
-                actions.append(f"雷达激活·进度{health.get('radar_progress', 0):.0%}")
+                actions.append(f"???????{health.get('radar_progress', 0):.0%}")
 
             self._radar_guardian_audit(real_amt, curr_px)
         except Exception as e:
-            logger.error(f"重启全域核查部分失败(继续哨兵): {e}")
-            actions.append(f"核查异常:{e}")
+            logger.error(f"??????????(????): {e}")
+            actions.append(f"????:{e}")
             final_audit = final_audit or self._audit_tp_levels(real_amt)
             health = {}
 
         self._post_recover_radar_pulse = True
         self._save_state()
         logger.info(
-            f"📡 [重启全域核查] {' · '.join(actions) if actions else '盘口已齐，雷达待命'} | "
+            f"?? [??????] {' ? '.join(actions) if actions else '?????????'} | "
             f"TP {final_audit.get('matched_full', 0)}/{final_audit.get('expected', 0)}"
         )
         return {"actions": actions, "audit": final_audit, "health": health}
@@ -5319,9 +5395,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._shield_arm_notified = True
             stop_px = self._shield_stop_price()
             logger.info(
-                f"🛡️ 重启：盘口 TV硬止损已齐"
+                f"??? ????? TV?????"
                 + (f" @ {stop_px:.2f}" if stop_px else "")
-                + "，跳过重挂"
+                + "?????"
             )
             self._save_state()
             return
@@ -5330,7 +5406,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             purged = self._purge_shield_stop_orders(audit["tier_prices"])
             self._record_shield_maintain(success=False)
             logger.warning(
-                f"🛡️ 重启：撤净防护盾叠单 {purged} 笔，宽限期后哨兵按实盘补挂"
+                f"??? ?????????? {purged} ?????????????"
             )
             self.shield_active = True
             self._save_state()
@@ -5339,17 +5415,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if curr_px > 0 and self._should_activate_shield(curr_px):
             self.shield_active = True
             logger.info(
-                "🛡️ 重启：TV硬止损待补挂（宽限期后哨兵按冷却处理）"
+                "??? ???TV???????????????????"
             )
             self._save_state()
 
     def _disarm_shield(self, reason="", notify=False):
-        # v16.15（根因四修复）：优化 REST 消耗——只查一次 pending 订单列表
-        # 用本地跟踪的已撤销 ID + 查询结果缓存，避免重复 REST 查询
+        # v16.15?????????? REST ???????? pending ????
+        # ????????? ID + ??????????? REST ??
         all_pending = deepcoin_client.get_trigger_orders_pending(self.symbol)
         cancelled = 0
 
-        # 第一次：撤销所有 shield 订单
+        # ???????? shield ??
         for t in all_pending:
             if not self._is_shield_trigger_order(t):
                 continue
@@ -5364,7 +5440,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             cancelled += 1
             time.sleep(0.2)
 
-        # 用本地已撤销 ID 判断是否还有剩余 shield（在 exchange 未查到但本地记录有）
+        # ?????? ID ???????? shield?? exchange ??????????
         _local_ord = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
         _local_set = float(getattr(self, "_shield_sltp_set_at", 0) or 0)
         still_have_local = (
@@ -5373,7 +5449,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             and (time.time() - _local_set) < 300
         )
 
-        # 检查是否还有未撤销的 shield 订单
+        # ?????????? shield ??
         still_on_exchange = False
         for t in all_pending:
             if not self._is_shield_trigger_order(t):
@@ -5384,7 +5460,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 break
 
         if still_on_exchange or still_have_local:
-            # 第二次查询（仅在第一次撤销后仍有订单时）
+            # ????????????????????
             all_pending2 = deepcoin_client.get_trigger_orders_pending(self.symbol)
             for t in all_pending2:
                 px = self._trigger_order_price(t)
@@ -5418,7 +5494,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._shield_cancelled_ids = set()
         self._save_state()
         if reason and (had or cancelled):
-            logger.info(f"🛡️ [硬止损解除] {reason} | 撤销 {cancelled} 笔 TV硬止损")
+            logger.info(f"??? [?????] {reason} | ?? {cancelled} ? TV???")
         if notify and cancelled > 0 and live_qty > 0:
             progress = 0.0
             try:
@@ -5435,11 +5511,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 reason=reason,
                 radar_progress=progress,
                 verify_note=(
-                    f"撤 {cancelled} 笔 TV硬止损 | "
+                    f"? {cancelled} ? TV??? | "
                     + (
-                        "雷达已激活，专注移动保本"
+                        "????????????"
                         if self._is_radar_active()
-                        else f"雷达进度 {progress:.0%}，TP1成交后推升止损"
+                        else f"???? {progress:.0%}?TP1???????"
                     )
                 ),
             )
@@ -5447,16 +5523,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
     def _place_shield_stops(self, live_qty, entry=None, reason="", force=False,
                             recover_mode=False, suppress_alert=False):
         """
-        使用 set-position-sltp 接口设置硬止损（市价触发），替代条件单。
-        根据 Deepcoin API 文档，set-position-sltp 是为止有持仓设置止盈止损的正确接口，
-        支持市价委托（slOrdPx=-1），避免价格跳空时限价单无法成交的问题。
+        ?? set-position-sltp ????????????????????
+        ?? Deepcoin API ???set-position-sltp ??????????????????
+        ???????slOrdPx=-1????????????????????
         """
         entry = float(entry or self.watched_entry or 0)
         live_qty = self._resolve_live_qty(live_qty)
         if live_qty <= 0 or entry <= 0 or not self.current_side:
             return False
 
-        # 【修复】价格已穿过硬止损线时，跳过无效操作（防死循环）
+        # ???????????????????????????
         curr_px = deepcoin_client.get_current_price(self.symbol) or 0
         if curr_px > 0:
             stop_px = self._shield_stop_price()
@@ -5468,8 +5544,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     crossed = True
                 if crossed:
                     logger.warning(
-                        f"🛡️ 硬止损@{stop_px:.2f} 已被价格@{curr_px:.2f}穿过，"
-                        f"标记已触发（防死循环）"
+                        f"??? ???@{stop_px:.2f} ????@{curr_px:.2f}???"
+                        f"???????????"
                     )
                     self.shield_active = True
                     self.shield_sized_qty = live_qty
@@ -5479,16 +5555,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         pos_side = "long" if self.current_side == "LONG" else "short"
         stop_px = self._shield_stop_price()
         if not stop_px or stop_px <= 0:
-            logger.warning(f"🛡️ 硬止损无效：无有效止损价格")
+            logger.warning(f"??? ?????????????")
             return False
 
-        # 计算交易所止损价（含滑点保护）
+        # ???????????????
         exchange_sl = float(order_stop_price(
             self.current_side, stop_px,
             profile=getattr(self, "breath_profile", None)
         ) or stop_px)
 
-        # v16.15（根因四修复）：幂等挂单——价格相同且最近15s内设置过则跳过
+        # v16.15?????????????????????15s???????
         _last = float(getattr(self, "_last_applied_tv_sl", 0) or 0)
         _last_set = float(getattr(self, "_shield_sltp_set_at", 0) or 0)
         _local_ord = str(getattr(self, "_shield_sltp_ord_id", "") or "").strip()
@@ -5501,12 +5577,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self.shield_sized_qty = live_qty
             self._save_state()
             logger.info(
-                f"🛡️ [TV硬止损] 幂等跳过 | {live_qty} 张 @ {exchange_sl:.2f} | "
-                f"ordId={_local_ord} | {_last_set > 0 and (time.time() - _last_set):.1f}s前已设置"
+                f"??? [TV???] ???? | {live_qty} ? @ {exchange_sl:.2f} | "
+                f"ordId={_local_ord} | {_last_set > 0 and (time.time() - _last_set):.1f}s????"
             )
             return True
 
-        # v16.26 修复：设置前清除所有旧硬止损单（防止重启后 _local_ord 丢失导致双硬止损）
+        # v16.26 ????????????????????? _local_ord ?????????
         self._purge_shield_stop_orders(tier_prices=None)
         for t in deepcoin_client.get_trigger_orders_pending(self.symbol):
             oid = str(t.get("ordId") or "").strip()
@@ -5519,35 +5595,35 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 deepcoin_client.cancel_trigger_order(self.symbol, oid)
                 self._shield_cancelled_ids = self._shield_cancelled_ids or set()
                 self._shield_cancelled_ids.add(oid)
-                logger.info(f"🛡️ [TV硬止损] 清场撤销旧单 {oid} @ {t.get('triggerPrice', '?')}")
+                logger.info(f"??? [TV???] ?????? {oid} @ {t.get('triggerPrice', '?')}")
 
-        # v16.15（根因四修复）：设置前先撤销旧订单（防止 Deepcoin 拒绝重复设置）
+        # v16.15???????????????????? Deepcoin ???????
         if _local_ord and _local_ord not in getattr(self, "_shield_cancelled_ids", set()):
             deepcoin_client.cancel_trigger_order(self.symbol, _local_ord)
             self._shield_cancelled_ids = self._shield_cancelled_ids or set()
             self._shield_cancelled_ids.add(_local_ord)
-            logger.info(f"🛡️ [TV硬止损] 撤销旧订单 {_local_ord} 后重新设置")
+            logger.info(f"??? [TV???] ????? {_local_ord} ?????")
             time.sleep(0.3)
 
-        # 使用 set-position-sltp 接口，设置市价止损（slOrdPx=-1）
+        # ?? set-position-sltp ??????????slOrdPx=-1?
         res = deepcoin_client.set_position_sltp(
             symbol=self.symbol,
             pos_side=pos_side,
             sl_trigger_px=exchange_sl,
-            tp_trigger_px=None,  # 止盈由 TP123 分批处理
+            tp_trigger_px=None,  # ??? TP123 ????
             td_mode="cross",
             mrg_position="merge",
             trigger_px_type="last",
-            sl_ord_px="-1",  # 市价止损
+            sl_ord_px="-1",  # ????
             tp_ord_px="-1",
         )
 
-        # 验证接口调用结果
+        # ????????
         if res and str(res.get("code", "0")) in ("0", "00000", ""):
             self.shield_active = True
             self.shield_sized_qty = live_qty
             self._shield_fail_streak = 0
-            # v16.15（根因四修复）：从响应中提取 order_id 并存储
+            # v16.15?????????????? order_id ???
             _new_ord_id = ""
             _data = res.get("data") if res else None
             if isinstance(_data, dict):
@@ -5561,8 +5637,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._shield_sltp_set_at = time.time()
             self._save_state()
             logger.warning(
-                f"🛡️ [TV硬止损] 已设置 | {live_qty} 张 @ {exchange_sl:.2f} | "
-                f"触发后市价平仓 | 雷达激活后自动覆盖"
+                f"??? [TV???] ??? | {live_qty} ? @ {exchange_sl:.2f} | "
+                f"??????? | ?????????"
             )
             if not getattr(self, "_shield_arm_notified", False):
                 self._shield_arm_notified = True
@@ -5575,25 +5651,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     tier_prices=[exchange_sl],
                     tier_pcts=SHIELD_TIER_PCTS,
                     verify_note=(
-                        (reason or f"TV硬止损 @ {exchange_sl:.2f}")
-                        + f" | 实盘 {live_qty} 张 | 市价止损 | 仅播报一次"
+                        (reason or f"TV??? @ {exchange_sl:.2f}")
+                        + f" | ?? {live_qty} ? | ???? | ?????"
                     ),
                 )
             return True
         else:
-            # 接口调用失败，记录错误
-            err_msg = str(res.get("msg", "") if res else "未知错误")
+            # ???????????
+            err_msg = str(res.get("msg", "") if res else "????")
             self._shield_fail_streak = getattr(self, "_shield_fail_streak", 0) + 1
-            logger.error(f"🛡️ 硬止损设置失败: {err_msg} | 重试次数: {self._shield_fail_streak}")
+            logger.error(f"??? ???????: {err_msg} | ????: {self._shield_fail_streak}")
 
             if not suppress_alert and self._shield_fail_streak >= 3:
                 logger.warning(
-                    f"[钉钉已关闭] TV硬止损设置失败 | 连续失败 {self._shield_fail_streak} 次 | 错误: {err_msg}"
+                    f"[?????] TV??????? | ???? {self._shield_fail_streak} ? | ??: {err_msg}"
                 )
             return False
 
     def _maintain_hard_shield(self, real_amt, curr_px=None, force=False):
-        """维护 TV tv_sl 硬止损底线；雷达止损独立运行"""
+        """?? TV tv_sl ??????????????"""
         if real_amt <= 0 or not self.watched_entry:
             return False
         if getattr(self, "tv_sl", 0) > 0:
@@ -5601,12 +5677,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 return getattr(self, "shield_active", False)
             return self._sync_tv_sl_stop(
                 real_amt,
-                reason="维护TV硬止损",
+                reason="??TV???",
                 force=force,
             ).get("ok", False)
 
-        # v16.23 修复：tv_sl=0 时，从 journal 最后一条 LONG/SHORT 记录中恢复
-        # v16.26 修复：journal 按 symbol 隔离 + 价格合理性检查，防止 ETH 数据污染 BNB
+        # v16.23 ???tv_sl=0 ??? journal ???? LONG/SHORT ?????
+        # v16.26 ???journal ? symbol ?? + ?????????? ETH ???? BNB
         if real_amt > 0 and getattr(self, "tv_sl", 0) <= 0:
             curr_px = curr_px or deepcoin_client.get_current_price(self.symbol)
             recovered_sl = 0.0
@@ -5619,17 +5695,22 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 sl = float(src.get("tv_sl", 0) or 0)
                 if sl <= 0:
                     continue
-                # v16.26：价格合理性检查，防止跨 symbol 数据污染
-                # SHORT 止损需 > 当前价，LONG 止损需 < 当前价
-                if curr_px and curr_px > 0:
-                    if self.current_side == "SHORT" and sl <= curr_px * 1.05:
+                # v16.26???????????? symbol ????
+                # SHORT ??? > ????LONG ??? < ???
+                # Bug fix (2026-08-02): SHORT stop-loss must be > entry price, not current price.
+                # The 5% check must anchor on entry price per spec v1.0 ?3.
+                # Previous check used current_price (584) which rejected valid SL (581.67)
+                # because 581.67 < 584. Now using watched_entry (575.82) which is correct.
+                anchor_px = self.watched_entry if self.watched_entry > 0 else curr_px
+                if anchor_px and anchor_px > 0:
+                    if self.current_side == "SHORT" and sl <= anchor_px * 1.05:
                         logger.warning(
-                            f"⚠️ [journal恢复] tv_sl={sl} 不合理（SHORT 应>当前{curr_px:.2f}，偏差不足 5%），跳过"
+                            f"?? [journal??] tv_sl={sl} ????SHORT ?>??{anchor_px:.2f}????? 5%????"
                         )
                         continue
-                    if self.current_side == "LONG" and sl >= curr_px * 0.95:
+                    if self.current_side == "LONG" and sl >= anchor_px * 0.95:
                         logger.warning(
-                            f"⚠️ [journal恢复] tv_sl={sl} 不合理（LONG 应<当前{curr_px:.2f}，偏差不足 5%），跳过"
+                            f"?? [journal??] tv_sl={sl} ????LONG ?<??{anchor_px:.2f}????? 5%????"
                         )
                         continue
                 recovered_sl = sl
@@ -5641,39 +5722,39 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 else:
                     recovered_sl = round(self.watched_entry + self.current_atr * sl_m, 2)
             if recovered_sl > 0:
-                logger.info(f"💧 硬止损维护：从 journal 恢复 tv_sl={recovered_sl:.2f}")
+                logger.info(f"?? ??????? journal ?? tv_sl={recovered_sl:.2f}")
                 self.tv_sl = recovered_sl
                 return self._sync_tv_sl_stop(
                     real_amt,
-                    reason="journal恢复TV硬止损",
+                    reason="journal??TV???",
                     force=True,
                 ).get("ok", False)
 
         if real_amt > 0 and not getattr(self, "_tv_sl_missing_alerted", False):
-            logger.error("维护TV硬止损失败：缺少 tv_sl，拒绝 fallback 旧逻辑")
+            logger.error("??TV???????? tv_sl??? fallback ???")
             logger.warning(
-                f"[钉钉已关闭] TV硬止损缺失 | 持仓 {real_amt} 张 但未收到 tv_sl，无法挂止损"
+                f"[?????] TV????? | ?? {real_amt} ? ???? tv_sl??????"
             )
             self._tv_sl_missing_alerted = True
         return False
 
     def _process_adverse_shield(self, real_amt, curr_px):
-        """兼容旧调用 → 维护硬止损"""
+        """????? ? ?????"""
         return self._maintain_hard_shield(real_amt, curr_px)
 
     def _is_radar_active(self):
         """
-        【规格 v1.0 · §5.1】
-        雷达激活判断：价格已到达TP1-TP2中点（首次开仓）或TP2（重入开仓），
-        且止损已移动到保本位（current_sl 已高于/低于 entry）。
-        不再要求 TP1 成交才激活雷达。
+        ??? v1.0 ? ?5.1?
+        ????????????TP1-TP2?????????TP2???????
+        ???????????current_sl ???/?? entry??
+        ???? TP1 ????????
         """
         if not self.watched_entry or not self.current_sl:
             return False
-        # 雷达激活后不撤销，保持激活状态直到仓位平仓
+        # ?????????????????????
         if getattr(self, "radar_activated", False):
             return True
-        # 价格必须到达雷达激活阈值
+        # ????????????
         gate = float(self._radar_activation_price() or 0)
         if gate <= 0:
             return False
@@ -5687,7 +5768,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             price_reached = curr_px <= gate
         else:
             price_reached = False
-        # 止损必须已移动到保本位
+        # ???????????
         if not price_reached:
             return False
         if side == "LONG":
@@ -5697,63 +5778,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return False
 
     def _radar_is_dormant(self):
-        """雷达休眠：未激活且未武装。"""
+        """?????????????"""
         return not self._is_radar_active() and not getattr(self, "radar_activated", False)
 
-    def _check_early_be_checkpoint(self, curr_px):
-        """
-        【规格 v1.0 · §5.0 提前保本检查点】
-        当价格到达 entry + tp1_distance × 0.5 时，将止损从当前值移动到保本位。
-        仅触发一次，触发后标记_done=True，不再重复。
-        不启动雷达，不影响雷达的激活状态判断。
-        """
-        if bool(getattr(self, "_early_be_checkpoint_done", False)):
-            return None
-        if bool(getattr(self, "radar_activated", False)):
-            return None
-        entry = float(self.watched_entry or 0)
-        side = str(self.current_side or "").strip().upper()
-        curr_px_f = float(curr_px or 0)
-        if entry <= 0 or side not in ("LONG", "SHORT") or curr_px_f <= 0:
-            return None
-        tps = list(getattr(self, "tv_tps", None) or [])
-        ref = float(getattr(self, "tv_price", 0) or entry)
-        tp1_px = float(tps[0] or 0) if len(tps) > 0 else 0.0
-        if tp1_px <= 0:
-            return None
-        tp1_dist = abs(tp1_px - ref)
-        if tp1_dist <= 0:
-            return None
-        trigger_px = entry + tp1_dist * 0.5
-        if side == "LONG" and curr_px_f < trigger_px:
-            return None
-        if side == "SHORT" and curr_px_f > trigger_px:
-            return None
-        current_sl = float(self.current_sl or 0)
-        tick = 0.01
-        fee_pct = 0.0008
-        fee = entry * fee_pct
-        if side == "LONG":
-            new_sl = max(entry + tick + fee, current_sl)
-        else:
-            new_sl = min(entry - tick - fee, current_sl)
-        if new_sl == current_sl:
-            self._early_be_checkpoint_done = True
-            return None
-        old_sl = current_sl
-        self.current_sl = new_sl
-        self._early_be_checkpoint_done = True
-        self._save_state()
-        logger.info(
-            f"[{self.symbol}] 规格 v1.0 §5.0 提前保本检查点触发 "
-            f"({side}) | entry={entry:.4f} trigger={trigger_px:.4f} "
-            f"old_sl={old_sl:.4f} → new_sl={new_sl:.4f}"
-        )
+    # _check_early_be_checkpoint (spec v1.0 5.0) removed for binance parity
+    # (v16.22 + v16.24 v2.1): the pre-breakeven checkpoint is abolished. See
+    # call-site comment in the monitor loop for rationale. _early_be_checkpoint_done
+    # is still saved/restored as a harmless legacy state field.
 
-    # ── 规格 v1.0 §8-9：防御单幂等标签 ────────────────────────────────────────
+    # ?? ?? v1.0 ?8-9???????? ????????????????????????????????????????
 
     def _clear_pending_tags_for_kind(self, kind_prefix, save=False):
-        """释放某类防御单本地标签（TP1/TP2/HARD/RADAR）。"""
+        """????????????TP1/TP2/HARD/RADAR??"""
         pref = str(kind_prefix or "").upper()
         tags = dict(getattr(self, "_pending_order_tags", {}) or {})
         changed = False
@@ -5769,9 +5805,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _gc_stale_pending_defense_tags_on_startup(self):
         """
-        v16.14（根因一修复）：VPS重启时安全清理所有旧标签。
-        重启前旧 VPS 进程已终止，其挂的单（不管成交/失败/撤销）都无法再被确认。
-        若不清理，_pending_order_tags 会残留旧标签永久阻止挂新单。
+        v16.14????????VPS?????????????
+        ???? VPS ???????????????/??/???????????
+        ?????_pending_order_tags ??????????????
         """
         tags = dict(getattr(self, "_pending_order_tags", {}) or {})
         if not tags:
@@ -5781,13 +5817,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             dropped.append(f"{tag}({meta.get('kind','?')}/{meta.get('status','?')}/{meta.get('order_id','no-oid')})")
         self._pending_order_tags = {}
         logger.warning(
-            f"[{self.symbol}] v16.14 重启清理旧标签 {len(dropped)} 个: {dropped[:8]}"
-            f"{'…' if len(dropped) > 8 else ''}"
+            f"[{self.symbol}] v16.14 ??????? {len(dropped)} ?: {dropped[:8]}"
+            f"{'?' if len(dropped) > 8 else ''}"
         )
         self._save_state()
 
     def _gc_stale_pending_defense_tags(self, max_pending_age_sec=45.0, save=True):
-        """清理陈旧防御单本地标签（超时/已完成）。"""
+        """??????????????/?????"""
         tags = dict(getattr(self, "_pending_order_tags", {}) or {})
         if not tags:
             return 0
@@ -5803,9 +5839,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 tags.pop(tag, None)
                 dropped.append(f"{tag}:{st}")
                 continue
-            # 【BUG修复】有 order_id 不代表订单已完成！
-            # 订单已提交（有 order_id）但尚未终态，不能清理标签
-            # 必须等收到成交/撤销确认，或订单超时（由 _confirm_stale_before_clear 处理）才能清理
+            # ?BUG???? order_id ?????????
+            # ??????? order_id?????????????
+            # ???????/???????????? _confirm_stale_before_clear ???????
             # if oid:
             #     tags.pop(tag, None)
             #     dropped.append(f"{tag}:acked")
@@ -5818,8 +5854,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return 0
         self._pending_order_tags = tags
         logger.warning(
-            f"[{self.symbol}] 清理陈旧防御标签 {len(dropped)} 个: "
-            f"{dropped[:6]}{'…' if len(dropped) > 6 else ''}"
+            f"[{self.symbol}] ???????? {len(dropped)} ?: "
+            f"{dropped[:6]}{'?' if len(dropped) > 6 else ''}"
         )
         if save:
             try:
@@ -5830,10 +5866,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _confirm_stale_before_clear(self, tag, meta):
         """
-        v16.11（根因二修复）：清残留标签前，必须先确认原订单已失败/超时。
-        不允许"看到残留就清"——只查本地状态表是远远不够的，必须核实交易所侧真实状态。
+        v16.11??????????????????????????/???
+        ???"??????"?????????????????????????????
 
-        返回 True = 已确认可安全清理；False = 不能清理（订单可能还在处理中）。
+        ?? True = ?????????False = ????????????????
         """
         if not tag or not meta:
             return False
@@ -5842,63 +5878,63 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         ts = float(meta.get("ts") or 0)
         age = (time.time() - ts) if ts > 0 else 0.0
 
-        # 条件1：有 order_id → 查交易所真实状态
+        # ??1?? order_id ? ????????
         if oid:
             try:
                 order_res = deepcoin_client.get_order(self.symbol, ord_id=oid)
                 if order_res:
                     state = str(order_res.get("state", "") or order_res.get("status", "")).lower().strip()
-                    # v16.14（根因一修复）：空状态/查不到订单视为已撤销
-                    # 订单在交易所侧已不存在（已成交被移除、已撤销、已过期、或从未成功提交）
-                    if state in ("filled", "cancelled", "canceled", "done", "完全成交", "已撤", ""):
-                        reason = "已终态" if state else "交易所侧不存在"
+                    # v16.14???????????/??????????
+                    # ???????????????????????????????????
+                    if state in ("filled", "cancelled", "canceled", "done", "????", "??", ""):
+                        reason = "???" if state else "???????"
                         logger.info(
-                            f"[{self.symbol}] 标签 {tag} 的订单 {oid} 状态=[{state or 'N/A'}]，{reason}，确认可清理"
+                            f"[{self.symbol}] ?? {tag} ??? {oid} ??=[{state or 'N/A'}]?{reason}??????"
                         )
                         return True
-                    # 状态未知或非终态，不清理
+                    # ????????????
                     logger.warning(
-                        f"[{self.symbol}] 标签 {tag} 的订单 {oid} 仍在 {state}，拒绝清理"
+                        f"[{self.symbol}] ?? {tag} ??? {oid} ?? {state}?????"
                     )
                     return False
                 else:
-                    # v16.14（根因一修复）：order_res 为空（订单不存在/网络异常）→ 视为已撤销
+                    # v16.14????????order_res ????????/?????? ?????
                     logger.warning(
-                        f"[{self.symbol}] 标签 {tag} 的订单 {oid} 交易所侧无记录，视为已撤销，确认可清理"
+                        f"[{self.symbol}] ?? {tag} ??? {oid} ???????????????????"
                     )
                     return True
             except Exception as e:
-                logger.warning(f"[{self.symbol}] 查询订单 {oid} 状态失败: {e}，拒绝清理")
+                logger.warning(f"[{self.symbol}] ???? {oid} ????: {e}?????")
                 return False
 
-        # 条件2：无 order_id（仅本地标签）→ 必须满足陈旧阈值
+        # ??2?? order_id???????? ????????
         STALE_THRESHOLD_SEC = 45.0
         if age >= STALE_THRESHOLD_SEC:
             logger.warning(
-                f"[{self.symbol}] 标签 {tag} 无 order_id 但已陈旧 {age:.0f}s >= {STALE_THRESHOLD_SEC}s，"
-                f"确认可清理"
+                f"[{self.symbol}] ?? {tag} ? order_id ???? {age:.0f}s >= {STALE_THRESHOLD_SEC}s?"
+                f"?????"
             )
             return True
-        # 不够陈旧，拒绝清理（防止误清正在处理中的订单）
+        # ???????????????????????
         logger.warning(
-            f"[{self.symbol}] 标签 {tag} 无 order_id 且仅 {age:.0f}s < {STALE_THRESHOLD_SEC}s，"
-            f"拒绝清理（可能还在处理中）"
+            f"[{self.symbol}] ?? {tag} ? order_id ?? {age:.0f}s < {STALE_THRESHOLD_SEC}s?"
+            f"?????????????"
         )
         return False
 
     def _has_open_pending_defense_tag(self, kind=None):
-        """本地已有同档未完成标签 → 拒挂（宁可错过）。"""
+        """??????????? ? ?????????"""
         self._gc_stale_pending_defense_tags(save=False)
         want = str(kind or "").upper()
         for tag, meta in dict(getattr(self, "_pending_order_tags", {}) or {}).items():
             st = str((meta or {}).get("status") or "open").lower()
-            # 【BUG修复】只要状态不是终态，无论有没有 order_id，都算未完成
+            # ?BUG????????????????? order_id??????
             if st in ("done", "filled", "cancelled", "canceled", "acked"):
                 continue
             k = str((meta or {}).get("kind") or "").upper()
             if want and k != want and not k.startswith(want):
                 continue
-            # 有未完成的标签（可能只有本地 pending 或已有 order_id 但未终态）
+            # ?????????????? pending ??? order_id ?????
             return True, tag, meta
         return False, "", {}
 
@@ -5933,9 +5969,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _radar_sl_to_pass(self):
         """
-        【规格 v1.0 · §5.1】
-        雷达激活后返回当前止损价。
-        不再要求 TP1 成交，只要雷达已激活（价格到达阈值）即可。
+        ??? v1.0 ? ?5.1?
+        ?????????????
+        ???? TP1 ?????????????????????
         """
         return self.current_sl if self._is_radar_active() else None
 
@@ -5975,10 +6011,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     deepcoin_client.cancel_order(self.symbol, ord_id=oid)
                     total += 1
                     time.sleep(0.10)
-            logger.info(f"🧹 撤限价止盈 第{round_i + 1}轮: {len(orders)} 张")
-            time.sleep(0.8)  # v16.19 优化：1.5s→0.8s（典型场景1轮即清）
+            logger.info(f"?? ????? ?{round_i + 1}?: {len(orders)} ?")
+            time.sleep(0.8)  # v16.19 ???1.5s?0.8s?????1????
         if total:
-            logger.info(f"🧹 已撤销限价止盈合计 {total} 张")
+            logger.info(f"?? ????????? {total} ?")
         return total
 
     def _scorched_earth_cancel_for_recover(self):
@@ -5989,14 +6025,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             time.sleep(0.6)
             remaining = self._collect_tp_limit_orders()
             if not remaining:
-                logger.info(f"☢️ 重启撤单完成，限价止盈已清零 (第 {attempt + 1} 轮)")
+                logger.info(f"?? ?????????????? (? {attempt + 1} ?)")
                 return True
             remain_txt = ", ".join(f"{o['qty']}@{o['price']}" for o in remaining[:4])
             logger.warning(
-                f"⚠️ 撤单后仍剩 {len(remaining)} 张限价止盈 ({remain_txt}) "
-                f"→ 重试 {attempt + 1}/6"
+                f"?? ????? {len(remaining)} ????? ({remain_txt}) "
+                f"? ?? {attempt + 1}/6"
             )
-        logger.error("❌ 重启撤单未净：重复 TP 可能残留，非权限问题时请 APP 手动全撤后重启")
+        logger.error("? ????????? TP ???????????? APP ???????")
         return False
 
     def _ensure_radar_sl(self, sl_price, live_qty, for_handoff=False):
@@ -6013,22 +6049,22 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _report_radar_first_activation(self, real_amt, curr_px, new_sl, sl_placed):
         """
-        【规格 v1.0 · §5.1 雷达延迟激活】
-        价格到达TP1-TP2中点（首次开仓）或TP2（重入开仓）时发送雷达激活通知。
-        不再要求 TP1 先成交。
+        ??? v1.0 ? ?5.1 ???????
+        ????TP1-TP2?????????TP2????????????????
+        ???? TP1 ????
         """
         if getattr(self, "_radar_activation_notified", False):
             return
-        # 规格 §5.1：只要价格到达阈值就激活，不要求TP1成交
-        # 止损必须高于入场价（多单）或低于入场价（空单）
+        # ?? ?5.1????????????????TP1??
+        # ???????????????????????
         if self.current_side == "LONG" and float(new_sl or 0) <= float(self.watched_entry or 0):
             logger.warning(
-                f"📡 雷达激活钉钉跳过：LONG 止损 {new_sl:.2f} 未高于 entry"
+                f"?? ?????????LONG ?? {new_sl:.2f} ??? entry"
             )
             return
         if self.current_side == "SHORT" and float(new_sl or 0) >= float(self.watched_entry or 0):
             logger.warning(
-                f"📡 雷达激活钉钉跳过：SHORT 止损 {new_sl:.2f} 未低于 entry"
+                f"?? ?????????SHORT ?? {new_sl:.2f} ??? entry"
             )
             return
         verified = self._wait_verify(
@@ -6039,12 +6075,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         progress = self._radar_activation_progress(curr_px) if curr_px > 0 else 1.0
         tv_floor = round(float(getattr(self, "tv_sl", 0) or 0), 2)
         verify_note = (
-            f"雷达进度 {progress:.0%} | 保本止损 @ {new_sl:.2f} | "
-            f"TV底线 tv_sl={tv_floor or 'fallback'} | "
-            f"持仓 {real_amt} 张 @ {self.watched_entry:.2f}"
+            f"???? {progress:.0%} | ???? @ {new_sl:.2f} | "
+            f"TV?? tv_sl={tv_floor or 'fallback'} | "
+            f"?? {real_amt} ? @ {self.watched_entry:.2f}"
         )
         if not verified and not sl_placed:
-            logger.warning(f"雷达首次激活钉钉跳过：止损 @ {new_sl:.2f} 未核实")
+            logger.warning(f"????????????? @ {new_sl:.2f} ???")
             return
         if not verified:
             verify_note += f" | {telegram_notify.VERIFY_DELAY_MARK}"
@@ -6053,14 +6089,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             (getattr(self, "open_atr", 0) or 0)
             * float(getattr(self, "breathing_coefficient", 1.0) or 1.0)
         )
-        # 规格 v1.0 §5.1：钉钉通知标注门类型
+        # ?? v1.0 ?5.1??????????
         reentry_attempt = int(getattr(self, "reentry_attempt", 0) or 0)
         if reentry_attempt >= 1:
-            open_kind = "重入开仓"
-            trigger_gate = "重入·TP2绝对价"
+            open_kind = "????"
+            trigger_gate = "???TP2???"
         else:
-            open_kind = "首次开仓"
-            trigger_gate = "首次·TP1-TP2中点"
+            open_kind = "????"
+            trigger_gate = "???TP1-TP2??"
         self._call_telegram_notify(
             telegram_notify.report_radar_activated,
             side=self.current_side,
@@ -6080,7 +6116,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             trigger_gate=trigger_gate,
         )
         self._radar_activation_notified = True
-        # P1 修复：并行 TG 雷达激活通知
+        # P1 ????? TG ??????
         self._call_telegram(
             telegram_notify.report_radar_activation,
             side=self.current_side,
@@ -6143,7 +6179,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         )
         if tp1_px > 0 and self._has_tp_limit_at_price(tp1_px):
             logger.warning(
-                f"📡 三角对账拒绝：TP1 限价仍在盘口 @{tp1_px:.2f}"
+                f"?? ???????TP1 ?????? @{tp1_px:.2f}"
             )
             return False
         if not self._price_reached_tp1_zone(curr_px, tp1_px):
@@ -6172,7 +6208,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return True
 
     def _tp1_filled_verified(self, live_qty=None, curr_px=0.0):
-        """TP1 三角对账：减仓+限价消失+价到TP1。"""
+        """TP1 ???????+????+??TP1?"""
         if getattr(self, "_open_in_progress", False) or getattr(
             self, "_defense_align_in_progress", False
         ):
@@ -6223,9 +6259,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _enforce_pre_tp1_radar_standby(self, live_qty=None, curr_px=0.0, source=""):
         """
-        【规格 v1.0 · §5.1】
-        雷达延迟激活：价格到达TP1-TP2中点（首次开仓）或TP2（重入开仓）之前，
-        止损仅维持 tv_sl 宽线保护，不做移动保本。
+        ??? v1.0 ? ?5.1?
+        ???????????TP1-TP2?????????TP2?????????
+        ????? tv_sl ????????????
         """
         if self._tp1_filled_verified(live_qty, curr_px):
             return False
@@ -6239,8 +6275,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self.tp_levels_consumed = []
             changed = True
             logger.warning(
-                f"📡 [{source or '雷达'}] 清除伪 TP{consumed} 标记 "
-                f"(TP1 未实盘成交)"
+                f"?? [{source or '??'}] ??? TP{consumed} ?? "
+                f"(TP1 ?????)"
             )
 
         if entry > 0 and self.current_sl:
@@ -6281,7 +6317,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self.best_price = entry if entry > 0 else self.best_price
             self._save_state()
             logger.info(
-                f"📡 [{source or '雷达'}] TP1前待命 | tv_sl={tv:.2f} | entry={entry:.2f}"
+                f"?? [{source or '??'}] TP1??? | tv_sl={tv:.2f} | entry={entry:.2f}"
             )
         return changed
 
@@ -6313,14 +6349,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._ws_tp1_fill_hint = False
         self._save_state()
         logger.warning(
-            f"📡 [{source or '雷达'}] 解除过早雷达/伪TP{stale or '标记'} "
-            f"→ 恢复 tv_sl={tv:.2f}"
+            f"?? [{source or '??'}] ??????/?TP{stale or '??'} "
+            f"? ?? tv_sl={tv:.2f}"
         )
         logger.info(
-            f"[钉钉已关闭] 雷达解除·恢复呼吸空间 | "
-            f"{self.current_side} {live_qty}张 @ {entry:.2f} | "
-            f"清除伪TP{stale or '标记'} | tv_sl={tv:.2f} | "
-            f"等待价格到达TP1-TP2中点后激活雷达"
+            f"[?????] ??????????? | "
+            f"{self.current_side} {live_qty}? @ {entry:.2f} | "
+            f"???TP{stale or '??'} | tv_sl={tv:.2f} | "
+            f"??????TP1-TP2???????"
         )
         if live_qty > 0 and tv > 0:
             self._maintain_hard_shield(live_qty, curr_px, force=True)
@@ -6337,7 +6373,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         entry = float(self.watched_entry or 0)
         if entry <= 0:
             return 0.0
-        atr = float(self.current_atr or 30.0)
+        atr = float(self.current_atr or symbol_aware_atr_fallback(self.symbol))
         cushion = max(atr * TV_BOOT_SL_ATR, entry * RADAR_FEE_BUFFER_PCT)
         if self.current_side == "LONG":
             return round(entry + cushion, 2)
@@ -6346,10 +6382,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return entry
 
     def _radar_trail_offset_price(self):
-        return float(self.current_atr or 30.0) * self._radar_tv_trail_atr_mult()
+        return float(self.current_atr or symbol_aware_atr_fallback(self.symbol)) * self._radar_tv_trail_atr_mult()
 
     def _refresh_radar_state_on_recover(self, curr_px, entry):
-        """重启：按现价恢复 best_price；仅 TP1 已成交才恢复雷达追踪位"""
+        """???????? best_price?? TP1 ???????????"""
         if curr_px <= 0 or not entry:
             return
 
@@ -6367,8 +6403,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._ws_tp1_fill_hint = False
             gate = float(self._radar_activation_price() or 0)
             logger.info(
-                f"📡 重启雷达待命: 等待价格到达TP1-TP2中点(阈值{gate:.2f}) "
-                f"(进度 {self._radar_activation_progress(curr_px):.0%})"
+                f"?? ??????: ??????TP1-TP2??(??{gate:.2f}) "
+                f"(?? {self._radar_activation_progress(curr_px):.0%})"
             )
             return
         self._radar_armed_after_tp1 = True
@@ -6388,67 +6424,94 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if not self._is_radar_active() or trail_sl < self.current_sl:
                     self.current_sl = min(self.current_sl or entry, trail_sl)
             logger.info(
-                f"📡 重启雷达恢复: TP1已成交 进度 {progress:.0%} | best={self.best_price:.2f} | "
-                f"SL={self.current_sl:.2f} | 追踪 {self._radar_tv_trail_atr_mult():.2f}ATR"
+                f"?? ??????: TP1??? ?? {progress:.0%} | best={self.best_price:.2f} | "
+                f"SL={self.current_sl:.2f} | ?? {self._radar_tv_trail_atr_mult():.2f}ATR"
             )
         elif self.current_sl == 0.0:
             self.current_sl = floor_px
 
     def _nuclear_realign_tp(self, live_qty, entry, dynamic_sl=None, rounds=3):
         """
-        核武级止盈对齐：只撤限价 TP → 重挂 TP123 → 始终续挂 tv_sl/雷达合并止损。
+        ???????????? TP ? ?? TP123 ? ???? tv_sl/???????
         """
-        # 【关键修复】防止核武死循环：短时间重复调用直接返回
+        # ?????????????????????????
         now = time.time()
         if now - getattr(self, "_last_nuclear_realign_ts", 0) < 15.0:
             audit = self._audit_tp_levels(live_qty)
             if self._tp_audit_ok(audit):
                 logger.warning(
-                    f"☢️ 核武冷却中（{now - getattr(self, '_last_nuclear_realign_ts', 0):.1f}s < 15s），TP已对齐，跳过"
+                    f"?? ??????{now - getattr(self, '_last_nuclear_realign_ts', 0):.1f}s < 15s??TP??????"
                 )
                 return audit
             logger.warning(
-                f"☢️ 核武冷却中（{now - getattr(self, '_last_nuclear_realign_ts', 0):.1f}s < 15s），仍需对齐但跳过"
+                f"?? ??????{now - getattr(self, '_last_nuclear_realign_ts', 0):.1f}s < 15s?????????"
             )
             return audit
         self._last_nuclear_realign_ts = now
 
+        # binance parity (129cd68): verify the exchange's real position before
+        # tearing down and rebuilding TP orders. Without this, a stale
+        # watched_qty (state residue after the exchange already went flat)
+        # makes the system nuke-and-rebuild TP orders against a position that
+        # no longer exists, which just accumulates orphan orders.
+        real_pos = self._get_active_position()
+        if real_pos == "QUERY_FAILED":
+            real_pos = None
+        real_qty = self._safe_qty(real_pos.get("size")) if real_pos else 0
+        if real_qty <= 0:
+            logger.info(
+                f"?? [{self.symbol}] ??????????={real_qty} | ??={live_qty} | "
+                f"???????????"
+            )
+            return {"expected": 0, "matched_full": 0, "missing": [], "orphans": [], "skipped_no_position": True}
+
         last_audit = self._audit_tp_levels(live_qty)
         for r in range(rounds):
-            # v16.22 修复：每轮重取实盘最新张数，防止裁减/减仓后用陈旧数量算错 TP 期望
+            # v16.22 ??????????????????/?????????? TP ??
             fresh_pos = self._get_active_position()
+            if fresh_pos == "QUERY_FAILED":
+                logger.warning("?? ?????????????? live_qty ??")
+                fresh_pos = None
             live_qty = self._safe_qty(fresh_pos.get("size")) if fresh_pos else live_qty
             logger.warning(
-                f"☢️ 核武级止盈清场重挂 {r + 1}/{rounds} | 持仓 {live_qty}张 | "
-                f"当前 {last_audit['matched_full']}/{last_audit['expected']} | "
+                f"?? ????????? {r + 1}/{rounds} | ?? {live_qty}? | "
+                f"?? {last_audit['matched_full']}/{last_audit['expected']} | "
                 f"{self._format_audit_summary(last_audit)}"
             )
-            # v16.14（根因一修复）：核武每轮开始前清理所有本地标签
-            # 旧 VPS 重启/断线导致的残留标签、或前一轮已挂成功的订单对应的标签，
-            # 都不应阻止本轮重建。核武必须"无条件全清"后重挂。
+            # v16.14???????????????????????
+            # ? VPS ??/???????????????????????????
+            # ??????????????"?????"????
             self._pending_order_tags = {}
             self._save_state()
             self._cancel_all_tp_limit_orders()
             time.sleep(1.0)
-            # v16.22 修复：传实盘最新张数，防止用陈旧 qty 算错 TP 数量
+            # v16.22 ???????????????? qty ?? TP ??
             placed = self._rebuild_defenses(live_qty, entry, dynamic_sl=None)
-            logger.info(f"☢️ 核武轮 {r + 1} 新挂 {placed} 笔限价止盈")
+            logger.info(f"?? ??? {r + 1} ?? {placed} ?????")
             curr_px = deepcoin_client.get_current_price(self.symbol)
             self._maintain_hard_shield(live_qty, curr_px, force=True)
             if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
                 self._ensure_radar_sl(live_qty, dynamic_sl)
             time.sleep(1.0)
-            # v16.22 修复：用实盘最新张数重新审计
+            # v16.22 ??????????????
             last_audit = self._audit_tp_levels(live_qty)
             stop_px = self._resolve_defense_stop_for_audit(dynamic_sl)
-            # v16.22 修复：仅当 matched < expected 时才继续；matched >= expected 时直接返回成功
+            # v16.22 ????? matched < expected ?????matched >= expected ???????
             if last_audit["matched_full"] >= last_audit["expected"] and not last_audit.get("orphans"):
-                logger.info(f"☢️ 核武重挂成功: {self._format_audit_summary(last_audit)}")
+                logger.info(f"?? ??????: {self._format_audit_summary(last_audit)}")
                 return last_audit
             logger.warning(
-                f"☢️ 核武轮 {r + 1} 仍未对齐: {self._format_audit_summary(last_audit)}"
+                f"?? ??? {r + 1} ????: {self._format_audit_summary(last_audit)}"
             )
             time.sleep(1.5)
+        # binance parity (247e3c2): rounds exhausted -- if stale/orphan TP
+        # orders are still sitting on the book, clean them up before giving
+        # up, otherwise they persist as noise that interferes with the next
+        # audit cycle.
+        if last_audit.get("orphans"):
+            self._cancel_orphan_tp_orders(live_qty)
+            time.sleep(0.5)
+            last_audit = self._audit_tp_levels(live_qty)
         return last_audit
 
     def _tp_audit_ok(self, audit):
@@ -6482,31 +6545,31 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _ensure_defenses_on_recover(self, live_qty, entry, dynamic_sl=None):
         """
-        重启/异动接管：审计 → 齐全跳过 → 增量补挂 → 仍失败才清场重建
+        ??/??????? ? ???? ? ???? ? ????????
 
-        v16.18 增强：
-        - 入参阶段：先用 _verify_live_tp_completeness 交叉验证 live_qty vs saved_initial
-        - 低置信度时：降级到保守模式（直接查交易所验证）
-        - 补挂全程受 TP 补挂安全上限约束
-        - 核武前必须通过交易所双重确认
+        v16.18 ???
+        - ??????? _verify_live_tp_completeness ???? live_qty vs saved_initial
+        - ???????????????????????
+        - ????? TP ????????
+        - ??????????????
         """
         live_qty = self._resolve_live_qty(live_qty)
         saved_initial = self._safe_qty(getattr(self, "initial_qty", 0) or 0)
 
         # ============================================================
-        # Step 0: v16.18 交叉验证 - 用 live_qty 反推 initial，与 saved 对比
+        # Step 0: v16.18 ???? - ? live_qty ?? initial?? saved ??
         # ============================================================
         qty_check = self._verify_live_tp_completeness(live_qty, saved_initial)
 
         conservative_mode = qty_check["needs_conservative_mode"]
         if conservative_mode:
             logger.warning(
-                f"⚠️ [TP恢复] 置信度={qty_check['confidence']} | "
-                f"偏差={qty_check['discrepancy_pct']:.1%} | 启用保守模式"
+                f"?? [TP??] ???={qty_check['confidence']} | "
+                f"??={qty_check['discrepancy_pct']:.1%} | ??????"
             )
-            # 重置补挂计数器（新持仓周期）
+            # ??????????????
             self._reset_tp_place_guard()
-            # 保守模式：直接查交易所验证，不依赖本地 tp_levels_consumed
+            # ??????????????????? tp_levels_consumed
             result = self._conservative_tp_recover(
                 live_qty, entry, dynamic_sl=dynamic_sl,
             )
@@ -6515,54 +6578,54 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             expected = audit["expected"]
             if matched >= expected and not audit.get("orphans"):
                 logger.info(
-                    f"✅ [保守] TP 恢复完成 | {matched}/{expected} | "
-                    f"补挂={result['placed']} | 跳过={result['skipped']} | "
-                    f"拦截={result['guarded']}"
+                    f"? [??] TP ???? | {matched}/{expected} | "
+                    f"??={result['placed']} | ??={result['skipped']} | "
+                    f"??={result['guarded']}"
                 )
                 return matched, audit["pending_prices"], expected, result["placed"] > 0
-            # 保守模式也失败，降级走常规流程（但带安全上限）
+            # ???????????????????????
             logger.warning(
-                f"⚠️ [保守] TP 仍不齐 ({matched}/{expected})，降级常规流程"
+                f"?? [??] TP ??? ({matched}/{expected})???????"
             )
 
         # ============================================================
-        # Step 1: 常规防线审计
+        # Step 1: ??????
         # ============================================================
         audit = self._audit_tp_levels(live_qty)
         expected = audit["expected"]
         matched = audit["matched_full"]
         pending_prices = audit["pending_prices"]
         logger.info(
-            f"📊 防线审计: 持仓 {live_qty}张 | TP {matched}/{expected} | "
+            f"?? ????: ?? {live_qty}? | TP {matched}/{expected} | "
             f"{self._format_audit_summary(audit)}"
         )
 
         if self._audit_requires_nuclear(audit) or self._has_duplicate_tp_orders():
             logger.warning(
-                f"☢️ 审计触发核武级重挂: {len(self._collect_tp_limit_orders())} 张止盈 | "
+                f"?? ?????????: {len(self._collect_tp_limit_orders())} ??? | "
                 f"{self._format_audit_summary(audit)}"
             )
-            # v16.18 核武前检查补挂安全上限
+            # v16.18 ???????????
             guard_ok, _ = self._check_tp_place_guard(level=0)
             if not guard_ok:
                 logger.warning(
-                    f"⛔ 核武被 TP 补挂安全上限拦截！累计补挂="
+                    f"? ??? TP ?????????????="
                     f"{getattr(self, '_tp_place_guard_count', 0)}/{RECOVER_TP_PLACE_GUARD_MAX}"
                 )
-                # 仍然允许核武（撤单行为），但记录为异常
+                # ???????????????????
             audit = self._nuclear_realign_tp(live_qty, entry, dynamic_sl=dynamic_sl, rounds=3)
             return audit["matched_full"], audit["pending_prices"], audit["expected"], True
 
         if self._defenses_fully_ok(live_qty, dynamic_sl):
             logger.info(
-                f"✅ TP123 比例齐全 ({matched}/{expected}) @ {pending_prices}，跳过补挂"
+                f"? TP123 ???? ({matched}/{expected}) @ {pending_prices}?????"
             )
             if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
                 self._ensure_radar_sl(live_qty, dynamic_sl)
             return matched, pending_prices, expected, False
 
         self._cancel_orphan_tp_orders(live_qty)
-        logger.info(f"📋 止盈未齐 ({matched}/{expected})，增量补挂缺失档（保留已有正确单）")
+        logger.info(f"?? ???? ({matched}/{expected})?????????????????")
         self._patch_missing_tp_levels(live_qty)
         time.sleep(0.8)
         matched, pending_prices = self._wait_tp_hung(
@@ -6572,13 +6635,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         matched = audit["matched_full"]
 
         if self._defenses_fully_ok(live_qty, dynamic_sl):
-            logger.info(f"✅ 增量补挂成功 ({matched}/{expected}) @ {audit['pending_prices']}")
+            logger.info(f"? ?????? ({matched}/{expected}) @ {audit['pending_prices']}")
             if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
                 self._ensure_radar_sl(live_qty, dynamic_sl)
             return matched, audit["pending_prices"], expected, True
 
         logger.warning(
-            f"⚠️ 增量补挂仍不足 ({matched}/{expected}) {audit['issues']}，升级核武级重挂"
+            f"?? ??????? ({matched}/{expected}) {audit['issues']}????????"
         )
         audit = self._nuclear_realign_tp(live_qty, entry, dynamic_sl=dynamic_sl, rounds=3)
         return audit["matched_full"], audit["pending_prices"], audit["expected"], True
@@ -6593,7 +6656,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 "pending_prices": [], "rebuilt": False, "audit": audit, "nuclear": False,
             }
 
-        # 【修复】防抖冷却：TP 已对齐时跳过；TP 未对齐时强制补挂
+        # ?????????TP ???????TP ????????
         now = time.time()
         if not recover_mode and not getattr(self, "_force_defense_realign", False):
             last_align = getattr(self, "_last_defense_align_ok_ts", 0) or 0
@@ -6601,8 +6664,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if now - last_align < DEFENSE_ALIGN_COOLDOWN_SEC:
                 if self._tp_audit_ok(audit):
                     logger.info(
-                        f"🛡️ 防线对齐冷却中（距上次 {now - last_align:.0f}s < {DEFENSE_ALIGN_COOLDOWN_SEC}s）"
-                        f"，TP 已齐，跳过撤挂 | {self._format_audit_summary(audit)}"
+                        f"??? ??????????? {now - last_align:.0f}s < {DEFENSE_ALIGN_COOLDOWN_SEC}s?"
+                        f"?TP ??????? | {self._format_audit_summary(audit)}"
                     )
                     return {
                         "matched": audit["matched_full"],
@@ -6612,27 +6675,27 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         "audit": audit,
                         "nuclear": False,
                     }
-                # 【关键修复】TP 未对齐时，即使在冷却期也必须补挂
+                # ??????TP ????????????????
                 logger.warning(
-                    f"🛡️ 防线对齐冷却中（距上次 {now - last_align:.0f}s < {DEFENSE_ALIGN_COOLDOWN_SEC}s）"
-                    f"，但 TP 未对齐 → 强制补挂 | {self._format_audit_summary(audit)}"
+                    f"??? ??????????? {now - last_align:.0f}s < {DEFENSE_ALIGN_COOLDOWN_SEC}s?"
+                    f"?? TP ??? ? ???? | {self._format_audit_summary(audit)}"
                 )
 
         if reason:
-            logger.info(f"🛡️ 防线对齐: {reason} | 持仓 {live_qty}张")
+            logger.info(f"??? ????: {reason} | ?? {live_qty}?")
 
         self._defense_align_in_progress = True
         try:
-            # v16.22 修复：提前取现价，供后续所有分支使用
+            # v16.22 ??????????????????
             curr_px = deepcoin_client.get_current_price(self.symbol)
             audit = self._audit_tp_levels(live_qty)
 
             if recover_mode and self._tp_audit_ok(audit):
                 logger.info(
-                    f"✅ 重启接管：盘口 TP 已齐，跳过核武撤挂 | "
+                    f"? ??????? TP ????????? | "
                     f"{self._format_audit_summary(audit)}"
                 )
-                # v16.22 修复：TP 已齐时仍要维护硬止损（不能漏挂）
+                # v16.22 ???TP ????????????????
                 if curr_px is None:
                     curr_px = deepcoin_client.get_current_price(self.symbol)
                 self._maintain_hard_shield(live_qty, curr_px or 0, force=True)
@@ -6653,10 +6716,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 audit = repaired
                 if self._tp_audit_ok(audit):
                     logger.info(
-                        f"✅ 重启智能修复成功 ({n_actions} 步)，无需核武 | "
+                        f"? ???????? ({n_actions} ?)????? | "
                         f"{self._format_audit_summary(audit)}"
                     )
-                    # v16.22 修复：修复后也要维护硬止损
+                    # v16.22 ?????????????
                     if curr_px is None:
                         curr_px = deepcoin_client.get_current_price(self.symbol)
                     self._maintain_hard_shield(live_qty, curr_px or 0, force=True)
@@ -6672,12 +6735,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         "nuclear": False,
                     }
                 logger.warning(
-                    f"⚠️ 重启智能修复后仍不齐 ({n_actions} 步) → 升级核武 | "
+                    f"?? ?????????? ({n_actions} ?) ? ???? | "
                     f"{self._format_audit_summary(audit)}"
                 )
 
             if not recover_mode and self._tp_audit_ok(audit):
-                logger.info(f"✅ TP 已齐，跳过撤单: {self._format_audit_summary(audit)}")
+                logger.info(f"? TP ???????: {self._format_audit_summary(audit)}")
                 if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
                     self._ensure_radar_sl(live_qty, dynamic_sl)
                 self._mark_defense_align_ok()
@@ -6697,7 +6760,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             time.sleep(0.45)
             audit = self._audit_tp_levels(live_qty)
             if self._tp_audit_ok(audit):
-                logger.info(f"✅ 撤单后 TP 已齐: {self._format_audit_summary(audit)}")
+                logger.info(f"? ??? TP ??: {self._format_audit_summary(audit)}")
                 if dynamic_sl and not self._has_trigger_sl_near(dynamic_sl):
                     self._ensure_radar_sl(live_qty, dynamic_sl)
                 self._mark_defense_align_ok()
@@ -6715,7 +6778,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 live_qty, entry, dynamic_sl=sl_preserve, rounds=rounds,
             )
             if audit["matched_full"] < audit["expected"]:
-                logger.warning("☢️ 首轮核武未齐，追加一轮重挂")
+                logger.warning("?? ?????????????")
                 if recover_mode:
                     self._scorched_earth_cancel_for_recover()
                 else:
@@ -6758,6 +6821,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         audit = self._audit_tp_levels(real_amt)
         sl = self._radar_sl_to_pass()
 
+        if audit.get("query_failed"):
+            logger.warning(
+                f"?? [????] ?????? ? ??????????????????"
+            )
+            return None
+
         if self._tp_audit_ok(audit):
             self._guardian_bad_streak = 0
             if sl and not self._has_trigger_sl_near(sl):
@@ -6768,40 +6837,51 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         now = time.time()
         severe = self._defense_needs_immediate_fix(audit)
         in_grace = now < getattr(self, "_sentinel_grace_until", 0)
-        in_cooldown = (
-            now - getattr(self, "_last_defense_align_ok_ts", 0)
-            < DEFENSE_ALIGN_COOLDOWN_SEC
-        )
-        if (in_grace or in_cooldown) and not severe and self._guardian_bad_streak < 2:
+        # binance parity (eb0dc4c): quiet window scales with bad_streak
+        # instead of a flat 30s -- repeated audit misses under order
+        # propagation delay/IP rate limit should back off *more*, not less.
+        # The old "bypass once streak>=2" behavior was backwards: it made
+        # protection weaker exactly when the audit was proving unreliable.
+        streak = int(getattr(self, "_guardian_bad_streak", 0) or 0)
+        since_ok = now - getattr(self, "_last_defense_align_ok_ts", 0)
+        quiet_sec = DEFENSE_ALIGN_COOLDOWN_SEC * (1 + min(streak, 4))
+        in_cooldown = since_ok < quiet_sec
+        if (in_grace or in_cooldown) and not severe:
             logger.info(
-                f"📡 [雷达守护] TP 审计波动，暂不重挂 "
-                f"({'重启宽限期' if in_grace else '冷却期'}) | "
+                f"?? [????] TP ????????? "
+                f"({'?????' if in_grace else f'???{since_ok:.0f}s/{quiet_sec}s streak={streak}'}) | "
                 f"{self._format_audit_summary(audit)}"
             )
             return None
 
         logger.warning(
-            f"📡 [雷达守护] TP 未对齐 → 撤单重算重挂 | "
+            f"?? [????] TP ??? ? ?????? | "
             f"{self._format_audit_summary(audit)}"
         )
+        # binance parity (8a279a9): a cooldown-period bypass (severe/naked
+        # case forced through despite in_cooldown) uses rounds=1, not the
+        # normal 3 -- order-propagation lag during the cooldown window can
+        # make a still-settling audit look wrong, and rounds=3 in that state
+        # risks a cancel/place/cancel loop instead of one clean correction.
+        rounds = 1 if in_cooldown else 3
         sl_preserve = sl if self._is_radar_active() else None
         result = self._enforce_defense_alignment(
             real_amt, self.watched_entry, dynamic_sl=sl_preserve,
-            reason="雷达守护实时纠偏", rounds=3,
+            reason="????????", rounds=rounds,
         )
         new_audit = result["audit"]
         if new_audit["matched_full"] < new_audit["expected"]:
             self._call_telegram_notify(
                 telegram_notify.report_system_alert,
-                title="雷达守护：止盈仍未对齐",
+                title="???????????",
                 detail=(
-                    f"{self.current_side} {real_amt}张 | "
-                    f"{self._format_audit_summary(new_audit)} | 请人工核查 Deepcoin 挂单"
+                    f"{self.current_side} {real_amt}? | "
+                    f"{self._format_audit_summary(new_audit)} | ????? Deepcoin ??"
                 ),
             )
         elif self._defense_needs_immediate_fix(audit):
             logger.info(
-                f"📡 [雷达守护] 纠偏完成: "
+                f"?? [????] ????: "
                 f"{new_audit['matched_full']}/{new_audit['expected']} | "
                 f"{self._format_audit_summary(new_audit)}"
             )
@@ -6813,7 +6893,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     qty=real_amt,
                     tp_audit=new_audit,
                     verify_note=(
-                        f"重启接管竞态后雷达已纠偏 | "
+                        f"???????????? | "
                         f"{new_audit['matched_full']}/{new_audit['expected']} | "
                         f"{self._format_audit_summary(new_audit)}"
                     ),
@@ -6826,7 +6906,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     qty=real_amt,
                     tp_audit=new_audit,
                     verify_note=(
-                        f"开仓后雷达已纠偏 | "
+                        f"???????? | "
                         f"{new_audit['matched_full']}/{new_audit['expected']} | "
                         f"{self._format_audit_summary(new_audit)}"
                     ),
@@ -6835,14 +6915,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _full_rebuild_tp_loop(self, live_qty, entry, dynamic_sl=None):
         result = self._enforce_defense_alignment(
-            live_qty, entry, dynamic_sl=dynamic_sl, reason="全量重建", rounds=3,
+            live_qty, entry, dynamic_sl=dynamic_sl, reason="????", rounds=3,
         )
         audit = result["audit"]
         return audit["matched_full"], audit["pending_prices"], audit["expected"]
 
     def _smart_realign_defenses(self, live_qty, entry, dynamic_sl=None, reason=""):
         return self._enforce_defense_alignment(
-            live_qty, entry, dynamic_sl=dynamic_sl, reason=reason or "智能防线对齐", rounds=3,
+            live_qty, entry, dynamic_sl=dynamic_sl, reason=reason or "??????", rounds=3,
         )
 
     def _place_radar_sl(self, live_qty, sl_price):
@@ -6855,16 +6935,35 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             order_type="market", td_mode="cross", mrg_position="merge",
         )
 
-    def _has_tp_limit_at_price(self, price, tolerance=1.0):
+    def _has_tp_limit_at_price(self, price, tolerance=0.1):
+        # binance parity (129cd68): tightened from a loose 1.0 -- with a 0.01
+        # tick size a $1 tolerance risks matching a stale orphan order at a
+        # nearby-but-wrong price as if it were the real TP, which both hides
+        # the orphan from cleanup and blocks a legitimate re-place.
         if price <= 0:
             return False
-        for o in self._collect_tp_limit_orders():
+        orders = self._collect_tp_limit_orders()
+        # binance parity (52d26bd): a failed pending-orders query must never
+        # be read as "this TP is missing" -- that would trigger a re-place
+        # against an order that may well still be live on the exchange,
+        # which is exactly the stacked-duplicate-LIMIT-orders incident this
+        # codebase's own README calls out as the historical worst case.
+        # Conservatively assume "already exists" (blocks re-place for one
+        # cycle) rather than "missing" (would stack); TP is reduceOnly so a
+        # one-cycle placement delay is the safe side of this tradeoff.
+        if not getattr(deepcoin_client, "_last_pending_orders_query_ok", True):
+            logger.warning(
+                f"[{self.symbol}] TP query failed @{price:.2f} -> "
+                f"conservatively assume exists, block re-place"
+            )
+            return True
+        for o in orders:
             if abs(o["price"] - price) <= tolerance:
                 return True
         return False
 
     def _detect_tp_fills(self, old_qty, new_qty, curr_px=0.0):
-        """仅成交史/盘口消失+价到+量匹配；禁止纯减仓软推断启雷达"""
+        """????/????+??+???????????????"""
         if new_qty >= old_qty:
             return []
         initial = self._safe_qty(
@@ -6878,7 +6977,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self.initial_qty = initial
             self._save_state()
 
-        # Deepcoin 无成交明细时：盘口 TP 消失 + 价到 + 减仓匹配
+        # Deepcoin ????????? TP ?? + ?? + ????
         consumed_before = set(getattr(self, "tp_levels_consumed", []) or [])
         reduced = self._safe_qty(old_qty) - self._safe_qty(new_qty)
         noise = max(1, int(round(initial * 0.02)))
@@ -6909,8 +7008,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         soft = self._infer_tp_consumed_sequential(initial, new_qty, curr_px)
         if soft:
             logger.info(
-                f"🧮 软推断 TP{soft} 已忽略作成交证据 "
-                f"(基线 {initial}→{new_qty} | 需价到TP+限价消失+量匹配)"
+                f"?? ??? TP{soft} ???????? "
+                f"(?? {initial}?{new_qty} | ???TP+????+???)"
             )
         return []
 
@@ -6932,7 +7031,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     cancelled += 1
                     time.sleep(0.2)
         if cancelled:
-            logger.info(f"🧹 撤净已成交 TP 残留单 {cancelled} 张")
+            logger.info(f"?? ????? TP ??? {cancelled} ?")
         return cancelled
 
     def _cancel_mismatched_remaining_tps(self, live_qty, tolerance=1.0):
@@ -6951,8 +7050,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     cancelled += 1
                     time.sleep(0.2)
                     logger.info(
-                        f"🔧 撤偏差 TP{lv['level']} @{px:.2f}: "
-                        f"盘口 {o['qty']} → 应 {target_q}张"
+                        f"?? ??? TP{lv['level']} @{px:.2f}: "
+                        f"?? {o['qty']} ? ? {target_q}?"
                     )
         return cancelled
 
@@ -6967,8 +7066,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             px = self.tv_tps[idx] if 0 <= idx < len(self.tv_tps) else 0
             if px > 0 and self._has_tp_limit_at_price(px):
                 logger.warning(
-                    f"⚠️ 多余 TP{lv} @{px:.2f} "
-                    f"(开单 {initial_qty} → 现仓 {live_qty}张，该档应已成交)"
+                    f"?? ?? TP{lv} @{px:.2f} "
+                    f"(?? {initial_qty} ? ?? {live_qty}????????)"
                 )
         return consumed
 
@@ -6982,14 +7081,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             }
         consumed = getattr(self, "tp_levels_consumed", []) or []
         logger.info(
-            f"🎯 TP 成交后静默对齐: 剩余 {live_qty}张 | "
-            f"已成交 TP{consumed} | 只补未成交档"
+            f"?? TP ???????: ?? {live_qty}? | "
+            f"??? TP{consumed} | ??????"
         )
         self._cancel_tp_orders_at_levels(consumed)
         time.sleep(0.35)
         n_fix = self._cancel_mismatched_remaining_tps(live_qty)
         if n_fix:
-            logger.info(f"🔧 TP 成交对齐：撤偏差剩余档 {n_fix} 张")
+            logger.info(f"?? TP ??????????? {n_fix} ?")
             time.sleep(0.35)
         placed = self._patch_missing_tp_levels(live_qty)
         time.sleep(0.5)
@@ -6998,7 +7097,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._ensure_radar_sl(live_qty, dynamic_sl)
         if placed == 0 and self._tp_audit_ok(audit):
             logger.info(
-                f"✅ TP 成交后盘口已齐 ({audit['matched_full']}/{audit['expected']})"
+                f"? TP ??????? ({audit['matched_full']}/{audit['expected']})"
             )
         elif not self._tp_audit_ok(audit):
             repaired, _ = self._surgical_repair_tp_defenses(live_qty, self.watched_entry)
@@ -7024,7 +7123,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             inferred = self._infer_tp_consumed_sequential(initial_qty, live_qty, curr_px)
             if not inferred:
                 logger.warning(
-                    f"跳过部分止盈修复：无减仓证据，清除 TP{consumed}"
+                    f"????????????????? TP{consumed}"
                 )
                 self.tp_levels_consumed = []
                 self._save_state()
@@ -7039,7 +7138,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.tp_levels_consumed = stale_levels
                 self._save_state()
             actions.append(
-                f"已成交档 TP{stale_levels} | 开单 {initial_qty} → 现仓 {live_qty}张"
+                f"???? TP{stale_levels} | ?? {initial_qty} ? ?? {live_qty}?"
             )
 
         consumed = getattr(self, "tp_levels_consumed", []) or []
@@ -7051,7 +7150,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.tp_levels_consumed = inferred
                 self._save_state()
                 consumed = inferred
-                actions.append(f"推断已成交 TP{inferred}")
+                actions.append(f"????? TP{inferred}")
         if not consumed:
             return {"repaired": False, "actions": actions, "result": None, "consumed": []}
 
@@ -7059,8 +7158,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._sanitize_tp_consumed(initial_qty, live_qty, curr_px)
             if self._expected_tp_count() == 0 and live_qty > DUST_ORPHAN_CONTRACTS:
                 logger.warning(
-                    f"⚠️ 仍有 {live_qty}张 且无待挂 TP → TP1+TP2 已尽，"
-                    f"余仓交雷达（不挂TP3限价）"
+                    f"?? ?? {live_qty}? ???? TP ? TP1+TP2 ???"
+                    f"????????TP3???"
                 )
                 self.tp_levels_consumed = [1, 2]
                 try:
@@ -7071,10 +7170,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         n_stale = self._cancel_tp_orders_at_levels(consumed)
         if n_stale:
-            actions.append(f"撤多余已成交档 {n_stale} 张")
+            actions.append(f"??????? {n_stale} ?")
         n_mismatch = self._cancel_mismatched_remaining_tps(live_qty)
         if n_mismatch:
-            actions.append(f"撤偏差 TP {n_mismatch} 张")
+            actions.append(f"??? TP {n_mismatch} ?")
         time.sleep(0.4)
 
         sl_to_pass = self._radar_sl_to_pass()
@@ -7088,14 +7187,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 )
 
         result = self._realign_remaining_tps_after_fill(
-            live_qty, dynamic_sl=sl_to_pass, reason="重启部分止盈修复",
+            live_qty, dynamic_sl=sl_to_pass, reason="????????",
         )
         rem_levels = self._expected_tp_levels(live_qty)
         rem_sum = sum(lv["qty"] for lv in rem_levels)
         audit = result.get("audit") or {}
         actions.append(
-            f"剩余 TP 重分 {rem_sum}/{live_qty}张 | "
-            f"对齐 {audit.get('matched_full', 0)}/{audit.get('expected', 0)} 档"
+            f"?? TP ?? {rem_sum}/{live_qty}? | "
+            f"?? {audit.get('matched_full', 0)}/{audit.get('expected', 0)} ?"
         )
         return {
             "repaired": True,
@@ -7164,7 +7263,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return None
         if not getattr(self, "_radar_armed_after_tp1", False) and not self._price_reached_tp1_zone(curr_px):
             logger.warning(
-                "📡 [雷达推进] 跳过：TP1 证据不足，保持阶段0宽硬止损"
+                "?? [????] ???TP1 ?????????0????"
             )
             return None
         for f in tp_fills:
@@ -7177,22 +7276,30 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         max_level = max(f["level"] for f in tp_fills)
         tp3 = self.tv_tps[2] if len(self.tv_tps) > 2 else 0.0
         self._radar_armed_after_tp1 = True
-        new_sl = self._compute_radar_sl(curr_px)
-        floor_px = self._radar_breakeven_floor()
-        if new_sl is not None:
-            if self.current_side == "LONG":
-                self.current_sl = max(self.current_sl or floor_px, new_sl, floor_px)
-            else:
-                self.current_sl = min(self.current_sl or floor_px, new_sl, floor_px)
-        elif max_level >= 1:
-            self.current_sl = floor_px
-        note = f"TP{max_level}成交"
+        # binance parity (a62117a): TP1 touch alone is never sufficient to
+        # advance the tracked stop to breakeven/radar level -- only the
+        # (TP1+TP2)/2 midpoint (or TP2 on reentry) gate may do that, per spec
+        # v1.0 5.1/5.2. Without this check, current_sl silently jumps to
+        # breakeven the instant TP1 fills, before the real activation gate is
+        # reached, which is the same "TP1触及即启动" bug binance's live ETH
+        # LONG incident traced back to.
+        if self._should_radar_trail(curr_px):
+            new_sl = self._compute_radar_sl(curr_px)
+            floor_px = self._radar_breakeven_floor()
+            if new_sl is not None:
+                if self.current_side == "LONG":
+                    self.current_sl = max(self.current_sl or floor_px, new_sl, floor_px)
+                else:
+                    self.current_sl = min(self.current_sl or floor_px, new_sl, floor_px)
+            elif max_level >= 1:
+                self.current_sl = floor_px
+        note = f"TP{max_level}??"
         if max_level >= 2 and tp3 > 0:
-            note += f" → 雷达止损向 TP3({tp3:.2f}) 动态收紧"
+            note += f" ? ????? TP3({tp3:.2f}) ????"
         elif max_level == 1:
-            note += " → 雷达保本启动，静默守 TP2/TP3"
+            note += " ? ?????????? TP2/TP3"
         logger.info(
-            f"📈 [雷达推进] {note} | SL={self.current_sl:.2f} | best={self.best_price:.2f}"
+            f"?? [????] {note} | SL={self.current_sl:.2f} | best={self.best_price:.2f}"
         )
         self._save_state()
         return self.current_sl if self.current_sl else None
@@ -7207,7 +7314,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             sl_to_pass = self._radar_sl_to_pass()
             result = self._smart_realign_defenses(
                 new_qty, self.watched_entry, dynamic_sl=sl_to_pass,
-                reason="加仓后防线对齐",
+                reason="???????",
             )
             if self._should_activate_shield(curr_px):
                 self._maintain_hard_shield(new_qty, curr_px, force=True)
@@ -7218,19 +7325,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             if not evidence_ok:
                 logger.warning(
-                    f"🎯 [智慧大脑] {levels} 疑似伪成交"
-                    f"（价未达TP1 / 开仓重建竞态）→ 不标记·不启雷达 | "
-                    f"{old_qty}→{new_qty}"
+                    f"?? [????] {levels} ?????"
+                    f"????TP1 / ???????? ???????? | "
+                    f"{old_qty}?{new_qty}"
                 )
                 logger.warning(
-                    f"[钉钉已关闭] 雷达拒启·伪TP1拦截 | "
-                    f"{self.current_side} {old_qty}→{new_qty}张 | {levels} | "
-                    f"现价 {float(curr_px or 0):.2f} | "
-                    f"规则：TP1限价实盘成交前不激活雷达"
+                    f"[?????] ??????TP1?? | "
+                    f"{self.current_side} {old_qty}?{new_qty}? | {levels} | "
+                    f"?? {float(curr_px or 0):.2f} | "
+                    f"???TP1????????????"
                 )
                 result = self._smart_realign_defenses(
                     new_qty, self.watched_entry, dynamic_sl=None,
-                    reason="伪TP拦截·保宽硬止损",
+                    reason="?TP????????",
                 )
                 if self._should_activate_shield(curr_px) or getattr(
                     self, "shield_active", False
@@ -7240,7 +7347,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._save_state()
                 return change, result
             logger.info(
-                f"🎯 [智慧大脑] {levels} 成交减仓 {old_qty} ➔ {new_qty} → 雷达推进 + 守剩余TP"
+                f"?? [????] {levels} ???? {old_qty} ? {new_qty} ? ???? + ???TP"
             )
             self._mark_tp_levels_consumed([f["level"] for f in change["tp_fills"]])
             self._radar_armed_after_tp1 = True
@@ -7252,11 +7359,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             result = self._realign_remaining_tps_after_fill(
                 new_qty, dynamic_sl=sl_to_pass,
-                reason=f"{levels} 成交静默对齐",
+                reason=f"{levels} ??????",
             )
             if sl_to_pass and not getattr(self, "_radar_activation_notified", False):
                 self._perform_radar_handoff(
-                    new_qty, curr_px_safe, reason=f"{levels} 成交雷达接管",
+                    new_qty, curr_px_safe, reason=f"{levels} ??????",
                 )
             elif sl_to_pass and not self._has_trigger_sl_near(sl_to_pass):
                 clamped = self._clamp_radar_sl_for_market(
@@ -7267,18 +7374,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         elif kind == "shield_fill":
             f = change["shield_fills"][0]
             logger.warning(
-                f"🛡️ [智慧大脑] TV硬止损成交 "
-                f"{old_qty} ➔ {new_qty} @ {f['price']:.2f}"
+                f"??? [????] TV????? "
+                f"{old_qty} ? {new_qty} @ {f['price']:.2f}"
             )
             if new_qty <= 0 or self._is_dust_qty(new_qty):
                 flat_meta = self._build_close_meta(
                     "CLOSE_STOPLOSS",
                     self.current_side,
                     self._estimate_pnl_pct(curr_px),
-                    "触碰硬止损平仓（TV tv_sl）",
+                    "????????TV tv_sl?",
                 )
                 flat_meta["close_type"] = CLOSE_TYPE_VPS_SHIELD
-                self._disarm_shield("TV硬止损全平", notify=False)
+                self._disarm_shield("TV?????", notify=False)
                 self._handle_manual_flat_detected(
                     flat_meta["tv_reason"],
                     close_meta=flat_meta,
@@ -7286,11 +7393,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 )
                 self._save_state()
                 return change, None
-            self._disarm_shield("TV硬止损成交", notify=True)
+            self._disarm_shield("TV?????", notify=True)
             self.shield_tiers_consumed = []
             result = self._smart_realign_defenses(
                 new_qty, self.watched_entry, dynamic_sl=None,
-                reason="硬止损成交后 TP 重算",
+                reason="?????? TP ??",
             )
             self._call_telegram_notify(
                 telegram_notify.report_shield_tier_fill,
@@ -7302,8 +7409,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 entry_px=self.watched_entry,
                 remaining_tiers=[],
                 verify_note=(
-                    f"硬止损 -{f['pct']:.0%} @ {f['price']:.2f} 成交 | "
-                    f"剩余 {new_qty} 张"
+                    f"??? -{f['pct']:.0%} @ {f['price']:.2f} ?? | "
+                    f"?? {new_qty} ?"
                 ),
             )
         else:
@@ -7318,11 +7425,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             sl_to_pass = self._radar_sl_to_pass()
             result = self._smart_realign_defenses(
                 new_qty, self.watched_entry, dynamic_sl=sl_to_pass,
-                reason="人工异动重对齐",
+                reason="???????",
             )
             if self._should_disarm_shield_for_favorable(curr_px):
                 self._perform_radar_handoff(
-                    new_qty, curr_px, reason="TP后切换雷达保本",
+                    new_qty, curr_px, reason="TP???????",
                 )
             elif self._should_activate_shield(curr_px) or getattr(self, "shield_active", False):
                 self._maintain_hard_shield(new_qty, curr_px, force=True)
@@ -7331,7 +7438,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return change, result
 
     def _report_qty_change_dingtalk(self, old_qty, new_qty, realign_result, change=None):
-        """TP 成交 / 减仓：REST 重试核查后必达钉钉"""
+        """TP ?? / ???REST ?????????"""
         verified_pos = self._wait_verify(
             lambda: self._verify_position(self.current_side),
             retries=8,
@@ -7346,8 +7453,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if verified_pos else self.watched_entry
         )
         verify_note = (
-            f"核实 {new_qty}张 @ {entry_px:.2f} | "
-            f"止盈 {realign_result['matched']}/{realign_result['expected']} 档 | "
+            f"?? {new_qty}? @ {entry_px:.2f} | "
+            f"?? {realign_result['matched']}/{realign_result['expected']} ? | "
             f"{self._format_audit_summary(realign_result['audit'])}"
         )
         if not verified:
@@ -7373,12 +7480,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     verified=verified,
                 )
                 logger.info(
-                    f"📣 TP{fill['level']} 成交钉钉已推送 @ {fill['price']:.2f} "
-                    f"({fill['qty']}张)"
+                    f"?? TP{fill['level']} ??????? @ {fill['price']:.2f} "
+                    f"({fill['qty']}?)"
                 )
         else:
             action_msg = (
-                "手动加仓" if new_qty > old_qty else "部分止盈吃单 / 手动减仓"
+                "????" if new_qty > old_qty else "?????? / ????"
             )
             self._call_telegram_notify(
                 telegram_notify.report_manual_position_change,
@@ -7393,11 +7500,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if realign_result["expected"] > 0 and realign_result["matched"] < realign_result["expected"]:
             logger.warning(
-                f"[钉钉已关闭] 人工异动后止盈未对齐 | {self._format_audit_summary(realign_result['audit'])}"
+                f"[?????] ?????????? | {self._format_audit_summary(realign_result['audit'])}"
             )
 
     def _report_radar_intervention(self, real_amt, new_sl, action_msg, sl_placed=True):
-        """雷达推止损：同价位冷却期内不重复播报"""
+        """??????????????????"""
         now = time.time()
         if (
             abs(new_sl - getattr(self, "_last_radar_report_sl", 0)) < 2.0
@@ -7410,16 +7517,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             delay=0.5,
         )
         base_note = (
-            f"条件止损 @ {new_sl:.2f} | 持仓 {real_amt}张 | 轮询 {SENTINEL_POLL_RADAR}s"
+            f"???? @ {new_sl:.2f} | ?? {real_amt}? | ?? {SENTINEL_POLL_RADAR}s"
         )
         if not sl_placed and not verified:
-            logger.warning(f"雷达钉钉：止损 @ {new_sl:.2f} 提交失败且盘口未核查到")
+            logger.warning(f"??????? @ {new_sl:.2f} ???????????")
             return
         if verified:
             verify_note = base_note
         else:
             verify_note = f"{base_note} | {telegram_notify.VERIFY_DELAY_MARK}"
-            logger.info(f"雷达钉钉：止损已挂 REST 延迟，仍推送 @{new_sl:.2f}")
+            logger.info(f"????????? REST ?????? @{new_sl:.2f}")
         self._call_telegram_notify(
             telegram_notify.report_intervention,
             qty=real_amt,
@@ -7433,7 +7540,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._last_radar_report_sl = new_sl
 
     def _realign_radar_defenses(self, live_qty, entry, new_sl):
-        """雷达推升：TP 异常才核武；止损单独换"""
+        """?????TP ???????????"""
         new_sl = self._clamp_radar_to_tv_floor(new_sl)
         self._cancel_stop_orders(scope="radar")
         time.sleep(0.35)
@@ -7441,7 +7548,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if self._defense_needs_immediate_fix(audit):
             self._enforce_defense_alignment(
                 live_qty, entry, dynamic_sl=new_sl,
-                reason="雷达推升前 TP 纠偏", rounds=2,
+                reason="????? TP ??", rounds=2,
             )
         sl_placed = self._ensure_radar_sl(live_qty, new_sl)
         if not sl_placed:
@@ -7467,7 +7574,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return matched, pending
 
     def _wait_defense_settled(self, live_qty, dynamic_sl=None, retries=8, delay=0.75):
-        """给撤单/重挂留 REST 同步窗口，避免接管未完成时误报"""
+        """???/??? REST ???????????????"""
         sl = dynamic_sl if dynamic_sl is not None else self._resolve_defense_stop_for_audit()
         last = self._audit_tp_levels(live_qty)
         for i in range(retries):
@@ -7499,7 +7606,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return checks_fn()
 
     def _calculate_tp_quantities(self, total_qty: int, ratios: list) -> tuple:
-        """深币最小 1 张限制 + 余数吸收：qty1+qty2+qty3 恒等于 total_qty"""
+        """???? 1 ??? + ?????qty1+qty2+qty3 ??? total_qty"""
         if total_qty <= 0:
             return 0, 0, 0
 
@@ -7522,41 +7629,44 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if qty3 == 0 and remaining >= 2 and qty2 > 1:
             qty3, qty2 = 1, remaining - 1
 
-        assert qty1 + qty2 + qty3 == total_qty, f"TP 分档不守恒: {qty1}+{qty2}+{qty3}!={total_qty}"
+        assert qty1 + qty2 + qty3 == total_qty, f"TP ?????: {qty1}+{qty2}+{qty3}!={total_qty}"
         return qty1, qty2, qty3
 
     def _resolve_live_qty(self, fallback_qty: int) -> int:
-        """挂 reduceOnly 前重新读取交易所落账张数，避免冻结/部分成交导致数量漂移"""
+        """? reduceOnly ?????????????????/??????????"""
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.warning(f"?? ??????????? ? ?? fallback={fallback_qty}")
+            return self._safe_qty(fallback_qty)
         if pos and self._safe_qty(pos.get("size")) > 0:
             live = self._safe_qty(pos["size"])
             if live != fallback_qty:
-                logger.info(f"📐 实盘张数校正: 账本 {fallback_qty} → 交易所 {live}")
+                logger.info(f"?? ??????: ?? {fallback_qty} ? ??? {live}")
             self._last_flat_qty_zero_ts = 0.0
             return live
-        # 规格 §9.6 平仓幂等性：无持仓直接返回0，不使用fallback避免幽灵单
-        # 5秒内重复归零只记一次，避免日志刷屏
+        # ?? ?9.6 ?????????????0????fallback?????
+        # 5?????????????????
         now = time.time()
         prev = float(getattr(self, "_last_flat_qty_zero_ts", 0.0) or 0.0)
         if now - prev > 5.0:
-            logger.warning(f"📐 实盘张数归零: 账本 {fallback_qty} → 交易所 0")
+            logger.warning(f"?? ??????: ?? {fallback_qty} ? ??? 0")
         self._last_flat_qty_zero_ts = now
         return 0
 
     def handle_signal(self, payload):
-        """兼容旧调用路径"""
+        """???????"""
         payload = self._enrich_tv_payload(dict(payload or {}))
         self.enqueue_signal(payload)
 
     def _enrich_tv_payload(self, payload):
-        """v6.9.75：TV 全量 regime/atr/tp 优先，仅缺失项本地补全。"""
+        """v6.9.75?TV ?? regime/atr/tp ????????????"""
         action = str(payload.get("action", "")).strip().upper()
         live_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price or 0.0
         return enrich_signal_fields(
             payload,
             action,
             fallback_regime=self.regime or 3,
-            fallback_atr=self.current_atr or 30.0,
+            fallback_atr=self.current_atr or symbol_aware_atr_fallback(self.symbol),
             fallback_price=live_px,
         )
 
@@ -7566,15 +7676,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
     def _format_close_extra(self, close_side, pnl_pct, tv_price, regime=None, atr=None):
         parts = []
         if close_side:
-            parts.append(f"TV方向 {close_side}")
+            parts.append(f"TV?? {close_side}")
         if regime:
-            parts.append(f"TV档位 R{int(regime)}")
+            parts.append(f"TV?? R{int(regime)}")
         if atr and float(atr) > 0:
             parts.append(f"TV ATR {float(atr):.2f}")
         if tv_price and float(tv_price) > 0:
-            parts.append(f"TV价 {float(tv_price):.2f}")
+            parts.append(f"TV? {float(tv_price):.2f}")
         if pnl_pct is not None and pnl_pct != "":
-            parts.append(f"TV盈亏 {self._safe_float(pnl_pct):+.2f}%")
+            parts.append(f"TV?? {self._safe_float(pnl_pct):+.2f}%")
         return (" | " + " | ".join(parts)) if parts else ""
 
     def _estimate_pnl_pct(self, curr_px):
@@ -7603,6 +7713,66 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             "closed_qty": self._safe_qty(self.watched_qty or self.initial_qty),
         }
 
+    def _note_adverse_extreme(self, curr_px):
+        """
+        binance parity (0e943a7): passively track this cycle's worst-direction
+        mark price (LONG: lowest seen, SHORT: highest seen) via the WS price
+        feed that is already running regardless of order-fill events. Never
+        feeds into any stop-loss/radar calculation -- purely evidence for
+        close-attribution fallback below, for the case where price spikes
+        through the hard stop and rebounds before the current-price
+        comparison in _likely_exchange_stop_exit runs (so that comparison
+        sees a price nowhere near the stop and misattributes the close as
+        "unknown source").
+        """
+        px = float(curr_px or 0)
+        if px <= 0:
+            return
+        side = str(self.current_side or "").strip().upper()
+        wp = float(getattr(self, "_adverse_worst_px", 0) or 0)
+        if side == "LONG":
+            new_wp = min(wp, px) if wp > 0 else px
+        elif side == "SHORT":
+            new_wp = max(wp, px) if wp > 0 else px
+        else:
+            return
+        if new_wp != wp:
+            self._adverse_worst_px = new_wp
+            self._adverse_worst_px_ts = time.time()
+
+    def _build_adverse_extreme_hint(self):
+        """
+        binance parity (0e943a7): if the worst-direction mark price this
+        cycle touched the frozen hard stop within the last 180s, treat that
+        as evidence of a pin-through-stop even if no WS fill report latched
+        and the current price has since rebounded away from the stop.
+        """
+        hard = float(self._frozen_hard_px() or 0)
+        worst = float(getattr(self, "_adverse_worst_px", 0) or 0)
+        worst_ts = float(getattr(self, "_adverse_worst_px_ts", 0) or 0)
+        side = str(self.current_side or "").strip().upper()
+        if hard <= 0 or worst <= 0 or worst_ts <= 0:
+            return None
+        if time.time() - worst_ts > 180.0:
+            return None
+        tol = max(3.0, hard * 0.003)
+        if side == "LONG":
+            touched = worst <= hard + tol
+        elif side == "SHORT":
+            touched = worst >= hard - tol
+        else:
+            touched = False
+        if not touched:
+            return None
+        logger.info(
+            f"[{self.symbol}] adverse-extreme fallback confirms hard-stop attribution "
+            f"worst={worst:.2f} hard={hard:.2f}"
+        )
+        return {
+            "sl": hard,
+            "worst": worst,
+        }
+
     def _infer_flat_close_meta(self, curr_px=0.0, hint_reason=""):
         if self._likely_exchange_stop_exit(curr_px) and not getattr(
             self, "_radar_activation_notified", False
@@ -7613,7 +7783,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 "CLOSE_STOPLOSS",
                 self.current_side,
                 est,
-                f"交易所止损触发 @ {sl:.2f} (TP1前宽止损/非雷达保本钉钉) | {hint_reason}",
+                f"??????? @ {sl:.2f} (TP1????/???????) | {hint_reason}",
+            )
+
+        adverse_hint = self._build_adverse_extreme_hint()
+        if adverse_hint and not getattr(self, "_radar_activation_notified", False):
+            est = self._estimate_pnl_pct(curr_px)
+            return self._build_close_meta(
+                "CLOSE_STOPLOSS",
+                self.current_side,
+                est,
+                f"pin-through hard stop @ {adverse_hint['sl']:.2f} "
+                f"(worst={adverse_hint['worst']:.2f}, no WS fill report) | {hint_reason}",
             )
 
         last = self.last_tv_signal or {}
@@ -7632,7 +7813,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if consumed >= {1, 2, 3}:
             return self._build_close_meta(
                 "CLOSE_TP3", self.current_side,
-                self._estimate_pnl_pct(curr_px), "TP3完美收网",
+                self._estimate_pnl_pct(curr_px), "TP3????",
             )
         if getattr(self, "_shield_handoff_notified", False) or getattr(
             self, "_radar_activation_notified", False
@@ -7645,15 +7826,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             return self._build_close_meta(
                 "CLOSE_STOPLOSS", self.current_side, est,
-                f"雷达保本止损触发 @ {sl:.2f} | {hint_reason}",
+                f"???????? @ {sl:.2f} | {hint_reason}",
             )
         if getattr(self, "shield_active", False):
             return self._build_close_meta(
                 "CLOSE_STOPLOSS", self.current_side,
                 self._estimate_pnl_pct(curr_px),
-                "触碰硬止损平仓（TV tv_sl）",
+                "????????TV tv_sl?",
             )
-        return self._build_close_meta("CLOSE", self.current_side, None, hint_reason or "仓位归零")
+        return self._build_close_meta("CLOSE", self.current_side, None, hint_reason or "????")
 
     def _enrich_close_meta_live(self, meta, curr_px=0.0):
         out = dict(meta or {})
@@ -7710,7 +7891,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if self.regime not in self.regime_settings:
                 self.regime = 3
 
-        # P0 修复：tier / tier_label 从 webhook 读取（TV 优先；缺失时本地推算）
+        # P0 ???tier / tier_label ? webhook ???TV ???????????
         tier_in = self._safe_int(payload.get("tier"), None)
         if tier_in is not None and tier_in in (0, 1, 2):
             self.adx_tier = tier_in
@@ -7718,7 +7899,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             tier_src = "tv"
         else:
             tier_src = "local"
-        # tier_label 透传至钉钉展示（不存状态，仅 payload 携带时透传）
+        # tier_label ?????????????? payload ??????
         self._last_tier_label = payload.get("tier_label") or ""
 
         atr_in = self._safe_float(payload.get("atr"), 0.0)
@@ -7763,38 +7944,46 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             "price": payload.get("_price_source", "tv"),
             "tier": tier_src,
         }
-        close_reason = str(payload.get("reason") or "策略指标反转/波动率安全退出").strip()
+        close_reason = str(payload.get("reason") or "??????/???????").strip()
         close_side = str(payload.get("side") or "").strip().upper()
         pnl_pct = payload.get("pnl_pct")
-        # 【BUG修复】is_close 在 _process_signal 中使用，但定义在 _process_close_action 中
-        # 对于非 close 信号 is_close 永远为 False（因为 side 不是 CLOSE 类）
+        # ?BUG???is_close ? _process_signal ???????? _process_close_action ?
+        # ??? close ?? is_close ??? False??? side ?? CLOSE ??
         is_close = (
             raw_action in ("CLOSE", "CLOSE_PROTECT", "CLOSE_TP3", "CLOSE_STOPLOSS", "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT")
             or str(raw_action or "").startswith("CLOSE")
         )
 
-        # P0 修复：CLOSE 方向校验 — 反向信号立即丢弃并告警
+        # P0 ???CLOSE ???? ? ???????????
         if is_close and close_side in ("LONG", "SHORT"):
             live_pos = self._get_active_position()
+            if live_pos == "QUERY_FAILED":
+                logger.error(
+                    f"?? CLOSE ???????? ? ????? [{self.symbol}] | {close_reason or raw_action}"
+                )
+                return
             if live_pos and self._safe_qty(live_pos.get("size", 0)) > 0:
                 pos_side = "LONG" if str(live_pos.get("posSide") or "").lower() == "long" else "SHORT"
                 if close_side != pos_side:
                     logger.warning(
-                        f"🚫 CLOSE 方向不匹配 已拒绝 | "
-                        f"TV side={close_side} 持仓={pos_side} | "
-                        f"忽略反向 CLOSE，防止多空混乱"
+                        f"?? CLOSE ????? ??? | "
+                        f"TV side={close_side} ??={pos_side} | "
+                        f"???? CLOSE???????"
                     )
                     try:
                         logger.warning(
-                            f"[钉钉已关闭] CLOSE 方向不匹配 [{self.symbol}] | "
-                            f"TV={close_side} 持仓={pos_side} | 已拒绝 | {close_reason or raw_action}"
+                            f"[?????] CLOSE ????? [{self.symbol}] | "
+                            f"TV={close_side} ??={pos_side} | ??? | {close_reason or raw_action}"
                         )
                     except Exception:
                         pass
                     return
         elif is_close and close_side not in ("LONG", "SHORT"):
-            # 无 side 字段时用持仓方向补全（向后兼容）
+            # ? side ????????????????
             live_pos = self._get_active_position()
+            if live_pos == "QUERY_FAILED":
+                logger.warning(f"?? CLOSE ??????? side ??????? [{self.symbol}]")
+                live_pos = None
             if live_pos and self._safe_qty(live_pos.get("size", 0)) > 0:
                 close_side = "LONG" if str(live_pos.get("posSide") or "").lower() == "long" else "SHORT"
 
@@ -7804,7 +7993,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         )
 
         if not raw_action:
-            logger.warning("TV 信号缺少 action，已忽略")
+            logger.warning("TV ???? action????")
             return
         if raw_action in (
             "LONG", "SHORT", "CLOSE", "CLOSE_PROTECT", "CLOSE_TP3",
@@ -7813,7 +8002,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._record_tv_signal(payload, raw_action)
 
         if not self._lock.acquire(timeout=120.0):
-            logger.error(f"⏱️ 锁等待 120s 超时，信号 {raw_action} 重新入队")
+            logger.error(f"?? ??? 120s ????? {raw_action} ????")
             self._signal_queue.put(payload)
             return
 
@@ -7827,13 +8016,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     getattr(self, "_last_open_exec_ts", 0) or 0
                 )
                 logger.warning(
-                    f"🛡️ [{self.symbol}] 迟到平仓已忽略 | {raw_action} "
-                    f"开仓后 {age:.2f}s < {LATE_CLOSE_SUPPRESS_SEC}s · 保持开仓"
+                    f"??? [{self.symbol}] ??????? | {raw_action} "
+                    f"??? {age:.2f}s < {LATE_CLOSE_SUPPRESS_SEC}s ? ????"
                 )
                 try:
                     logger.warning(
-                        f"[钉钉已关闭] 迟到平仓已忽略·保持开仓 [{self.symbol}] | "
-                        f"{raw_action} 距开仓成交仅 {age:.2f}s (窗={LATE_CLOSE_SUPPRESS_SEC}s)"
+                        f"[?????] ???????????? [{self.symbol}] | "
+                        f"{raw_action} ?????? {age:.2f}s (?={LATE_CLOSE_SUPPRESS_SEC}s)"
                     )
                 except Exception:
                     pass
@@ -7842,9 +8031,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.monitoring = False
             if raw_action in ("CLOSE_PROTECT", "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT") or raw_action.startswith("CLOSE_PROTECT"):
                 pos = self._get_active_position()
-                tv_reason = close_reason or ("保护性全平" if "PROTECT" in raw_action else f"TV平仓:{raw_action}")
+                if pos == "QUERY_FAILED":
+                    logger.error(f"?? [{self.symbol}] {raw_action} ??????????? ? ??????")
+                    return
+                tv_reason = close_reason or ("?????" if "PROTECT" in raw_action else f"TV??:{raw_action}")
                 if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
-                    logger.info(f"🛡️ 保护性全平到达但盘口已空仓 → 撤单复位 | {tv_reason}{close_extra}")
+                    logger.info(f"??? ????????????? ? ???? | {tv_reason}{close_extra}")
                     self._handle_manual_flat_detected(
                         tv_reason,
                         close_meta=close_meta,
@@ -7852,12 +8044,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     )
                 else:
                     self._close_all(
-                        f"🛡️ 风控拦截：{tv_reason}{close_extra}",
+                        f"??? ?????{tv_reason}{close_extra}",
                         close_meta=close_meta,
                     )
             elif raw_action == "CLOSE_TP3":
                 pos = self._get_active_position()
-                tv_reason = close_reason or "TP3完美收网"
+                if pos == "QUERY_FAILED":
+                    logger.error(f"?? [{self.symbol}] CLOSE_TP3 ??????????? ? ??????")
+                    return
+                tv_reason = close_reason or "TP3????"
                 if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
                     self._handle_manual_flat_detected(
                         tv_reason,
@@ -7866,12 +8061,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     )
                 else:
                     self._close_all(
-                        f"🏆 TP3止盈：{tv_reason}{close_extra}",
+                        f"?? TP3???{tv_reason}{close_extra}",
                         close_meta=close_meta,
                     )
             elif raw_action == "CLOSE_STOPLOSS":
                 pos = self._get_active_position()
-                tv_reason = close_reason or "被动止损/保本"
+                if pos == "QUERY_FAILED":
+                    logger.error(f"?? [{self.symbol}] CLOSE_STOPLOSS ??????????? ? ??????")
+                    return
+                tv_reason = close_reason or "????/??"
                 if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
                     self._handle_manual_flat_detected(
                         tv_reason,
@@ -7880,20 +8078,23 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     )
                 else:
                     tag = (
-                        "防回吐保本"
+                        "?????"
                         if close_meta.get("close_type") == CLOSE_TYPE_BREAKEVEN
-                        else "硬止损"
+                        else "???"
                     )
                     self._close_all(
-                        f"🛑 {tag}：{tv_reason}{close_extra}",
+                        f"?? {tag}?{tv_reason}{close_extra}",
                         close_meta=close_meta,
                     )
             elif raw_action == "CLOSE":
                 pos = self._get_active_position()
-                tv_reason = close_reason or "TV单独平仓清场"
+                if pos == "QUERY_FAILED":
+                    logger.error(f"?? [{self.symbol}] CLOSE ??????????? ? ??????")
+                    return
+                tv_reason = close_reason or "TV??????"
                 if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
                     logger.info(
-                        f"🧹 TV单独平仓但盘口已空 → 撤净挂单复位等待 | {tv_reason}{close_extra}"
+                        f"?? TV????????? ? ???????? | {tv_reason}{close_extra}"
                     )
                     self._handle_manual_flat_detected(
                         tv_reason,
@@ -7902,7 +8103,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     )
                 else:
                     self._close_all(
-                        f"🧹 TV单独平仓清场：{tv_reason}{close_extra}",
+                        f"?? TV???????{tv_reason}{close_extra}",
                         close_meta=close_meta,
                     )
             elif raw_action == "UPDATE_SL":
@@ -7910,13 +8111,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             elif raw_action == "UPDATE_TP":
                 self._handle_tv_tp_update(payload)
             elif raw_action in ["LONG", "SHORT"]:
-                self._apply_tv_sl_from_payload(payload, source=f"{raw_action}开仓")
+                self._apply_tv_sl_from_payload(payload, source=f"{raw_action}??")
                 self._apply_tv_sizing_params(payload)
                 self.last_tv_side = raw_action
                 self._save_state()
                 self._handle_smart_entry(raw_action, payload)
             else:
-                logger.warning(f"未识别的 TV action: {raw_action}")
+                logger.warning(f"???? TV action: {raw_action}")
         finally:
             self._lock.release()
 
@@ -7961,7 +8162,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return diff < SAME_DIR_MIN_SPREAD_PCT
 
     def _same_direction_entry_mode(self, action, pos, curr_px):
-        """同向智能决策：① ATR → ② 档位 → ③ 理论开仓价差"""
+        """???????? ATR ? ? ?? ? ? ??????"""
         ref_px = curr_px or self.tv_price or pos["entry_price"]
         live_entry = pos["entry_price"]
         diff_pct = self._entry_price_diff_pct(live_entry, self.tv_price, ref_px)
@@ -7971,26 +8172,26 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if not self._is_similar_atr(open_atr, tv_atr):
             logger.info(
-                f"🔄 同向 [{action}] ATR {open_atr:.2f}→{tv_atr:.2f} 变化 "
-                f"(>{ATR_SIMILAR_RATIO:.0%}) → 先平后开重入"
+                f"?? ?? [{action}] ATR {open_atr:.2f}?{tv_atr:.2f} ?? "
+                f"(>{ATR_SIMILAR_RATIO:.0%}) ? ??????"
             )
             return "FULL_REENTRY", diff_pct, "atr_changed", open_atr, tv_atr
 
         if int(self.regime) != open_regime:
             logger.info(
-                f"🔄 同向 [{action}] 档位 R{open_regime}→R{self.regime} → 先平后开重入"
+                f"?? ?? [{action}] ?? R{open_regime}?R{self.regime} ? ??????"
             )
             return "FULL_REENTRY", diff_pct, "regime_changed", open_atr, tv_atr
 
         if diff_pct >= SAME_DIR_MIN_SPREAD_PCT:
             logger.info(
-                f"🔄 同向 [{action}] 价差 {diff_pct:.3f}% ≥ {SAME_DIR_MIN_SPREAD_PCT}% → 先平后开"
+                f"?? ?? [{action}] ?? {diff_pct:.3f}% ? {SAME_DIR_MIN_SPREAD_PCT}% ? ????"
             )
             return "FULL_REENTRY", diff_pct, "spread_ok", open_atr, tv_atr
 
         logger.info(
-            f"🧠 同向 [{action}] ATR {tv_atr:.2f} 未变 + 价差 {diff_pct:.3f}% "
-            f"< {SAME_DIR_MIN_SPREAD_PCT}% → 仅刷新 TP123"
+            f"?? ?? [{action}] ATR {tv_atr:.2f} ?? + ?? {diff_pct:.3f}% "
+            f"< {SAME_DIR_MIN_SPREAD_PCT}% ? ??? TP123"
         )
         return "REFRESH_TP", diff_pct, "refresh_tp", open_atr, tv_atr
 
@@ -7998,10 +8199,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         live_entry = pos["entry_price"]
         real_qty = self._safe_qty(pos.get("size"))
         reason_txt = {
-            "atr_changed": f"TV ATR `{tv_atr:.2f}` ≠ 持仓 ATR `{open_atr:.2f}` → 刷新仓位",
-            "regime_changed": f"档位 R{self.open_regime}→R{self.regime} → 刷新仓位",
-            "spread_ok": f"理论价差 {diff_pct:.3f}% ≥ {SAME_DIR_MIN_SPREAD_PCT}% → 刷新仓位",
-        }.get(reason, "同向刷新仓位")
+            "atr_changed": f"TV ATR `{tv_atr:.2f}` ? ?? ATR `{open_atr:.2f}` ? ????",
+            "regime_changed": f"?? R{self.open_regime}?R{self.regime} ? ????",
+            "spread_ok": f"???? {diff_pct:.3f}% ? {SAME_DIR_MIN_SPREAD_PCT}% ? ????",
+        }.get(reason, "??????")
         self._call_telegram_notify(
             telegram_notify.report_smart_same_dir_decision,
             side=action,
@@ -8016,14 +8217,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             tv_atr=tv_atr,
             qty=real_qty,
             verify_note=(
-                f"核实持仓 {real_qty}张 @ {live_entry:.2f} | {reason_txt} | 执行先平后开"
+                f"???? {real_qty}? @ {live_entry:.2f} | {reason_txt} | ??????"
             ),
         )
 
     def _same_direction_refresh_tp(self, action, pos, curr_px, diff_pct, open_atr, tv_atr):
         live_pos = self._get_active_position()
+        if live_pos == "QUERY_FAILED":
+            logger.warning("?? ????: ????????????? ? ??")
+            return
         if not live_pos or self._safe_qty(live_pos.get("size", 0)) <= 0:
-            logger.warning("🧠 同向刷新: 实盘已无持仓，跳过")
+            logger.warning("?? ????: ?????????")
             return
 
         real_qty = self._safe_qty(live_pos["size"])
@@ -8037,15 +8241,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         sl_to_pass = self._radar_sl_to_pass()
         result = self._smart_realign_defenses(
             real_qty, entry, dynamic_sl=sl_to_pass,
-            reason="同向TV智能刷新止盈",
+            reason="??TV??????",
         )
         self._ensure_sentinel_running()
 
         verify_note = (
-            f"核实持仓 {real_qty}张 @ {entry:.2f} | TV理论 {self.tv_price:.2f} | "
-            f"持仓ATR {open_atr:.2f} = TV ATR {tv_atr:.2f} | "
-            f"价差 {diff_pct:.3f}% (< {SAME_DIR_MIN_SPREAD_PCT}%) | "
-            f"止盈 {result['matched']}/{result['expected']} 档 | "
+            f"???? {real_qty}? @ {entry:.2f} | TV?? {self.tv_price:.2f} | "
+            f"??ATR {open_atr:.2f} = TV ATR {tv_atr:.2f} | "
+            f"?? {diff_pct:.3f}% (< {SAME_DIR_MIN_SPREAD_PCT}%) | "
+            f"?? {result['matched']}/{result['expected']} ? | "
             f"{self._format_audit_summary(result['audit'])}"
         )
         self._call_telegram_notify(
@@ -8064,19 +8268,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             tp_audit=result["audit"],
             verify_note=verify_note,
         )
-        logger.info("🧠 同向智能处理完成: ATR未变+价差不足，未再开仓，TP123 已按新 TV 价刷新")
+        logger.info("?? ????????: ATR??+??????????TP123 ??? TV ???")
 
     def _ensure_sentinel_running(self):
         if self.monitoring and not self._sentinel_active:
             threading.Thread(
                 target=self._sentinel_loop, daemon=True, name="sentinel",
             ).start()
-        # §6.2：启动私有 WS（部分成交动态同步）
+        # ?6.2????? WS??????????
         if not getattr(self, "_deepcoin_private_ws_started", False):
             self._start_deepcoin_private_ws()
 
     def _start_deepcoin_private_ws(self):
-        """§6.2：订阅 Deepcoin 私有 WebSocket → 实时成交回报 → 触发数量重同步。"""
+        """?6.2??? Deepcoin ?? WebSocket ? ?????? ? ????????"""
         self._deepcoin_private_ws_started = True
         self._ws_hard_sl_fill_hint = None
         self._ws_tp1_fill_hint = False
@@ -8084,17 +8288,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         try:
             deepcoin_client.start_private_ws(on_message=self._on_deepcoin_ws_message)
         except Exception as e:
-            logger.warning(f"[{self.symbol}] 私有WS启动失败（稍后重试）: {e}")
+            logger.warning(f"[{self.symbol}] ??WS??????????: {e}")
             self._deepcoin_private_ws_started = False
 
     def _on_deepcoin_ws_message(self, data):
-        """§6.2：Deepcoin 私有 WS 事件 → TP 成交提示 + 部分成交数量重同步。"""
+        """?6.2?Deepcoin ?? WS ?? ? TP ???? + ??????????"""
         if not isinstance(data, dict):
             return
         table = str(data.get("table") or "").lower()
         if table not in ("order", "position", "trade", "triggerorder"):
             return
-        # 脉冲哨兵
+        # ????
         self._ws_defense_pulse = True
         self._ws_fast_poll = True
 
@@ -8104,7 +8308,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._handle_deepcoin_order_event(data)
 
     def _handle_deepcoin_trade_event(self, data):
-        """Trade 成交事件：记录 TP1 成交提示（用于雷达提前武装）。"""
+        """Trade ??????? TP1 ???????????????"""
         rows = data.get("data") or []
         if not isinstance(rows, list):
             rows = [rows]
@@ -8120,10 +8324,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 px = float(px_str)
             except (ValueError, TypeError):
                 px = 0.0
-            # 非反向成交 → TP 方向
+            # ????? ? TP ??
             if px <= 0:
                 continue
-            # 尝试匹配 TP 档位
+            # ???? TP ??
             tps = list(getattr(self, "tv_tps", None) or [])
             for lv in (1, 2):
                 tp_px = float(tps[lv - 1] or 0) if lv <= len(tps) else 0.0
@@ -8140,7 +8344,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self._ws_tp_fill_levels = levels
 
     def _handle_deepcoin_order_event(self, data):
-        """Order 事件：FILLED/PARTIALLY_FILLED → 触发部分成交重同步。"""
+        """Order ???FILLED/PARTIALLY_FILLED ? ??????????"""
         rows = data.get("data") or []
         if not isinstance(rows, list):
             rows = [rows]
@@ -8155,7 +8359,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._handle_unilateral_order_cancel(row)
 
     def _handle_unilateral_order_cancel(self, order):
-        """§12.3：非本地发起的取消 → 异常取消告警 + 强制对账。"""
+        """?12.3????????? ? ?????? + ?????"""
         try:
             sym = str(order.get("instrument_id") or order.get("symbol") or "").upper()
             if sym and sym != self.symbol.upper():
@@ -8163,16 +8367,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             oid = order.get("orderId") or order.get("algoId") or ""
             status = str(order.get("status") or "").upper()
             logger.warning(
-                f"🚨 [{self.symbol}] 外部撤单 event: id={oid} status={status} | "
-                f"触发强制对账"
+                f"?? [{self.symbol}] ???? event: id={oid} status={status} | "
+                f"??????"
             )
             self._ws_defense_pulse = True
             self._ws_fast_poll = True
         except Exception as e:
-            logger.debug(f"外部撤单解析跳过: {e}")
+            logger.debug(f"????????: {e}")
 
     def _purge_all_defense_orders_on_flat(self, reason="", max_rounds=6):
-        """§6.2：空仓时撤掉所有防御单（TP + 雷达 STOP）。"""
+        """?6.2????????????TP + ?? STOP??"""
         cancelled = 0
         for rnd in range(max_rounds):
             deepcoin_client.cancel_all_open_orders(self.symbol)
@@ -8192,11 +8396,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 break
             time.sleep(0.3)
         if cancelled:
-            logger.info(f"🧹 [{self.symbol}] 空仓撤防：{cancelled} 张 | {reason}")
+            logger.info(f"?? [{self.symbol}] ?????{cancelled} ? | {reason}")
         return cancelled
 
     def _schedule_partial_fill_resize(self, source=""):
-        """§6.2：TP/减仓成交后按实时头寸同步硬/雷达数量（防超卖变反向）。"""
+        """?6.2?TP/?????????????/?????????????"""
         if getattr(self, "api_monitor_only", False):
             return
         if not getattr(self, "monitoring", False):
@@ -8213,19 +8417,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if pos == "QUERY_FAILED" or pos is None:
                 self._partial_resize_pending = True
                 logger.warning(
-                    f"⏳ [{self.symbol}] 部分成交核算跳过·持仓不可读 | {source}"
+                    f"? [{self.symbol}] ?????????????? | {source}"
                 )
                 return
             live = float((pos or {}).get("size") or 0)
             if live <= 0:
                 logger.info(
-                    f"🧹 [{self.symbol}] WS成交后已空仓 → 清挂单 | {source}"
+                    f"?? [{self.symbol}] WS?????? ? ??? | {source}"
                 )
-                self._purge_all_defense_orders_on_flat(f"WS成交空仓|{source}")
+                self._purge_all_defense_orders_on_flat(f"WS????|{source}")
                 return
             if self._is_dust_qty(live):
                 logger.warning(
-                    f"🐜 [{self.symbol}] 部分成交后零头={live} → 市价扫尾 | {source}"
+                    f"?? [{self.symbol}] ???????={live} ? ???? | {source}"
                 )
                 self._sweep_dust_and_finalize(f"partial_fill_dust|{source}")
                 return
@@ -8238,35 +8442,35 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             logger.error(f"[{self.symbol}] partial_fill_resize: {e}")
 
     def _full_reentry(self, action, close_reason, payload=None):
-        """铁律：先平现有仓 → 净挂单 → 再开仓刷新；钉钉核实。
-        v16.19 优化：取消 `_close_all` 后立即取价开仓（去重第2次撤单 + 额外等待）。
+        """???????? ? ??? ? ???????????
+        v16.19 ????? `_close_all` ???????????2??? + ??????
         """
-        reason = close_reason or "TV开仓·一律先平后开"
+        reason = close_reason or "TV?????????"
         try:
             self._pipeline_pending_clear(note=reason)
         except Exception:
             pass
         deepcoin_client.cancel_all_open_orders(self.symbol)
-        time.sleep(0.3)  # v16.19: 0.5→0.3s
+        time.sleep(0.3)  # v16.19: 0.5?0.3s
         if not self._close_all(reason, reset_state=True):
-            logger.error("❌ 先平后开中止：平仓未归零，拒绝叠仓开仓")
+            logger.error("? ???????????????????")
             try:
                 self._pipeline_fail(Role.AUDITOR_POS, "CLEAR_FAIL")
             except Exception:
                 pass
             logger.warning(
-                f"[钉钉已关闭] 先平后开中止·平仓未归零 | 强平后盘口仍有持仓，已拒绝新开仓，请人工核查 Deepcoin 盘口"
+                f"[?????] ???????????? | ?????????????????????? Deepcoin ??"
             )
             self._close_open_chain_active = False
             return
-        if not self._wait_verify(self._verify_flat, retries=6, delay=0.25):  # v16.19: 8次×0.5→6次×0.25
-            logger.error("❌ 先平后开中止：空仓核查未通过")
+        if not self._wait_verify(self._verify_flat, retries=6, delay=0.25):  # v16.19: 8??0.5?6??0.25
+            logger.error("? ??????????????")
             try:
                 self._pipeline_fail(Role.AUDITOR_POS, "CLEAR_VERIFY_FAIL")
             except Exception:
                 pass
             logger.warning(
-                f"[钉钉已关闭] 先平后开中止·空仓核查失败 | 平仓指令已发但 REST 仍显示持仓，已拒绝叠仓开仓"
+                f"[?????] ????????????? | ??????? REST ?????????????"
             )
             self._close_open_chain_active = False
             return
@@ -8274,14 +8478,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._pipeline_cleared(note="sterile_ok")
         except Exception:
             pass
-        # v16.19：取消第2次撤单 + 额外0.5s 等待（_close_all 已完成撤单，无重复挂单风险）
+        # v16.19????2??? + ??0.5s ???_close_all ??????????????
         curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
         if curr_px <= 0:
-            logger.error("❌ 先平后开中止：无有效市价")
+            logger.error("? ????????????")
             return
         try:
             logger.info(
-                f"[钉钉已关闭] 先平后开·执行 [{self.symbol}] | {reason} @ {float(curr_px):.2f} → 开 {action}"
+                f"[?????] ??????? [{self.symbol}] | {reason} @ {float(curr_px):.2f} ? ? {action}"
             )
         except Exception:
             pass
@@ -8289,12 +8493,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._close_open_chain_active = False
 
     def _handle_manual_flat_detected(self, reason, close_meta=None, curr_px=0.0):
-        """人工全平 / 止盈吃满 / 止损触发：智能复位账本 + 四标签收网钉钉"""
+        """???? / ???? / ??????????? + ???????"""
         meta = self._enrich_close_meta_live(
             close_meta or self._infer_flat_close_meta(curr_px, hint_reason=reason),
             curr_px,
         )
-        logger.info(f"📭 感知空仓: {meta.get('tv_reason') or reason}")
+        logger.info(f"?? ????: {meta.get('tv_reason') or reason}")
         try:
             self._pipeline_reset_flat(note=str(meta.get("tv_reason") or reason or "flat"))
         except Exception:
@@ -8313,37 +8517,37 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         deepcoin_client.cancel_all_open_orders(self.symbol)
         self._save_state()
         self._report_flat_close(
-            meta.get("tv_reason") or reason or "仓位归零",
+            meta.get("tv_reason") or reason or "????",
             close_meta=meta,
             curr_px=curr_px,
         )
 
     def _realign_after_position_add(self, new_qty, new_entry, curr_px, entry_type):
         """
-        加仓成功后：按 TV TP123 价格 + 新总头寸重挂止盈，并同步 tv_sl / 雷达。
-        加仓必撤旧 TP（数量已过期），再按 open_regime 比例重算剩余档位。
+        ??????? TV TP123 ?? + ???????????? tv_sl / ???
+        ????? TP?????????? open_regime ?????????
         """
         self._ensure_tp123_prices_from_tv(new_entry)
         tp_txt = "/".join(
             f"{float(p):.0f}" for p in (self.tv_tps or []) if float(p or 0) > 0
-        ) or "—"
+        ) or "?"
         ratios = self.regime_settings[self._tp_split_regime()]["ratios"]
         consumed = list(getattr(self, "tp_levels_consumed", []) or [])
 
         sl_to_pass = None
-        radar_note = "雷达待命(TP1前)"
+        radar_note = "????(TP1?)"
         if self._tp1_filled_verified(new_qty, curr_px):
             self._refresh_radar_state_on_recover(curr_px, new_entry)
             sl_to_pass = self._radar_sl_to_pass()
             radar_note = (
-                f"雷达已激活 SL={sl_to_pass:.2f}"
-                if sl_to_pass else "雷达跟进中"
+                f"????? SL={sl_to_pass:.2f}"
+                if sl_to_pass else "?????"
             )
 
         logger.info(
-            f"🕸️ [{entry_type}] 加仓后防线重挂 | 新仓 {new_qty} 张 @ {new_entry:.2f} "
-            f"| TV TP={tp_txt} | R{self._tp_split_regime()} 比例 {ratios} "
-            f"| 已成交档 {consumed or '无'}"
+            f"??? [{entry_type}] ??????? | ?? {new_qty} ? @ {new_entry:.2f} "
+            f"| TV TP={tp_txt} | R{self._tp_split_regime()} ?? {ratios} "
+            f"| ???? {consumed or '?'}"
         )
         self._cancel_all_tp_limit_orders()
         time.sleep(0.45)
@@ -8351,13 +8555,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         result = self._enforce_defense_alignment(
             new_qty, new_entry,
             dynamic_sl=sl_to_pass,
-            reason=f"{entry_type}加仓后TP123重挂",
+            reason=f"{entry_type}???TP123??",
             rounds=4,
         )
         audit = result.get("audit") or self._audit_tp_levels(new_qty)
         if not self._tp_audit_ok(audit):
             logger.warning(
-                f"⚠️ [{entry_type}] 加仓后 TP 未齐 → 核武重挂 | "
+                f"?? [{entry_type}] ??? TP ?? ? ???? | "
                 f"{self._format_audit_summary(audit)}"
             )
             audit = self._nuclear_realign_tp(
@@ -8375,7 +8579,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 shield_ok = self._maintain_hard_shield(
                     new_qty, curr_px, force=True, radar_sl=sl,
                 ) or shield_ok
-                radar_note = f"雷达推升 SL={sl:.2f}"
+                radar_note = f"???? SL={sl:.2f}"
 
         self.shield_sized_qty = float(new_qty)
         self._save_state()
@@ -8389,34 +8593,37 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         }
 
     def _add_to_position(self, action, payload):
-        """PYRAMID / PROFIT_ADD：base_qty × TV qty_ratio 追加，并重挂 TP123 + 同步雷达"""
+        """PYRAMID / PROFIT_ADD?base_qty ? TV qty_ratio ?????? TP123 + ????"""
         entry_type = normalize_entry_type(payload.get("entry_type"))
         max_add = self._max_add_times_for_regime()
         tv_ratio = float(getattr(self, "tv_qty_ratio", 0) or 0)
         pos = self._get_active_position()
+        if pos == "QUERY_FAILED":
+            logger.error(f"{entry_type} ??????????????? ? ??")
+            return
         if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
-            logger.warning(f"{entry_type} 到达但盘口无持仓，已忽略")
+            logger.warning(f"{entry_type} ????????????")
             return
         if self._pos_side_label(pos) != action:
             logger.warning(
-                f"[钉钉已关闭] {entry_type} 方向不符 | TV {action} vs 实盘 {self._pos_side_label(pos)}，已拒绝加仓"
+                f"[?????] {entry_type} ???? | TV {action} vs ?? {self._pos_side_label(pos)}??????"
             )
             return
         if tv_ratio <= 0:
             logger.warning(
-                f"{entry_type} 跳过：R{self.regime} TV加仓比例={tv_ratio:.2f}（档位禁止加仓）"
+                f"{entry_type} ???R{self.regime} TV????={tv_ratio:.2f}????????"
             )
             logger.warning(
-                f"[钉钉已关闭] {entry_type} 加仓跳过 | TV加仓比例={tv_ratio:.2f} ≤ 0 | base={getattr(self, 'base_qty', 0)} 张"
+                f"[?????] {entry_type} ???? | TV????={tv_ratio:.2f} ? 0 | base={getattr(self, 'base_qty', 0)} ?"
             )
             return
         if int(getattr(self, "add_count", 0) or 0) >= max_add:
             logger.warning(
-                f"{entry_type} 跳过：已达 R{self.regime} 最大加仓次数 {max_add} "
+                f"{entry_type} ????? R{self.regime} ?????? {max_add} "
                 f"(base={getattr(self, 'base_qty', 0)})"
             )
             logger.warning(
-                f"[钉钉已关闭] {entry_type} 加仓跳过 | 已达最大加仓 {max_add} 次 | base={getattr(self, 'base_qty', 0)} | 现仓 {self._safe_qty(pos.get('size', 0))} 张"
+                f"[?????] {entry_type} ???? | ?????? {max_add} ? | base={getattr(self, 'base_qty', 0)} | ?? {self._safe_qty(pos.get('size', 0))} ?"
             )
             return
 
@@ -8425,16 +8632,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         old_entry = float(pos.get("entry_price", 0))
         add_qty, meta = self._calc_vps_add_qty(tv_ratio)
         if add_qty <= 0:
-            logger.error(f"{entry_type} 跳过：计算加仓量无效 {meta}")
+            logger.error(f"{entry_type} ?????????? {meta}")
             logger.warning(
-                f"[钉钉已关闭] {entry_type} 数量无效 | 加仓计算失败"
+                f"[?????] {entry_type} ???? | ??????"
             )
             return
 
         deepcoin_client.set_position_mode(self.symbol, mode="both")
         deepcoin_client.set_leverage(self.symbol, leverage=EXCHANGE_LEVERAGE)
         logger.info(
-            f"➕ [{entry_type}] {action} 追加 {add_qty} 张 | "
+            f"? [{entry_type}] {action} ?? {add_qty} ? | "
             f"{self._tv_sizing_note(add_qty, meta, entry_type=entry_type)}"
         )
         open_side = "buy" if action == "LONG" else "sell"
@@ -8442,15 +8649,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         res = deepcoin_client.place_market_order(self.symbol, open_side, pos_side, add_qty)
         if not res or not deepcoin_client._is_success(res):
             logger.warning(
-                f"[钉钉已关闭] {entry_type} 下单失败 | {action} 追加 {add_qty} 张 市价单未成交"
+                f"[?????] {entry_type} ???? | {action} ?? {add_qty} ? ??????"
             )
             return
         time.sleep(1.5)
 
         new_pos = self._get_active_position()
+        if new_pos == "QUERY_FAILED":
+            logger.error(
+                f"[?????] {entry_type} ??????? ? ??????????"
+            )
+            return
         if not new_pos or self._safe_qty(new_pos.get("size", 0)) <= old_qty:
             logger.warning(
-                f"[钉钉已关闭] {entry_type} 核实失败 | 追加 {add_qty} 张 后实盘未增长"
+                f"[?????] {entry_type} ???? | ?? {add_qty} ? ??????"
             )
             return
 
@@ -8469,19 +8681,19 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         audit = realign.get("audit") or {}
         self.add_count = int(getattr(self, "add_count", 0) or 0) + 1
         self._save_state()
-        type_label = "浮盈加仓" if entry_type == ENTRY_TYPE_PROFIT_ADD else "金字塔加仓"
+        type_label = "????" if entry_type == ENTRY_TYPE_PROFIT_ADD else "?????"
         tp_summary = self._format_audit_summary(audit)
         verify_note = (
             f"{type_label} | {self._tv_sizing_note(add_qty, meta, entry_type=entry_type)} "
             f"| base={getattr(self, 'base_qty', 0)} "
-            f"| 加仓次数 {self.add_count}/{max_add} "
-            f"| 持仓 {old_qty}→{new_qty} 张 @ {new_entry:.2f} "
-            f"| TV TP={realign.get('tp_prices', '—')} "
+            f"| ???? {self.add_count}/{max_add} "
+            f"| ?? {old_qty}?{new_qty} ? @ {new_entry:.2f} "
+            f"| TV TP={realign.get('tp_prices', '?')} "
             f"| TP {audit.get('matched_full', 0)}/{audit.get('expected', 0)} "
             f"| {tp_summary} "
             f"| {realign.get('radar_note', '')} "
             f"| tv_sl={getattr(self, 'tv_sl', 0):.2f} "
-            f"| {'防线已核实' if sl_ok and self._tp_audit_ok(audit) else '防线待核实'}"
+            f"| {'?????' if sl_ok and self._tp_audit_ok(audit) else '?????'}"
         )
         self._call_telegram_notify(
             telegram_notify.report_tv_position_add,
@@ -8511,7 +8723,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._ensure_sentinel_running()
 
     def _is_fresh_open_cooldown(self, pos=None, cooldown_sec=None):
-        """刚开仓同向冷却窗：重复 OPEN 禁止立刻先平后开"""
+        """??????????? OPEN ????????"""
         cooldown_sec = float(
             cooldown_sec if cooldown_sec is not None else OPEN_SAME_DIR_COOLDOWN_SEC
         )
@@ -8546,7 +8758,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _handle_smart_entry(self, action, payload=None):
         """
-        铁律：带开仓的 TV → 一律先平后开刷新；单独平仓由 CLOSE* 清零等待。
+        ??????? TV ? ?????????????? CLOSE* ?????
         """
         payload = payload or {}
         entry_type = normalize_entry_type(payload.get("entry_type"))
@@ -8558,7 +8770,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         curr_px = deepcoin_client.get_current_price(self.symbol) or self.tv_price
         if self._verify_flat() and self._is_duplicate_flat_entry(action, curr_px):
-            logger.info(f"🧠 空仓短时重复开仓 TV [{action}] → 忽略，干净等待下次")
+            logger.info(f"?? ???????? TV [{action}] ? ?????????")
             try:
                 self._call_telegram_notify(
                     telegram_notify.report_smart_same_dir_decision,
@@ -8573,7 +8785,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     open_atr=self._last_entry_signal.get("atr", self.current_atr),
                     tv_atr=self.current_atr,
                     qty=0.0,
-                    verify_note="空仓重复开仓信号已忽略 | 状态干净等待",
+                    verify_note="??????????? | ??????",
                 )
             except Exception:
                 pass
@@ -8581,15 +8793,20 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return
 
         pos = self._get_active_position()
-        live_sz = self._safe_qty((pos or {}).get("size", 0))
-        live_side = self._pos_side_label(pos) if pos else None
+        if pos == "QUERY_FAILED":
+            logger.warning("?? [????] ??????????????")
+            live_sz = 0
+            live_side = "UNKNOWN"
+        else:
+            live_sz = self._safe_qty((pos or {}).get("size", 0))
+            live_side = self._pos_side_label(pos) if pos else None
         logger.info(
-            f"⚡ TV开仓 [{action}] entry={entry_type} → 铁律先平后开刷新 "
-            f"| 现仓 {live_side or 'FLAT'} {live_sz}张"
+            f"? TV?? [{action}] entry={entry_type} ? ???????? "
+            f"| ?? {live_side or 'FLAT'} {live_sz}?"
         )
         self._full_reentry(
             action,
-            "TV开仓·一律先平后开刷新仓位（有仓先平；无仓净挂单再开）",
+            "TV???????????????????????????",
             payload=payload,
         )
         self._touch_entry_signal_signature(action)
@@ -8597,25 +8814,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
     def _open_position(self, action, curr_px, payload=None):
         payload = payload or {}
         if self._open_in_progress:
-            logger.error(f"开仓中止：已有开仓流程进行中，拒绝叠仓 [{action}]")
+            logger.error(f"??????????????????? [{action}]")
             return
         self._open_in_progress = True
         try:
             self._snapshot_sizing_principal(
-                f"开仓前 {normalize_entry_type(payload.get('entry_type'))} R{self.regime}"
+                f"??? {normalize_entry_type(payload.get('entry_type'))} R{self.regime}"
             )
             qty, balance, margin_usdt, margin_pct, sizing_meta = self._calc_target_open_qty(
                 curr_px, payload=payload,
             )
             if qty <= 0:
-                logger.error(f"开仓跳过：目标张数无效 balance={balance:.2f} px={curr_px}")
+                logger.error(f"??????????? balance={balance:.2f} px={curr_px}")
                 return
 
             deepcoin_client.set_position_mode(self.symbol, mode="both")
             deepcoin_client.set_leverage(self.symbol, leverage=EXCHANGE_LEVERAGE)
             notional = qty * self.face_value * curr_px
             budget_txt = format_vps_sizing_note(sizing_meta, qty=qty, entry_type=ENTRY_TYPE_OPEN)
-            logger.info(f"📐 仓位预算 [{self.symbol}]: {budget_txt} (名义 ~{notional:.0f}U)")
+            logger.info(f"?? ???? [{self.symbol}]: {budget_txt} (?? ~{notional:.0f}U)")
 
             cap_ok, _cap_meta = self._assert_notional_cap_or_reject(
                 qty, curr_px, sizing_meta=sizing_meta,
@@ -8624,35 +8841,42 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 return
 
             if not self._wait_verify(self._verify_flat, retries=4, delay=0.35):
-                logger.error("开仓中止：市价下单前盘口仍非空")
+                logger.error("???????????????")
                 logger.warning(
-                    f"[钉钉已关闭] 开仓中止·下单前盘口非空 [{self.symbol}] | TV {action} 目标 {qty}张，REST 仍显示持仓，已拒绝"
+                    f"[?????] ???????????? [{self.symbol}] | TV {action} ?? {qty}??REST ?????????"
                 )
                 return
 
             open_side = "buy" if action == "LONG" else "sell"
             pos_side = "long" if action == "LONG" else "short"
-            logger.info(f"🚀 [唯一主仓] 极速开仓: {open_side} {qty} 张 | {self.symbol} | 档位 {self.regime}")
+            logger.info(f"?? [????] ????: {open_side} {qty} ? | {self.symbol} | ?? {self.regime}")
             try:
                 self._pipeline_entry_submitted(action, qty)
             except Exception:
                 pass
             res = deepcoin_client.place_market_order(self.symbol, open_side, pos_side, qty)
             if not res or not deepcoin_client._is_success(res):
-                logger.error("开仓失败：市价单未成交")
+                logger.error("???????????")
                 try:
                     self._pipeline_fail(Role.EXECUTION, "ENTRY_SUBMIT_FAIL")
                 except Exception:
                     pass
                 logger.warning(
-                    f"[钉钉已关闭] 开仓失败 | TV {action} {qty} 张 市价单失败"
+                    f"[?????] ???? | TV {action} {qty} ? ?????"
                 )
                 return
-            time.sleep(1.2)  # v16.19: 2.0→1.2s（市价成交快，WS 实时推送）
+            time.sleep(1.2)  # v16.19: 2.0?1.2s???????WS ?????
 
             pos = self._get_active_position()
+            if pos == "QUERY_FAILED":
+                logger.error("???????? REST ???????? ? ??????")
+                try:
+                    self._pipeline_fail(Role.EXECUTION, "ENTRY_CONFIRM_FAIL")
+                except Exception:
+                    pass
+                return
             if not pos or self._safe_qty(pos.get("size", 0)) <= 0:
-                logger.error("开仓失败：成交后 REST 无持仓")
+                logger.error("???????? REST ???")
                 try:
                     self._pipeline_fail(Role.EXECUTION, "ENTRY_CONFIRM_FAIL")
                 except Exception:
@@ -8662,15 +8886,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             real_qty = self._safe_qty(pos["size"])
             if real_qty > qty * OPEN_OVERSIZE_RATIO:
                 logger.error(
-                    f"🚨 持仓超标: 目标 {qty} 张，实盘 {real_qty} 张 "
-                    f"(>{qty * OPEN_OVERSIZE_RATIO:.3f})，启动裁减"
+                    f"?? ????: ?? {qty} ???? {real_qty} ? "
+                    f"(>{qty * OPEN_OVERSIZE_RATIO:.3f})?????"
                 )
                 logger.warning(
-                    f"[钉钉已关闭] 持仓超标·自动裁减 | 目标 {qty}张，实盘 {real_qty}张，正在 reduceOnly 裁减"
+                    f"[?????] ????????? | ?? {qty}???? {real_qty}???? reduceOnly ??"
                 )
                 real_qty = self._trim_position_to_target(qty, action)
-                pos = self._get_active_position()
-                if pos:
+                fresh_pos = self._get_active_position()
+                if fresh_pos == "QUERY_FAILED":
+                    logger.warning("?? ??????????? ? ??????????")
+                elif fresh_pos:
+                    pos = fresh_pos
                     pos["size"] = real_qty
 
             self.current_side = action
@@ -8679,11 +8906,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if payload_atr <= 0:
                 try:
                     logger.warning(
-                        f"[钉钉已关闭] 开仓拒绝·缺TV atr | {self.symbol} webhook 无 atr → 拒绝开仓"
+                        f"[?????] ??????TV atr | {self.symbol} webhook ? atr ? ????"
                     )
                 except Exception:
                     pass
-                logger.error(f"拒绝开仓缺 TV atr [{self.symbol}]")
+                logger.error(f"????? TV atr [{self.symbol}]")
                 return
             self.open_atr = payload_atr
             self.current_atr = payload_atr
@@ -8708,14 +8935,58 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         finally:
             self._open_in_progress = False
 
+    def _sanitize_open_tps_vs_mark(self, curr_px=None):
+        """
+        binance parity (2a2e28f/0805f17/977135d): if a TV TP1/TP2 price is
+        already marketable against the current mark price at open time, nudge
+        it the minimum safe distance away and persist the nudged value into
+        self.tv_tps. Without this, a marketable TP either fills instantly
+        against intent or gets treated as "drifted" by later audit passes,
+        which repeatedly cancels and re-places it (the cancel/place death
+        spiral binance hit before this fix). TP3 is never a limit order so
+        it is left untouched.
+        """
+        try:
+            px = float(curr_px if curr_px is not None else (deepcoin_client.get_current_price(self.symbol) or 0))
+        except Exception:
+            px = 0.0
+        side = str(self.current_side or "").upper()
+        tps = list(getattr(self, "tv_tps", None) or [])
+        if px <= 0 or side not in ("LONG", "SHORT") or not tps:
+            return
+        atr = float(getattr(self, "open_atr", None) or self.current_atr or 0)
+        min_gap = max(px * 0.0015, atr * 0.15, 0.5)
+        changed = False
+        for idx in (0, 1):
+            if idx >= len(tps):
+                continue
+            tp_px = float(tps[idx] or 0)
+            if tp_px <= 0:
+                continue
+            if side == "LONG" and tp_px <= px + min_gap:
+                tps[idx] = round(px + min_gap, 2)
+                changed = True
+            elif side == "SHORT" and tp_px >= px - min_gap:
+                tps[idx] = round(px - min_gap, 2)
+                changed = True
+        if changed:
+            logger.warning(
+                f"[{self.symbol}] TP marketable at open, nudged away from mark "
+                f"px={px:.2f} min_gap={min_gap:.4f} | before={self.tv_tps} after={tps}"
+            )
+            self.tv_tps = tps
+            self._save_state()
+
     def _protect_and_monitor(self, qty, entry_price, budget_note="", target_qty=0, sizing_meta=None):
-        """规格 v1.0 §3：永久硬止损 = |TV.price − TV.stop_loss| × 1.15。"""
+        """?? v1.0 ?3?????? = |TV.price ? TV.stop_loss| ? 1.15?"""
         self._lock_frozen_hard_sl_from_tv(
-            entry=entry_price, side=self.current_side, source="开仓后",
+            entry=entry_price, side=self.current_side, source="???",
         )
         hard_sl = float(self._frozen_hard_px() or 0)
         self.current_sl = hard_sl if hard_sl > 0 else 0.0
         self.best_price = entry_price
+        self._adverse_worst_px = 0.0
+        self._adverse_worst_px_ts = 0.0
         self.shield_active = False
         self.shield_tiers_consumed = []
         self.tp_levels_consumed = []
@@ -8738,8 +9009,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             pass
         self._refresh_breathing_coefficient(force=True)
 
-        # 规格 §3.7：从 tv_stop_distance / atr 推导 adx_tier（弱0/中1/强2）
-        # tv_stop_distance = |TV.price − TV.stop_loss|；1.3×ATR = 强趋势档边界
+        # ?? ?3.7?? tv_stop_distance / atr ?? adx_tier??0/?1/?2?
+        # tv_stop_distance = |TV.price ? TV.stop_loss|?1.3?ATR = ??????
         open_atr = float(getattr(self, "open_atr", None) or self.current_atr or 0)
         tv_sl_val = float(getattr(self, "tv_sl_ref", 0) or 0)
         tv_price_val = float(getattr(self, "tv_price", 0) or entry_price or 0)
@@ -8747,15 +9018,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             tv_stop_dist = abs(tv_price_val - tv_sl_val)
             tier_threshold = 1.3 * open_atr
             if tv_stop_dist > tier_threshold:
-                derived_tier = 0  # 弱趋势
+                derived_tier = 0  # ???
             else:
-                derived_tier = 2  # 强趋势（实际是 tv_stop_dist <= tier_threshold）
+                derived_tier = 2  # ??????? tv_stop_dist <= tier_threshold?
             self.adx_tier = derived_tier
             self.radar_tier = derived_tier
             logger.info(
-                f"[{self.symbol}] 规格 §3.7 adx_tier={derived_tier} "
+                f"[{self.symbol}] ?? ?3.7 adx_tier={derived_tier} "
                 f"(tv_dist={tv_stop_dist:.2f} ATR={open_atr:.2f} "
-                f"阈值={tier_threshold:.2f})"
+                f"??={tier_threshold:.2f})"
             )
 
         if hasattr(self, "_init_reentry_runtime"):
@@ -8765,7 +9036,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             self._radar_stage_last = 0
         self._radar_activation_notified = False
 
-        # 规格 v1.0：冻结雷达激活价格（使用 TP1/TP2 绝对锚点）
+        self._sanitize_open_tps_vs_mark(entry_price)
+
+        # ?? v1.0???????????? TP1/TP2 ?????
         try:
             from reentry_profiles import radar_gate_price_from_tps
             tps = list(getattr(self, "tv_tps", None) or [])
@@ -8802,11 +9075,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
             self._scorched_earth_cancel_for_recover()
             self._enforce_pre_tp1_radar_standby(
-                vqty, verified["entry_price"], source="开仓保护",
+                vqty, verified["entry_price"], source="????",
             )
             self._enforce_defense_alignment(
                 vqty, verified["entry_price"],
-                dynamic_sl=None, reason="开仓后防线对齐", rounds=4,
+                dynamic_sl=None, reason="???????", rounds=4,
                 recover_mode=True,
             )
             audit = self._wait_defense_settled(vqty)
@@ -8814,7 +9087,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             curr_px = deepcoin_client.get_current_price(self.symbol) or entry_price
             if expected > 0 and matched < expected:
                 logger.warning(
-                    f"⚠️ 开仓首轮 TP 仅 {matched}/{expected} → 追加核武重挂"
+                    f"?? ???? TP ? {matched}/{expected} ? ??????"
                 )
                 audit = self._nuclear_realign_tp(
                     vqty, verified["entry_price"], dynamic_sl=None, rounds=3,
@@ -8825,12 +9098,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             verify_note = (
                 f"{budget_note} | " if budget_note else ""
             ) + (
-                f"持仓 {vqty}张 @ {verified['entry_price']:.2f} | "
-                f"限价止盈 {matched}/{expected} 档 | {self._format_audit_summary(audit)} | "
+                f"?? {vqty}? @ {verified['entry_price']:.2f} | "
+                f"???? {matched}/{expected} ? | {self._format_audit_summary(audit)} | "
                 f"{self._tv_field_source_note(getattr(self, '_last_tv_field_sources', {}))}"
             )
             if target_qty > 0 and vqty > target_qty * OPEN_OVERSIZE_RATIO:
-                verify_note += f" | ⚠️ 超标目标 {target_qty} 张"
+                verify_note += f" | ?? ???? {target_qty} ?"
             self._record_open_log(
                 self.current_side, vqty, verified["entry_price"], source="open",
             )
@@ -8879,11 +9152,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._open_tp_unconfirmed = True
                 dupes = [lv for lv in audit.get("levels", []) if lv.get("status") == "duplicate"]
                 hint = (
-                    "重复 TP 占满可减仓额度 | 雷达将接力纠偏"
-                    if dupes else "请查 logs/deepcoin_brain.log"
+                    "?? TP ??????? | ???????"
+                    if dupes else "?? logs/deepcoin_brain.log"
                 )
                 logger.warning(
-                    f"[钉钉已关闭] 开仓后限价止盈未全部挂上 | {self.current_side} {vqty}张 | 仅 {matched}/{expected} 档"
+                    f"[?????] ???????????? | {self.current_side} {vqty}? | ? {matched}/{expected} ?"
                 )
             if self._should_activate_shield(curr_px):
                 self._maintain_hard_shield(
@@ -8891,7 +9164,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     force=True,
                 )
         else:
-            logger.warning("开仓钉钉跳过：实盘持仓核查未通过")
+            logger.warning("????????????????")
         self._ensure_sentinel_running()
 
     def _ensure_price_ws(self):
@@ -8903,7 +9176,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return self.current_atr * 1.5
 
     def _radar_activation_ratio(self):
-        """返回冻结的 ADX 启动比例（0.70~0.90）。"""
+        """????? ADX ?????0.70~0.90??"""
         from reentry_profiles import normalize_activation_ratio
         frac = float(getattr(self, "radar_activation_frac", 0) or 0)
         adx = float(
@@ -8918,10 +9191,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _radar_activation_price(self):
         """
-        【规格 v1.0 · 绝对价格锚定】
-        首次开仓：雷达激活价 = (TP1 + TP2) / 2（TP1/TP2 为 webhook 原始信号价格）
-        重入开仓：雷达激活价 = TP2（价格必须真正到达 TP2 才接管）
-        不再使用 ADX 比例 × TP1 距离的旧公式。
+        ??? v1.0 ? ???????
+        ?????????? = (TP1 + TP2) / 2?TP1/TP2 ? webhook ???????
+        ?????????? = TP2????????? TP2 ????
+        ???? ADX ?? ? TP1 ???????
         """
         from reentry_profiles import radar_gate_price_from_tps
 
@@ -8932,7 +9205,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         tp2_px = float(tps[1] or 0) if len(tps) > 1 else 0.0
         attempt = int(getattr(self, "reentry_attempt", 0) or 0)
 
-        # 已冻结且有效：持仓期不漂移
+        # ?????????????
         if frozen > 0 and tp1_px > 0 and tp2_px > 0:
             if not activated:
                 expect = radar_gate_price_from_tps(tp1_px, tp2_px, attempt)
@@ -8941,7 +9214,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     return expect
             return frozen
 
-        # 首次计算
+        # ????
         if tp1_px > 0 and tp2_px > 0:
             px = radar_gate_price_from_tps(tp1_px, tp2_px, attempt)
             if px > 0:
@@ -8951,9 +9224,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _should_radar_trail(self, curr_px):
         """
-        【规格 v1.0 · §5.1 雷达延迟激活】
-        价格到达TP1-TP2中点（首次开仓）或TP2（重入开仓）后，雷达开始追踪。
-        不再要求 TP1 成交才激活雷达。
+        ??? v1.0 ? ?5.1 ???????
+        ????TP1-TP2?????????TP2???????????????
+        ???? TP1 ????????
         """
         if getattr(self, "_radar_armed_after_tp1", False) and self._is_radar_active():
             return True
@@ -8991,7 +9264,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return None
 
     def _sync_radar_sl_from_best(self, curr_px):
-        """TP 重对齐前刷新内存止损位，避免把旧止损重新挂回交易所"""
+        """TP ?????????????????????????"""
         if not self._should_radar_trail(curr_px):
             return self.current_sl
         new_sl = self._compute_radar_sl(curr_px)
@@ -8999,7 +9272,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return self.current_sl
         if self.current_side == "LONG" and new_sl > self.current_sl:
             logger.info(
-                f"📈 雷达止损预算刷新: {self.current_sl:.2f} → {new_sl:.2f} "
+                f"?? ????????: {self.current_sl:.2f} ? {new_sl:.2f} "
                 f"(best={self.best_price:.2f})"
             )
             self.current_sl = new_sl
@@ -9008,7 +9281,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self.current_sl >= self.watched_entry or new_sl < self.current_sl
         ):
             logger.info(
-                f"📉 雷达止损预算刷新: {self.current_sl:.2f} → {new_sl:.2f} "
+                f"?? ????????: {self.current_sl:.2f} ? {new_sl:.2f} "
                 f"(best={self.best_price:.2f})"
             )
             self.current_sl = new_sl
@@ -9016,7 +9289,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return self.current_sl
 
     def _bump_best_on_tp_fill(self, old_qty, new_qty, curr_px):
-        """部分止盈后把 best_price 抬到已触及的 TP 价，避免漏记冲高"""
+        """?????? best_price ?????? TP ????????"""
         if new_qty >= old_qty or curr_px <= 0:
             return
         if self.current_side == "LONG":
@@ -9027,8 +9300,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             new_best = max(candidates)
             if new_best > self.best_price + 0.01:
                 logger.info(
-                    f"📊 止盈吃单刷新 best_price: {self.best_price:.2f} → {new_best:.2f} "
-                    f"(qty {old_qty}→{new_qty})"
+                    f"?? ?????? best_price: {self.best_price:.2f} ? {new_best:.2f} "
+                    f"(qty {old_qty}?{new_qty})"
                 )
                 self.best_price = new_best
         else:
@@ -9039,13 +9312,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             new_best = min(candidates)
             if new_best < self.best_price - 0.01:
                 logger.info(
-                    f"📊 止盈吃单刷新 best_price: {self.best_price:.2f} → {new_best:.2f} "
-                    f"(qty {old_qty}→{new_qty})"
+                    f"?? ?????? best_price: {self.best_price:.2f} ? {new_best:.2f} "
+                    f"(qty {old_qty}?{new_qty})"
                 )
                 self.best_price = new_best
 
     def _radar_activation_progress(self, curr_px):
-        """0~1：朝 ADX 激活绝对价推进；已激活后走阶段进度（若有）。"""
+        """0~1?? ADX ??????????????????????"""
         try:
             if hasattr(self, "_radar_legitimately_armed") and (
                 self._radar_legitimately_armed(self.watched_qty, curr_px)
@@ -9096,7 +9369,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if not self._is_radar_active():
             return self._perform_radar_handoff(
-                real_amt, curr_px, reason="雷达激活 · 移动保本",
+                real_amt, curr_px, reason="???? ? ????",
             )
 
         tick = self._apply_breath_stop_tick(curr_px)
@@ -9122,7 +9395,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 sl_placed = self._realign_radar_defenses(real_amt, self.watched_entry, new_sl)
                 self._report_radar_intervention(
                     real_amt, new_sl,
-                    f"🚀 档位{self.regime} 雷达实时跟踪：保本盾推升至 {new_sl:.2f}",
+                    f"?? ??{self.regime} ????????????? {new_sl:.2f}",
                     sl_placed=sl_placed,
                 )
                 return True
@@ -9134,14 +9407,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 sl_placed = self._realign_radar_defenses(real_amt, self.watched_entry, new_sl)
                 self._report_radar_intervention(
                     real_amt, new_sl,
-                    f"🚀 档位{self.regime} 雷达实时跟踪：保本顶线下压至 {new_sl:.2f}",
+                    f"?? ??{self.regime} ?????????????? {new_sl:.2f}",
                     sl_placed=sl_placed,
                 )
                 return True
         return False
 
     def _sentinel_loop(self):
-        """哨兵：持仓/TP 防线 + 雷达移动保本（自适应轮询 2~6 秒）"""
+        """?????/TP ?? + ???????????? 2~6 ??"""
         self._sentinel_active = True
         last_px = 0.0
         try:
@@ -9151,27 +9424,30 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         continue
                     try:
                         pos = self._get_active_position()
+                        if pos == "QUERY_FAILED":
+                            logger.warning("?? [??] ??????????? ? ????")
+                            continue
                         real_amt = self._safe_qty(pos.get("size")) if pos else 0
                         actual_side = "LONG" if pos and pos.get('posSide') == "long" else "SHORT"
 
                         if real_amt == 0:
                             if time.time() < getattr(self, "_sentinel_grace_until", 0):
                                 logger.debug(
-                                    "哨兵宽限期：跳过空仓判定（防重启误清场）"
+                                    "????????????????????"
                                 )
                                 continue
                             if self.watched_qty > 0:
                                 if not self._confirm_position_flat():
                                     logger.warning(
-                                        "⚠️ [哨兵] 首次无仓但复核仍有持仓 → 跳过误清场"
+                                        "?? [??] ??????????? ? ?????"
                                     )
                                     continue
                                 flat_meta = self._infer_flat_close_meta(
                                     curr_px=last_px,
-                                    hint_reason="仓位归零 (止盈吃单 / 人工全平 / 止损触发)",
+                                    hint_reason="???? (???? / ???? / ????)",
                                 )
                                 self._handle_manual_flat_detected(
-                                    flat_meta.get("tv_reason", "仓位归零"),
+                                    flat_meta.get("tv_reason", "????"),
                                     close_meta=flat_meta,
                                     curr_px=last_px,
                                 )
@@ -9179,7 +9455,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
                         if self.watched_qty > 0 and self._should_finalize_tp_victory(real_amt):
                             self._sweep_dust_and_finalize(
-                                "仓位归零 (止盈吃单 / 人工全平 / TV 强制平仓)"
+                                "???? (???? / ???? / TV ????)"
                             )
                             break
 
@@ -9190,12 +9466,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             and not self._live_aligns_with_credible_tv(actual_side)
                         ):
                             reason = (
-                                f"致命方向背离：实盘({actual_side}) vs "
-                                f"最新TV({tv_opposite}) [实盘监督]"
+                                f"?????????({actual_side}) vs "
+                                f"??TV({tv_opposite}) [????]"
                             )
                             verify_note = (
-                                f"触发源: 实盘监督 | 最新TV {tv_opposite} | "
-                                f"实盘反向 {actual_side}"
+                                f"???: ???? | ??TV {tv_opposite} | "
+                                f"???? {actual_side}"
                             )
                             self._close_all(
                                 reason,
@@ -9214,6 +9490,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                                 self.best_price = max(self.best_price, curr_px)
                             else:
                                 self.best_price = min(self.best_price, curr_px)
+                            self._note_adverse_extreme(curr_px)
 
                         qty_changed = False
                         if real_amt != self.watched_qty:
@@ -9233,8 +9510,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                                 drift = self._qty_change_ratio(self.watched_qty, real_amt)
                                 if drift >= QTY_DRIFT_TOLERANCE_PCT:
                                     logger.info(
-                                        f"📎 [哨兵] 仓位微漂 {self.watched_qty}→{real_amt} 张 "
-                                        f"({drift:.2%}，未达 {QTY_ALIGN_MIN_PCT:.0%} 对齐阈值)，仅同步账本"
+                                        f"?? [??] ???? {self.watched_qty}?{real_amt} ? "
+                                        f"({drift:.2%}??? {QTY_ALIGN_MIN_PCT:.0%} ????)??????"
                                     )
                                 self.watched_qty = real_amt
                                 self.watched_entry = pos['entry_price']
@@ -9246,16 +9523,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             if curr_px > 0:
                                 self._process_radar_trailing(real_amt, curr_px)
                             self._radar_guardian_audit(real_amt, curr_px)
-                            logger.info("📡 [哨兵] 重启后立即雷达脉冲完成")
+                            logger.info("?? [??] ???????????")
                         elif not qty_changed:
                             self._radar_guardian_audit(real_amt, curr_px)
 
                         if curr_px <= 0:
                             continue
 
-                        # 规格 v1.0 §5.0：提前保本检查点（在雷达激活判断之前独立检查）
-                        if self._radar_is_dormant() and curr_px > 0:
-                            self._check_early_be_checkpoint(curr_px)
+                        # binance parity (v16.22+v16.24 v2.1): pre-breakeven checkpoint
+                        # abolished. XAU/BNB volatility caused premature stop moves that
+                        # got stopped out before the real move played out. Radar activation
+                        # itself now starts at breakeven (see _perform_radar_handoff), so
+                        # this early single-shot checkpoint is redundant and removed.
 
                         self._process_directional_defenses(real_amt, curr_px)
                         progress = self._radar_activation_progress(curr_px)
@@ -9265,13 +9544,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             and self._scan_ticks % 5 == 0
                         ):
                             logger.info(
-                                f"📡 雷达预热: 进度 {progress:.0%} | 现价 {curr_px:.2f} | "
-                                f"轮询 {SENTINEL_POLL_ARMING}s"
+                                f"?? ????: ?? {progress:.0%} | ?? {curr_px:.2f} | "
+                                f"?? {SENTINEL_POLL_ARMING}s"
                             )
                     finally:
                         self._lock.release()
                 except Exception as e:
-                    logger.error(f"哨兵异常: {e}")
+                    logger.error(f"????: {e}")
                 if self.monitoring:
                     time.sleep(self._sentinel_poll_sec(last_px))
         finally:
@@ -9283,34 +9562,34 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         live_qty = self._resolve_live_qty(qty)
         if live_qty <= 0:
-            logger.warning(f"重建防线跳过：交易所无可用持仓 (传入 {qty} 张)")
+            logger.warning(f"??????????????? (?? {qty} ?)")
             return 0
 
-        # 【关键修复】防止死循环：短时间重复调用_rebuild_defenses直接返回
+        # ???????????????????_rebuild_defenses????
         now = time.time()
         if now - getattr(self, "_last_rebuild_attempt_ts", 0) < 10.0:
             logger.warning(
-                f"[{self.symbol}] _rebuild_defenses 冷却中（{now - getattr(self, '_last_rebuild_attempt_ts', 0):.1f}s < 10s），跳过"
+                f"[{self.symbol}] _rebuild_defenses ????{now - getattr(self, '_last_rebuild_attempt_ts', 0):.1f}s < 10s????"
             )
             return 0
         self._last_rebuild_attempt_ts = now
 
         self._cancel_all_tp_limit_orders()
-        # 【关键修复】增加等待时间确保撤销完成（从0.35秒改为2秒）
+        # ????????????????????0.35???2??
         time.sleep(2.0)
-        # 【关键修复】撤销后必须验证旧单已全部撤销，防止死循环挂单
+        # ????????????????????????????
         leftover = self._collect_tp_limit_orders()
         if leftover:
             prices = [f"@{o['price']:.2f}" for o in leftover]
             logger.warning(
-                f"[{self.symbol}] 撤销后仍有{len(leftover)}张旧TP未撤净，等待..."
+                f"[{self.symbol}] ?????{len(leftover)}??TP??????..."
             )
             time.sleep(2.0)
             leftover = self._collect_tp_limit_orders()
             if leftover:
                 prices = [f"@{o['price']:.2f}" for o in leftover]
                 logger.error(
-                    f"[{self.symbol}] 旧TP仍未撤净，放弃本次补挂: {prices}"
+                    f"[{self.symbol}] ?TP???????????: {prices}"
                 )
                 return 0
 
@@ -9321,8 +9600,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         consumed = getattr(self, "tp_levels_consumed", []) or []
         placed = 0
 
-        # 规格 v1.0 §6 保护：tv_tps 全零说明 TP 价格从未被正确初始化（TV 信号缺字段 / 重启恢复失败）。
-        # 用 open_atr + open_regime 做紧急 fallback，不让仓位裸奔。
+        # ?? v1.0 ?6 ???tv_tps ???? TP ???????????TV ????? / ????????
+        # ? open_atr + open_regime ??? fallback????????
         if self.tv_tps and all(float(t or 0) <= 0 for t in self.tv_tps):
             if self.current_side and entry > 0:
                 atr = float(getattr(self, "open_atr", None) or self.current_atr or 0)
@@ -9335,7 +9614,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         self._safe_float(payload.get("tv_tp2"), 0),
                         self._safe_float(payload.get("tv_tp3"), 0),
                     ]
-                    # v16.27: 价格合理性检查 - TP 应在正确的方向
+                    # v16.27: ??????? - TP ???????
                     tps_valid = True
                     if self.current_side == "SHORT":
                         for tp_px in tps:
@@ -9350,21 +9629,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     if tps_valid:
                         self.tv_tps = self._sanitize_tp_prices(tps)
                         logger.warning(
-                            f"⚠️ tv_tps=全零 → ATR紧急Fallback TP123={self.tv_tps} "
+                            f"?? tv_tps=?? ? ATR??Fallback TP123={self.tv_tps} "
                             f"| entry={entry:.2f} ATR={atr:.2f} R{regime}"
                         )
                     else:
                         logger.warning(
-                            f"⛔ ATR紧急Fallback计算出TP价格方向错误，跳过 | "
+                            f"? ATR??Fallback???TP????????? | "
                             f"tps={tps} entry={entry:.2f} side={self.current_side}"
                         )
                     logger.warning(
-                        f"[钉钉已关闭] TP价格缺失·ATR紧急Fallback | {self.current_side} {live_qty}张 | ATR={atr:.2f} R{regime}"
+                        f"[?????] TP?????ATR??Fallback | {self.current_side} {live_qty}? | ATR={atr:.2f} R{regime}"
                     )
                     self._save_state()
 
         logger.info(
-            f"🕸️ 补挂 TP: 总 {live_qty}张 | 已成交 TP{consumed or '无'} | "
+            f"??? ?? TP: ? {live_qty}? | ??? TP{consumed or '?'} | "
             f"R{self._tp_split_regime()}"
         )
 
@@ -9372,48 +9651,48 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             q, px = lv["qty"], lv["price"]
             kind = f"TP{int(lv.get('level', 0))}"
             if q > 0 and px > 0:
-                # v16.11（根因二修复）：标签残留时，必须先确认原订单已失败/超时才能清
+                # v16.11?????????????????????????/?????
                 blocked, tag0, meta0 = self._has_open_pending_defense_tag(kind)
                 if blocked:
                     logger.warning(
-                        f"[{self.symbol}] 本地未完成标签 tag={tag0} kind={kind} → "
-                        f"开始核实原订单是否已失败 | px={px:.2f}"
+                        f"[{self.symbol}] ??????? tag={tag0} kind={kind} ? "
+                        f"???????????? | px={px:.2f}"
                     )
                     if not meta0.get("order_id"):
                         age = time.time() - float(meta0.get("ts", 0) or 0)
                         if age >= 45.0:
                             logger.warning(
-                                f"[{self.symbol}] 标签 {tag0} 无 order_id 且陈旧 {age:.0f}s ≥ 45s → 直接清理"
+                                f"[{self.symbol}] ?? {tag0} ? order_id ??? {age:.0f}s ? 45s ? ????"
                             )
                             self._complete_pending_defense_tag(tag=tag0)
                             self._save_state()
                             time.sleep(0.15)
                         else:
                             logger.warning(
-                                f"[{self.symbol}] 标签 {tag0} 无 order_id 且仅 {age:.0f}s < 45s → "
-                                f"拒绝清理（可能还在处理中），本次跳过"
+                                f"[{self.symbol}] ?? {tag0} ? order_id ?? {age:.0f}s < 45s ? "
+                                f"??????????????????"
                             )
                             continue
                     else:
                         if not self._confirm_stale_before_clear(tag0, meta0):
                             logger.warning(
-                                f"[{self.symbol}] 标签 {tag0} 对应订单仍在处理中 → 拒绝清理，本次跳过"
+                                f"[{self.symbol}] ?? {tag0} ????????? ? ?????????"
                             )
                             continue
                         self._complete_pending_defense_tag(tag=tag0)
                         self._save_state()
                         time.sleep(0.15)
                 tag = make_defense_client_order_id(self.symbol, kind, px)
-                # 【紧急修复】挂单前必须确认交易所侧没有该价格的TP订单
-                # 防止因本地标签被清理后，交易所侧订单仍存在导致重复挂单
+                # ???????????????????????TP??
+                # ???????????????????????????
                 existing_orders = self._collect_tp_limit_orders()
-                # 修复：使用正确的字段名 px 而不是 price
+                # ??????????? px ??? price
                 at_px_existing = [o for o in existing_orders if abs(o.get("px", o.get("price", 0)) - px) <= 1.0]
                 if at_px_existing:
                     logger.warning(
-                        f"[{self.symbol}] 交易所侧已有 TP@{px:.2f} ({len(at_px_existing)}张)，跳过挂单"
+                        f"[{self.symbol}] ?????? TP@{px:.2f} ({len(at_px_existing)}?)?????"
                     )
-                    # 更新标签，不挂新单
+                    # ?????????
                     existing = at_px_existing[0]
                     existing_oid = str(existing.get("orderId") or existing.get("ordId") or "")
                     if existing_oid:
@@ -9429,25 +9708,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 except Exception:
                     pass
                 last = None
-                # v16.11（根因二修复）：TP 挂单失败时强制重试，不轻易放弃
+                # v16.11????????TP ???????????????
                 max_retries = 3
                 for attempt in range(max_retries):
-                    # v16.18 补挂安全上限检查（防止重复挂50个单）
+                    # v16.18 ??????????????50???
                     allowed, guard_reason = self._check_tp_place_guard(int(lv.get("level", 0)))
                     if not allowed:
                         logger.warning(
-                            f"⛔ _rebuild跳过：TP{lv['level']}@{px:.2f} | {guard_reason}"
+                            f"? _rebuild???TP{lv['level']}@{px:.2f} | {guard_reason}"
                         )
                         break
                     res = deepcoin_client.place_limit_order(
                         self.symbol, close_side, pos_side, px, q,
                         reduce_only=True, cl_ord_id=tag,
                     )
-                    # 根因修复：reduceOnly 限价单失败 → 查实盘持仓 → 重算可平量
+                    # ?????reduceOnly ????? ? ????? ? ?????
                     if deepcoin_client.is_reduce_only_rejected(res):
                         logger.warning(
-                            f"⚠️ _rebuild TP{lv['level']} reduceOnly 拒绝 {close_side} {q}张 → "
-                            f"force_rest 重查持仓后修正挂单量"
+                            f"?? _rebuild TP{lv['level']} reduceOnly ?? {close_side} {q}? ? "
+                            f"force_rest ??????????"
                         )
                         time.sleep(0.3)
                         fresh = deepcoin_client.force_rest_get_all_positions(self.symbol)
@@ -9458,16 +9737,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                                     live_qty = self._safe_qty(fp.get("size", 0))
                                     break
                         if live_qty <= 0:
-                            logger.info(f"_rebuild TP{lv['level']} 无持仓可平，跳过")
+                            logger.info(f"_rebuild TP{lv['level']} ????????")
                             break
                         q = min(q, live_qty)
-                        logger.info(f"🔄 _rebuild TP{lv['level']} 修正数量 → {q}张（持仓={live_qty}）")
+                        logger.info(f"?? _rebuild TP{lv['level']} ???? ? {q}????={live_qty}?")
                         res = deepcoin_client.place_limit_order(
                             self.symbol, close_side, pos_side, px, q,
                             reduce_only=True, cl_ord_id=tag,
                         )
                         if deepcoin_client.is_reduce_only_rejected(res):
-                            logger.error(f"❌ _rebuild TP{lv['level']} 重试仍拒绝 → 跳过")
+                            logger.error(f"? _rebuild TP{lv['level']} ????? ? ??")
                             break
                     if res and deepcoin_client._is_success(res):
                         last = res
@@ -9475,12 +9754,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         self._register_pending_defense_tag(tag, kind, price=px, order_id=oid)
                         placed += 1
                         self._increment_tp_place_guard()
-                        logger.info(f"📈 TP{int(lv.get('level', 0))} {q} @ {px:.2f} tag={tag}")
+                        logger.info(f"?? TP{int(lv.get('level', 0))} {q} @ {px:.2f} tag={tag}")
                         break
                     if attempt < max_retries - 1:
                         logger.warning(
                             f"[{self.symbol}] TP{int(lv.get('level', 0))} @ {px:.2f} "
-                            f"挂单失败，重试 {attempt + 1}/{max_retries}"
+                            f"??????? {attempt + 1}/{max_retries}"
                         )
                         time.sleep(0.3)
                 if not last:
@@ -9491,7 +9770,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         pass
                     logger.error(
                         f"[{self.symbol}] TP{int(lv.get('level', 0))} @ {px:.2f} "
-                        f"失败（已释放标签，max_retries={max_retries}）"
+                        f"?????????max_retries={max_retries}?"
                     )
                 else:
                     time.sleep(0.25)
@@ -9504,36 +9783,36 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _close_all(self, reason="", force_align=None, reset_state=True, close_meta=None,
                    force_verify_note=""):
-        """先撤全部挂单再强平所有方向持仓；对冲模式兼容。
-        ⚠️ 根因修复：reduceOnly 失败绝不降级 → 立即 force_rest 重查持仓后重试。
-        ⚠️ v16.19 优化：减少固定等待时间，依赖实时 WS + REST 核查决定是否继续。
+        """???????????????????????
+        ?? ?????reduceOnly ?????? ? ?? force_rest ????????
+        ?? v16.19 ???????????????? WS + REST ?????????
         """
         deepcoin_client.cancel_all_open_orders(self.symbol)
-        time.sleep(0.3)  # v16.19: 0.5→0.3s
+        time.sleep(0.3)  # v16.19: 0.5?0.3s
         self._cancel_all_tp_limit_orders()
-        time.sleep(0.2)  # v16.19: 0.3→0.2s（WS 会在下一轮帮我们确认）
+        time.sleep(0.2)  # v16.19: 0.3?0.2s?WS ???????????
         closed_successfully = False
 
         for round_i in range(6):
-            # 获取所有方向的持仓
+            # ?????????
             all_positions = self._get_all_positions()
             if not all_positions:
                 closed_successfully = True
                 break
 
-            # 清理所有方向的持仓
+            # ?????????
             for pos in all_positions:
                 close_side = "sell" if pos["posSide"] == "long" else "buy"
                 live_sz = self._safe_qty(pos["size"])
-                logger.info(f"🔪 强平{round_i + 1}/6: {close_side} {live_sz}张 {pos['posSide']} reduceOnly")
+                logger.info(f"?? ??{round_i + 1}/6: {close_side} {live_sz}? {pos['posSide']} reduceOnly")
                 res = deepcoin_client.place_market_order(
                     self.symbol, close_side, pos["posSide"], live_sz, reduce_only=True,
                 )
-                # ── 根因修复：reduceOnly 失败绝不降级，立即 force_rest 重查 ──
+                # ?? ?????reduceOnly ????????? force_rest ?? ??
                 if deepcoin_client.is_reduce_only_rejected(res):
                     logger.warning(
-                        f"⚠️ reduceOnly 拒绝 {close_side} {live_sz}张 → "
-                        f"force_rest 重查持仓后再平仓"
+                        f"?? reduceOnly ?? {close_side} {live_sz}? ? "
+                        f"force_rest ????????"
                     )
                     time.sleep(0.4)
                     fresh_positions = deepcoin_client.force_rest_get_all_positions(self.symbol)
@@ -9543,57 +9822,57 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             if fpsz <= 0:
                                 continue
                             fp_side = "sell" if fp["posSide"] == "long" else "buy"
-                            logger.info(f"🔄 重查后平仓: {fp_side} {fpsz}张 {fp['posSide']}")
+                            logger.info(f"?? ?????: {fp_side} {fpsz}? {fp['posSide']}")
                             retry_res = deepcoin_client.place_market_order(
                                 self.symbol, fp_side, fp["posSide"], fpsz, reduce_only=True,
                             )
                             if deepcoin_client.is_reduce_only_rejected(retry_res):
                                 logger.error(
-                                    f"❌ 重查后 reduceOnly 仍拒绝 {fp_side} {fpsz}张 "
-                                    f"→ 记录残仓，跳出该方向"
+                                    f"? ??? reduceOnly ??? {fp_side} {fpsz}? "
+                                    f"? ??????????"
                                 )
                             time.sleep(0.4)
                     break
-                # ── 正常路径：等待成交后继续 ──
-                time.sleep(0.3)  # v16.19: 0.5→0.3s（WS 实时推送加速确认）
-            # v16.19: 根据轮次动态调整等待时间，快速轮用短等待
-            inter_wait = 1.2 if round_i == 0 else 1.0  # 首轮1.2s（首次成交稍慢），后续1.0s
+                # ?? ???????????? ??
+                time.sleep(0.3)  # v16.19: 0.5?0.3s?WS ?????????
+            # v16.19: ????????????????????
+            inter_wait = 1.2 if round_i == 0 else 1.0  # ??1.2s???????????1.0s
             time.sleep(inter_wait)
 
-        # 清理残余持仓（蚂蚁仓扫尾）
+        # ?????????????
         if not closed_successfully:
             all_residual = self._get_all_positions()
             if all_residual:
                 total_residual = sum(self._safe_qty(p["size"]) for p in all_residual)
-                # 对每方向分别处理
+                # ????????
                 for residual in all_residual:
                     residual_sz = self._safe_qty(residual["size"])
                     if residual_sz > 0:
                         if self._is_dust_qty(residual_sz):
                             close_side = "sell" if residual["posSide"] == "long" else "buy"
-                            logger.warning(f"🐜 蚂蚁仓扫尾: {close_side} {residual_sz}张 {residual['posSide']}")
+                            logger.warning(f"?? ?????: {close_side} {residual_sz}? {residual['posSide']}")
                             res = deepcoin_client.place_market_order(
                                 self.symbol, close_side, residual["posSide"], residual_sz, reduce_only=True,
                             )
-                            # 蚂蚁仓 reduceOnly 失败也记录
+                            # ??? reduceOnly ?????
                             if deepcoin_client.is_reduce_only_rejected(res):
                                 logger.error(
-                                    f"❌ 蚂蚁仓 reduceOnly 拒绝: {close_side} {residual_sz}张 "
-                                    f"→ 残仓待下次清理"
+                                    f"? ??? reduceOnly ??: {close_side} {residual_sz}? "
+                                    f"? ???????"
                                 )
                             time.sleep(1.0)
                         else:
-                            logger.warning(f"⚠️ 残仓: {residual['posSide']} {residual_sz}张 非蚂蚁量级")
+                            logger.warning(f"?? ??: {residual['posSide']} {residual_sz}? ?????")
                 closed_successfully = self._verify_flat()
 
             if not closed_successfully:
                 all_residual = self._get_all_positions()
                 residual_info = ", ".join(
-                    f"{p['posSide']}:{self._safe_qty(p['size'])}张" for p in all_residual
-                ) if all_residual else "无"
-                logger.error(f"❌ 6 轮强平后仍有残单: {residual_info}")
+                    f"{p['posSide']}:{self._safe_qty(p['size'])}?" for p in all_residual
+                ) if all_residual else "?"
+                logger.error(f"? 6 ????????: {residual_info}")
                 logger.warning(
-                    f"[钉钉已关闭] 强平未完全归零 | 6轮市价平仓后仍剩: {residual_info}，请人工核查 Deepcoin 盘口"
+                    f"[?????] ??????? | 6????????: {residual_info}?????? Deepcoin ??"
                 )
 
         if reset_state:
@@ -9610,19 +9889,21 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._shield_sltp_ord_id = ""
                 self._shield_sltp_set_at = 0.0
                 self._shield_cancelled_ids = set()
-                # v16.22 修复：全平成功才重置防守价格；全平失败（残留仓）必须保留 tv_sl/tv_tps
+                # v16.22 ???????????????????????????? tv_sl/tv_tps
                 self.tv_sl = 0.0
                 self.tv_tps = [0.0, 0.0, 0.0]
-                self._snapshot_sizing_principal("全平后本金重置")
+                self._snapshot_sizing_principal("???????")
             else:
-                # 残留仓：保留 tv_sl 和 tv_tps（不能重置，否则重启后硬止损漏挂）
+                # ?????? tv_sl ? tv_tps?????????????????
                 residual = self._get_active_position()
-                if residual:
+                if residual == "QUERY_FAILED":
+                    logger.warning("?? ??????????????????? ? ??????")
+                elif residual:
                     self.watched_qty = self._safe_qty(residual["size"])
                     self.current_side = self._pos_side_label(residual)
                     self.watched_entry = residual["entry_price"]
                     logger.warning(
-                        f"强平未归零，账本同步实盘: {self.current_side} {self.watched_qty} 张"
+                        f"????????????: {self.current_side} {self.watched_qty} ?"
                     )
             self._save_state()
 
@@ -9632,9 +9913,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             if force_align:
                 real_side, expected_side = force_align
                 flat = self._wait_verify(self._verify_flat, retries=6, delay=0.5)
-                verify_note = "盘口无持仓 | 挂单已清空 | 智慧大脑复位待命"
+                verify_note = "????? | ????? | ????????"
                 if not flat:
-                    verify_note += " | REST 同步略延迟"
+                    verify_note += " | REST ?????"
                 self._call_telegram_notify(
                     telegram_notify.report_force_align,
                     real_side=real_side,
@@ -9647,17 +9928,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return closed_successfully
 
     def recover_state_on_startup(self):
-        """重启闪电接管：对账 TV/开仓日志 → 核实实盘 → 智能补挂 TP123 → 恢复雷达"""
+        """????????? TV/???? ? ???? ? ???? TP123 ? ????"""
         if not self._try_acquire_recover_singleton():
             return
         try:
-            # v16.18：重启时重置 TP 补挂安全计数器（新会话）
+            # v16.18?????? TP ????????????
             self._reset_tp_place_guard()
-            # v16.21：重启时清除恢复确认记忆（新会话）
+            # v16.21?????????????????
             self._clear_recover_confirmed_levels()
-            # v16.22 修复：必须无条件加载状态文件，不能被 monitoring 标志跳过。
-            # 即使 monitoring=False（上次会话非正常退出），只要状态文件存在就要读取，
-            # 因为实盘可能仍有持仓，防御数据（tv_sl/tv_tps）必须恢复。
+            # v16.22 ?????????????????? monitoring ?????
+            # ?? monitoring=False?????????????????????????
+            # ????????????????tv_sl/tv_tps??????
             if os.path.exists(self.state_file):
                 with open(self.state_file, 'r') as f:
                     s = json.load(f)
@@ -9667,16 +9948,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self.current_sl = s.get("current_sl", 0.0)
                     self.regime = s.get("regime", 3)
                     self.current_atr = s.get("current_atr", 30.0)
-                    # v16.22 修复：ATR 全零时强制从 open_journal 恢复，防止 tv_sl fallback 计算错误
+                    # v16.22 ???ATR ?????? open_journal ????? tv_sl fallback ????
                     if float(self.current_atr or 0) <= 0:
                         last_open = self._load_last_journal_entry(OPEN_JOURNAL, self.symbol)
                         if last_open and float(last_open.get("atr", 0) or 0) > 0:
                             self.current_atr = float(last_open.get("atr"))
-                            logger.info(f"💧 [重启] 从开仓日志恢复 ATR={self.current_atr:.2f}")
+                            logger.info(f"?? [??] ??????? ATR={self.current_atr:.2f}")
                     self.tv_tps = self._sanitize_tp_prices(s.get("tv_tps", [0.0, 0.0, 0.0]))
                     self.tv_sl = float(s.get("tv_sl", 0) or 0)
-                    # v16.22 修复：重启恢复时必须还原 last_tv_signal，
-                    # 这样 _hydrate_tv_defense_context 才能正确从信源补全 TP123 和 tv_sl
+                    # v16.22 ???????????? last_tv_signal?
+                    # ?? _hydrate_tv_defense_context ????????? TP123 ? tv_sl
                     self.last_tv_signal = s.get("last_tv_signal")
                     self.tv_price = float(s.get("tv_price", 0.0) or 0.0)
                     self.best_price = s.get("best_price", 0.0)
@@ -9724,16 +10005,16 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self._open_settled_qty = int(
                         s.get("open_settled_qty", s.get("initial_qty", 0)) or 0
                     )
-                    # 规格 v1.0 §3：永久硬止损冻结价
+                    # ?? v1.0 ?3?????????
                     self.frozen_hard_sl_px = float(s.get("frozen_hard_sl_px", 0) or 0)
-                    # 规格 v1.0 §5.0：提前保本检查点
+                    # ?? v1.0 ?5.0????????
                     self._early_be_checkpoint_done = bool(s.get("_early_be_checkpoint_done", False))
-                    # 规格 v1.0 §8-9：防御单幂等标签 + 退出所有权
+                    # ?? v1.0 ?8-9???????? + ?????
                     self.exit_ownership = str(s.get("exit_ownership", "NONE") or "NONE")
                     self.ownership_locked_at = float(s.get("ownership_locked_at", 0) or 0)
                     raw_tags = s.get("pending_order_tags") or {}
                     self._pending_order_tags = dict(raw_tags) if isinstance(raw_tags, dict) else {}
-                    # v16.14（根因一修复）：重启时清理陈旧标签，避免旧单残留阻止新单挂载
+                    # v16.14??????????????????????????????
                     self._gc_stale_pending_defense_tags_on_startup()
                     self._mutex_leg = str(s.get("mutex_leg", "") or "")
                     if self.sizing_principal <= 0:
@@ -9747,7 +10028,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     jq = int(last_open.get("qty", 0) or 0)
                     if jq > 0:
                         self.base_qty = jq
-                        logger.info(f"📖 恢复 base_qty 取自开仓日志 {jq} 张")
+                        logger.info(f"?? ?? base_qty ?????? {jq} ?")
 
             if self._scan_and_sweep_dust_on_startup(was_monitoring=saved_monitoring):
                 return
@@ -9756,18 +10037,23 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 return
 
             pos = self._get_active_position()
+            if pos == "QUERY_FAILED":
+                logger.error(
+                    "?? [??????] ???????? ? ??????????????????? ? ??????"
+                )
+                return
             if pos and self._safe_qty(pos.get("size", 0)) != 0:
-                # v16.22：立即设标志，阻止 _run_idle_live_reconcile 在重启接管期间干扰
+                # v16.22????????? _run_idle_live_reconcile ?????????
                 self._recover_in_progress = True
                 recover_ok = False
                 recover_err = ""
                 radar_active = False
                 sl_ok = False
                 if not self._lock.acquire(timeout=120.0):
-                    logger.error("❌ 重启接管无法获取锁，跳过")
+                    logger.error("? ????????????")
                     self._recover_in_progress = False
                     logger.warning(
-                        f"[钉钉已关闭] 重启接管失败 | 无法获取仓位锁（120s超时），请稍后重启或检查是否有僵死进程"
+                        f"[?????] ?????? | ????????120s???????????????????"
                     )
                     return
                 try:
@@ -9778,23 +10064,23 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     if self._live_aligns_with_credible_tv(side):
                         if reconcile.get("direction_mismatch"):
                             logger.warning(
-                                f"🔄 [重启] 陈旧对账报方向背离，但实盘 {side} "
-                                f"与最新TV信源同向 → 闪电接管"
+                                f"?? [??] ????????????? {side} "
+                                f"???TV???? ? ????"
                             )
                             self.last_tv_side = side
                             reconcile["direction_mismatch"] = False
-                    elif self._enforce_tv_direction_or_flat(pos, source="VPS重启"):
+                    elif self._enforce_tv_direction_or_flat(pos, source="VPS??"):
                         self._recover_in_progress = False
                         return
 
                     if reconcile.get("manual_open") or self._safe_qty(self.watched_qty) <= 0:
                         logger.info(
-                            f"🔄 [重启] 人工/孤儿同向仓 {side} "
-                            f"{self._safe_qty(pos.get('size'))}张 → 闪电接管 TP123+止损+雷达"
+                            f"?? [??] ??/????? {side} "
+                            f"{self._safe_qty(pos.get('size'))}? ? ???? TP123+??+??"
                         )
                         self._perform_live_takeover(
                             pos,
-                            source="VPS重启",
+                            source="VPS??",
                             manual_open=bool(reconcile.get("manual_open")),
                             qty_change=reconcile.get("qty_manual_change"),
                         )
@@ -9828,7 +10114,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     curr_px = deepcoin_client.get_current_price(self.symbol)
                     stack = self._ensure_full_defense_stack(
                         real_amt, self.watched_entry, curr_px or 0,
-                        source="VPS重启", manual_fresh=bool(reconcile.get("manual_open")),
+                        source="VPS??", manual_fresh=bool(reconcile.get("manual_open")),
                         recover_mode=True,
                     )
                     audit = stack.get("audit") or {}
@@ -9846,11 +10132,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     _rebuilt = result.get("rebuilt", False)
 
                     logger.info(
-                        f"🔄 [系统重启点火] 检测到实盘持仓 {self.current_side} {real_amt}张 @ "
-                        f"{self.watched_entry:.2f} | 开单 {saved_initial}张 | "
-                        f"已成交 TP{getattr(self, 'tp_levels_consumed', []) or '无'} | "
-                        f"雷达={'已激活' if radar_active else '待命(TP1后)'} | "
-                        f"TV对齐 {self.last_tv_side} | 对账 {len(reconcile_notes)} 项"
+                        f"?? [??????] ??????? {self.current_side} {real_amt}? @ "
+                        f"{self.watched_entry:.2f} | ?? {saved_initial}? | "
+                        f"??? TP{getattr(self, 'tp_levels_consumed', []) or '?'} | "
+                        f"??={'???' if radar_active else '??(TP1?)'} | "
+                        f"TV?? {self.last_tv_side} | ?? {len(reconcile_notes)} ?"
                     )
 
                     self.monitoring = True
@@ -9872,12 +10158,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     if reconcile.get("manual_open"):
                         self._call_telegram_notify(
                             telegram_notify.report_manual_position_change,
-                            action_type="人工开仓 · 重启接管",
+                            action_type="???? ? ????",
                             old_qty=0,
                             new_qty=real_amt,
                             new_entry_price=entry_px,
                             verify_note=(
-                                f"TV方向 {self.last_tv_side} | TP123 {self.tv_tps} | "
+                                f"TV?? {self.last_tv_side} | TP123 {self.tv_tps} | "
                                 f"tv_sl={getattr(self, 'tv_sl', 0):.2f}"
                             ),
                             tp_audit=audit,
@@ -9887,18 +10173,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     tv_note = ""
                     if self.last_tv_signal:
                         tv_note = (
-                            f" | 最新TV: {self.last_tv_signal.get('action')} "
+                            f" | ??TV: {self.last_tv_signal.get('action')} "
                             f"@{self.last_tv_signal.get('ts', '')}"
                         )
                     reconcile_txt = (" | " + " ; ".join(reconcile_notes)) if reconcile_notes else ""
-                    skip_note = " | 盘口已齐全，未重复补挂" if not _rebuilt else ""
+                    skip_note = " | ???????????" if not _rebuilt else ""
                     verify_note = (
-                        f"接管 {real_amt}张 @ {entry_px:.2f} | "
-                        f"开单 {saved_initial}张 | "
-                        f"已成交 TP{getattr(self, 'tp_levels_consumed', []) or '无'} | "
-                        f"TV方向 {self.last_tv_side} | "
+                        f"?? {real_amt}? @ {entry_px:.2f} | "
+                        f"?? {saved_initial}? | "
+                        f"??? TP{getattr(self, 'tp_levels_consumed', []) or '?'} | "
+                        f"TV?? {self.last_tv_side} | "
                         f"tv_sl={float(getattr(self, 'tv_sl', 0) or 0):.2f} | "
-                        f"止盈 {matched}/{expected} 档 | "
+                        f"?? {matched}/{expected} ? | "
                         f"{self._format_audit_summary(audit)}{skip_note}{tv_note}{reconcile_txt}"
                     )
                     if not verified:
@@ -9911,25 +10197,25 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                             old_qty=old_q,
                             new_qty=new_q,
                             new_entry_price=entry_px,
-                            verify_note=f"重启接管检测 | {verify_note}",
+                            verify_note=f"?????? | {verify_note}",
                             tp_audit=audit,
                             verified=bool(verified),
                         )
                     if expected > 0 and matched < expected:
                         dupes = [lv for lv in audit.get("levels", []) if lv.get("status") == "duplicate"]
                         hint = (
-                            "重复 TP 占满可减仓额度→TP3 无法挂 | 非 API 权限问题"
-                            if dupes else "请查 logs/deepcoin_brain.log 是否有撤单/限价失败"
+                            "?? TP ????????TP3 ??? | ? API ????"
+                            if dupes else "?? logs/deepcoin_brain.log ?????/????"
                         )
                         self._recover_tp_unconfirmed = True
                         logger.warning(
-                            f"[钉钉已关闭] 重启接管后限价止盈未对齐 | {self.current_side} {real_amt}张 | 仅 {matched}/{expected}档"
+                            f"[?????] ???????????? | {self.current_side} {real_amt}? | ? {matched}/{expected}?"
                         )
 
                     health_txt = (
-                        f" | 盈亏态 {health.get('pnl_label', '未知')} | "
-                        f"硬止损 {health.get('shield_status', '待核实')} | "
-                        f"策略 {health.get('defense_plan', 'TP123+硬止损')}"
+                        f" | ??? {health.get('pnl_label', '??')} | "
+                        f"??? {health.get('shield_status', '???')} | "
+                        f"?? {health.get('defense_plan', 'TP123+???')}"
                     )
                     verify_note = verify_note + health_txt
 
@@ -9961,18 +10247,18 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     )
                     policy_actions = stack.get("notes") or []
                     logger.info(
-                        f"  -> 🎉 实盘阵地接管完毕 | {health.get('pnl_label', '')} | "
-                        f"防线 {' · '.join(policy_actions) if policy_actions else '已核实'}"
+                        f"  -> ?? ???????? | {health.get('pnl_label', '')} | "
+                        f"?? {' ? '.join(policy_actions) if policy_actions else '???'}"
                     )
                     recover_ok = True
                 except Exception as e:
                     import traceback
                     recover_err = f"{e}\n{traceback.format_exc()[-800:]}"
-                    logger.error(f"❌ 重启接管步骤异常: {recover_err}")
+                    logger.error(f"? ????????: {recover_err}")
                     self.monitoring = True
                     self._save_state()
                     logger.warning(
-                        f"[钉钉已关闭] 重启接管部分失败 | 实盘仍有仓，已尽力启动哨兵接力 | {recover_err}"
+                        f"[?????] ???????? | ??????????????? | {recover_err}"
                     )
                 finally:
                     self._recover_in_progress = False
@@ -9980,8 +10266,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
                 if recover_ok and radar_active:
                     logger.info(
-                        f"📡 [重启] 雷达哨兵已点火 | SL={self.current_sl:.2f} | "
-                        f"止损={'已挂/已确认' if sl_ok else '待哨兵补挂'}"
+                        f"?? [??] ??????? | SL={self.current_sl:.2f} | "
+                        f"??={'??/???' if sl_ok else '?????'}"
                     )
 
                 if not self._sentinel_active:
@@ -9992,7 +10278,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     self._post_recover_radar_pulse = True
             else:
                 deepcoin_client.cancel_all_open_orders(self.symbol)
-                logger.info("🔄 [系统重启点火] 盘口干净无持仓，账本复位为空仓待命。")
+                logger.info("?? [??????] ??????????????????")
                 self.monitoring = False
                 self.watched_qty = 0
                 self.initial_qty = 0
@@ -10002,7 +10288,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._save_state()
                 flat_ok = self._wait_verify(self._verify_flat, retries=6, delay=0.5)
                 standby_note = (
-                    f"重启完成 | 盘口无持仓 | 挂单已清空 | "
+                    f"???? | ????? | ????? | "
                     f"{DEEPCOIN_SUPERVISOR_VERSION}"
                 )
                 if not flat_ok:
@@ -10012,9 +10298,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     version=DEEPCOIN_SUPERVISOR_VERSION,
                 )
         except Exception as e:
-            logger.error(f"❌ 闪电接管异常: {e}")
+            logger.error(f"? ??????: {e}")
             logger.warning(
-                f"[钉钉已关闭] 闪电接管异常 | {e}"
+                f"[?????] ?????? | {e}"
             )
 
 
@@ -10051,10 +10337,10 @@ def bootstrap_supervisors():
     if __name__ != "__main__":
         for sym, sup in SUPERVISORS.items():
             try:
-                logger.info(f"🔄 启动恢复 [{sym}] …")
+                logger.info(f"?? ???? [{sym}] ?")
                 sup.recover_state_on_startup()
             except Exception as e:
-                logger.error(f"启动恢复失败 [{sym}]: {e}")
+                logger.error(f"?????? [{sym}]: {e}")
     return SUPERVISORS
 
 

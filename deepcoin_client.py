@@ -772,6 +772,7 @@ class DeepcoinClient:
         """GET /deepcoin/trade/v2/orders-pending — 未成交限价单（支持按品种或全账户查询）"""
         seen = set()
         merged = []
+        any_ok = False
         for params in (
             {"instId": symbol, "index": 1, "limit": 100},
             {"index": 1, "limit": 100},
@@ -783,6 +784,7 @@ class DeepcoinClient:
                         f"挂单查询失败 params={params} code={res.get('code')} msg={res.get('msg')}"
                     )
                 continue
+            any_ok = True
             for o in res.get("data") or []:
                 if symbol and o.get("instId") != symbol:
                     continue
@@ -790,6 +792,12 @@ class DeepcoinClient:
                 if oid and oid not in seen:
                     seen.add(oid)
                     merged.append(o)
+        # binance parity (52d26bd): side channel so callers that need to tell
+        # "genuinely no pending orders" apart from "query failed, unknown
+        # state" can do so without changing this function's return shape for
+        # every existing caller. A caller MUST NOT treat an empty list as
+        # confirmed-empty when this is False right after the call.
+        self._last_pending_orders_query_ok = any_ok
         return merged
 
     def get_trigger_orders_pending(self, symbol="ETH-USDT-SWAP"):

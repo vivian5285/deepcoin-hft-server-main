@@ -46,27 +46,27 @@ TP1 = **10%**，TP2 = **20%**，TP3 = **70%**。比例固定，不随档位变�
 ### 雷达激活臂（§5.1）
 激活瞬间保本位：`entry ± tick + fee_cover`，不跳 ATR。
 
-### 雷达跟踪参数（§5.2 / §5.3 / §6.1）
-步进/呼吸/呼吸空间统一使用 **TV webhook 的 `atr` 字段**，VPS 不独立拉取 ATR。
+### 雷达跟踪参数（§5.2 / §5.3 / §6.1）——v2.1 已放宽约 40-60%
+步进/呼吸/呼吸空间统一使用 **TV webhook 的 `atr` 字段**，VPS 不独立拉取 ATR。对齐币安 v2.1（498757d）：步进参数大幅放宽，呼吸空间沿用已验证的 v2.0 数值。XAU 此前误共用 ETH 参数表，现已拆分独立档位。
 
-ETHUSDT.P：
+ETHUSDT.P（BNB 跟随 ETH 逻辑）：
 
 | 档位 | 跟踪步长 | 跟进幅度 | TP1-TP2呼吸 | TP2-TP3呼吸 | TP3后 |
 |------|---------|---------|------------|------------|-------|
-| 弱趋势 T0 | 0.40×ATR | 0.25×ATR | 0.80×ATR | 1.00×ATR | 1.2~1.5×ATR |
-| 中趋势 T1 | 0.50×ATR | 0.35×ATR | 1.20×ATR | 1.60×ATR | 2.0~2.5×ATR |
-| 强趋势 T2 | 0.60×ATR | 0.40×ATR | 1.50×ATR | 2.00×ATR | 2.5~3.5×ATR |
+| 弱趋势 T0 | 0.70×ATR | 0.42×ATR | 1.50×ATR | 2.00×ATR | 2.5~3.5×ATR |
+| 中趋势 T1 | 0.85×ATR | 0.55×ATR | 2.00×ATR | 2.80×ATR | 3.0~4.5×ATR |
+| 强趋势 T2 | 1.00×ATR | 0.65×ATR | 2.50×ATR | 3.50×ATR | 4.0~6.0×ATR |
 
 XAUUSDT.P：
 
 | 档位 | 跟踪步长 | 跟进幅度 | TP1-TP2呼吸 | TP2-TP3呼吸 | TP3后 |
 |------|---------|---------|------------|------------|-------|
-| 弱趋势 T0 | 0.35×ATR | 0.20×ATR | 0.70×ATR | 0.90×ATR | 1.0~1.3×ATR |
-| 中趋势 T1 | 0.40×ATR | 0.30×ATR | 1.00×ATR | 1.40×ATR | 1.8~2.2×ATR |
-| 强趋势 T2 | 0.50×ATR | 0.35×ATR | 1.30×ATR | 1.80×ATR | 2.2~3.0×ATR |
+| 弱趋势 T0 | 0.70×ATR | 0.50×ATR | 2.00×ATR | 2.80×ATR | 3.0~4.5×ATR |
+| 中趋势 T1 | 0.85×ATR | 0.55×ATR | 2.50×ATR | 3.50×ATR | 3.5~5.5×ATR |
+| 强趋势 T2 | 1.00×ATR | 0.65×ATR | 3.00×ATR | 4.00×ATR | 5.0~7.0×ATR |
 
-### 提前保本检查点（§5.0）
-价格到达 `entry ± TP1距离 × 0.5` 时，单次将止损移至保本位（`entry ± tick + fee`）。仅触发一次，不启动雷达，不影响雷达激活判断。
+### 提前保本检查点（§5.0）——已废除
+对齐币安 v16.22 + v16.24 v2.1：提前保本检查点已废除（XAU/BNB 波动大，雷达过早启动易出局）。雷达激活本身即以保本位起步，无需独立检查点。
 
 ### 雷达与硬止损（§5.4）
 两层保护同时存在，互不干扰。硬止损永不撤销，雷达激活后两层并存。
@@ -122,7 +122,8 @@ XAUUSDT.P：
 ### 平仓完整性（§9.4 / §9.5）
 平仓前必须用 REST 查询交易所真实持仓作为最终依据，**平仓数量 ≤ 真实持仓**，绝不允许超出导致反向开仓。
 
-### 钉钉通知（§11）
+### Telegram 通知（§11）——对齐币安 2026-07-31 起纯 Telegram
+本服务实际早已全量使用 `telegram_notify.py`（`TG_BOT_TOKEN`/`TG_CHAT_ID`），核心大脑 `position_supervisor_deepcoin.py` 中 31 处通知调用无一使用钉钉；`dingtalk.py` 为未被任何模块导入的死代码，已删除。此前 README 仍标注"钉钉/紫金主题"为历史遗留描述，现予更正。
 
 | 事件 | 触发时机 |
 |------|---------|
@@ -162,10 +163,10 @@ XAUUSDT.P：
 
 | 项目 | 深币 | 币安 |
 |------|------|------|
-| 止损 | tv_sl 条件单 + 雷达 `place_trigger_order` | 单槽 `closePosition` 合并 |
-| 数量 | 张（字符串 API） | ETH 三位小数 |
+| 止损 | tv_sl 条件单 + 雷达 `place_trigger_order`（不随 TP 成交自动缩量，需显式重算张数） | 单槽 `closePosition` 合并（自动缩量） |
+| 数量 | 张（整数字符串 API） | ETH 三位小数 |
 | WS | `market-latest` | `markPrice@1s` |
-| 钉钉主题 | 紫金 | 黄金 |
+| 通知 | Telegram（与币安共用同一 Bot） | Telegram |
 | 蚂蚁仓 | ≤ 1 张 | ≤ 0.004 ETH |
 
 ---
@@ -229,7 +230,7 @@ python3 test_radar_gate_tp12.py -v
 
 ```
 TradingView → app.py → position_supervisor_deepcoin.py → deepcoin_client.py
-                      ↘ dingtalk.py（紫金）
+                      ↘ telegram_notify.py
 ```
 
 核心模块：
@@ -245,7 +246,7 @@ TradingView → app.py → position_supervisor_deepcoin.py → deepcoin_client.p
 | `breath_profiles.py` | 呼吸跟踪基线参数 |
 | `defense_profiles.py` | 硬止损缓冲、TP分仓比例 |
 | `atr_scenario.py` | 硬止损计算 |
-| `dingtalk.py` | 钉钉通知（紫金主题） |
+| `telegram_notify.py` | Telegram 通知 |
 | `webhook_parser.py` | TV 信号解析 |
 | `order_idempotency.py` | 幂等订单标签 |
 | `api_throttle.py` | REST API 限流 |
@@ -260,8 +261,8 @@ DEEPCOIN_API_KEY=
 DEEPCOIN_API_SECRET=
 DEEPCOIN_PASSPHRASE=
 WEBHOOK_SECRET=                # webhook 鉴权密码
-DINGTALK_WEBHOOK=             # 钉钉机器人 Webhook
-DINGTALK_SECRET=              # 钉钉机器人加签密钥
+TG_BOT_TOKEN=                 # Telegram 机器人 token（与币安共用同一 Bot）
+TG_CHAT_ID=                   # Telegram 接收群/频道 ID
 FLASK_PORT=5004
 ```
 
@@ -282,4 +283,4 @@ FLASK_PORT=5004
 
 ---
 
-*深币紫金引擎 · v16.18 · 对齐规格 v1.0*
+*深币引擎 · 对齐规格 v1.0 / v2.1*
