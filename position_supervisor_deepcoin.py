@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEEPCOIN_SUPERVISOR_VERSION = "v16.28-tp-bugfix"
+DEEPCOIN_SUPERVISOR_VERSION = "v16.29-binance-parity"
 
 # ???????? CLOSE ??????? 1?2s ????
 LATE_CLOSE_SUPPRESS_SEC = 5.0
