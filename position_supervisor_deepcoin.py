@@ -3364,7 +3364,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         for o in orphans:
             issues.append(f"???? @{o['price']:.2f} {o['qty']}?")
 
-        expected = self._expected_tp_count()
+        # ?? _expected_tp_count() ?????? tv_tps ??????? qty=0
+        # ?????level??? qty=1 ??????TP2 ???0??????????
+        # matched_full ?????? len(levels)?????????????
+        # _tp_audit_ok ??????? ? ??/????????? TP ??????
+        expected = len(levels)
         pending_prices = sorted({o["price"] for o in orders})
         return {
             "matched_full": matched_full,
@@ -3430,12 +3434,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         return False
 
     def _defenses_fully_ok(self, live_qty, dynamic_sl=None, tolerance=1.0):
-        tp_pxs = self.tv_tps
-        expected = self._expected_tp_count(tp_pxs)
+        # ?? audit["expected"] ????qty=0 ?????????????
+        # ??????? _expected_tp_count() ??? matched_full ??????
+        audit = self._audit_tp_levels(live_qty, tolerance)
+        expected = audit["expected"]
         if expected == 0:
             return dynamic_sl is None or self._has_trigger_sl_near(dynamic_sl, tolerance)
 
-        audit = self._audit_tp_levels(live_qty, tolerance)
         if audit["matched_full"] < expected:
             return False
         if audit["orphans"]:
