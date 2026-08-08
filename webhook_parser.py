@@ -15,13 +15,14 @@ EXCHANGE_LEVERAGE = 5
 VPS_MARGIN_LEVERAGE = 1
 
 # VPS 自主风控（与 TV risk_pct / qty_ratio 完全脱钩）
+# 与币安系统对齐（FIXED_RISK_PCT=0.20）：固定本金×20%，不再按 regime 分级。
 VPS_MARGIN_PCT_BY_REGIME = {
-    1: 0.05,
-    2: 0.10,
-    3: 0.15,
-    4: 0.18,
+    1: 0.20,
+    2: 0.20,
+    3: 0.20,
+    4: 0.20,
 }
-VPS_RISK_PCT = 18.0
+VPS_RISK_PCT = 20.0
 VPS_GLOBAL_SCALE = 1.0
 VPS_REGIME_SCALE = {
     1: VPS_MARGIN_PCT_BY_REGIME[1] / VPS_MARGIN_PCT_BY_REGIME[4],
