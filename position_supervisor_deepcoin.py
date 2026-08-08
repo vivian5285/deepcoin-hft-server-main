@@ -191,9 +191,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         except Exception as e:
             logger.warning(f"face_value instruments ???? meta {self.face_value}: {e}")
 
-        # v16.16 ??Deepcoin ?? set-position-mode API?? posSide(long/short)
-        # ????????????????????? Deepcoin ???
-        # ?????????? set_leverage(5x) ???
+        # v16.16 note: Deepcoin has no set-position-mode API; posSide(long/short)
+        # is already correctly used on every order, account default hedge
+        # behavior is controlled by Deepcoin itself.
+        # binance parity (a09008f, 2026-08-08): system no longer calls
+        # set_leverage at all. Sizing always uses the fixed EXCHANGE_LEVERAGE
+        # constant; the exchange's real leverage is entirely the user's own
+        # manual setting in the Deepcoin app.
         self.binance_mark = meta.get("binance_mark") or "ETHUSDT"
         self.monitoring = False
         self._lock = threading.Lock()
@@ -8650,7 +8654,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             return
 
         deepcoin_client.set_position_mode(self.symbol, mode="both")
-        deepcoin_client.set_leverage(self.symbol, leverage=EXCHANGE_LEVERAGE)
+        # binance parity (a09008f, 2026-08-08): position sizing is always
+        # computed off the fixed EXCHANGE_LEVERAGE constant regardless of the
+        # exchange's real leverage setting -- the system must never actively
+        # push a leverage value to the exchange. A higher real leverage set
+        # manually in the Deepcoin app just frees up margin; it must never
+        # be silently overwritten back to EXCHANGE_LEVERAGE (which used to
+        # happen on every add/open, and again after every restart since the
+        # "did we already set it" tracking was in-memory only).
         logger.info(
             f"? [{entry_type}] {action} ?? {add_qty} ? | "
             f"{self._tv_sizing_note(add_qty, meta, entry_type=entry_type)}"
@@ -8840,7 +8851,10 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 return
 
             deepcoin_client.set_position_mode(self.symbol, mode="both")
-            deepcoin_client.set_leverage(self.symbol, leverage=EXCHANGE_LEVERAGE)
+            # binance parity (a09008f, 2026-08-08): never push leverage to the
+            # exchange -- sizing always uses the fixed EXCHANGE_LEVERAGE
+            # constant, independent of whatever real leverage the user has
+            # set manually. See the matching comment in _add_to_position.
             notional = qty * self.face_value * curr_px
             budget_txt = format_vps_sizing_note(sizing_meta, qty=qty, entry_type=ENTRY_TYPE_OPEN)
             logger.info(f"?? ???? [{self.symbol}]: {budget_txt} (?? ~{notional:.0f}U)")

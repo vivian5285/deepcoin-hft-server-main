@@ -13,7 +13,7 @@
 | 端口 | **5004** |
 | TV Webhook | `http://187.77.130.144/deepcoin/webhook` |
 | 单位 | **张**（0.1 ETH/张） |
-| 杠杆 | **5x** cross（双向持仓模式） |
+| 杠杆 | 下单量公式恒按 **5x** 计算（cross，双向持仓模式）；系统不再主动调用 set_leverage，交易所真实杠杆完全由用户在 App 手动设置，调多少倍都不影响下单张数，只影响保证金占用 |
 | 健康检查 | `GET /health` → `"version":"v16.23-hard-shield-recovery"` |
 | 主日志 | `logs/deepcoin_brain.log` |
 | 部署 | `bash deploy_deepcoin.sh` |
