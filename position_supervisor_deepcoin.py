@@ -6525,13 +6525,17 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         expected = audit.get("expected", 0)
         if expected <= 0:
             return True
-        tp_prices = sum(1 for t in (self.tv_tps or []) if t > 0)
-        if (
-            tp_prices >= 3
-            and not self._tp_level_consumed(1)
-            and expected < 3
-        ):
-            return False
+        # Removed: a stale special-case that unconditionally failed the audit
+        # whenever all 3 TP prices were known (tv_tps fully populated, the
+        # normal state), TP1 hadn't filled yet (also normal right after
+        # placement) and expected < 3 (also normal/correct -- TP3 never gets
+        # a limit order per spec, so expected is always 2). Those three
+        # conditions are true for essentially every healthy open position,
+        # so this was a permanent false positive that kept forcing
+        # cancel+rebuild of perfectly fine TP1/TP2 orders every guardian
+        # cycle (confirmed live: audit showed matched TP1+TP2 immediately
+        # before this block still reported "not ok" and triggered a nuclear
+        # realign, over and over).
         return (
             audit.get("matched_full", 0) >= expected
             and not audit.get("orphans")
