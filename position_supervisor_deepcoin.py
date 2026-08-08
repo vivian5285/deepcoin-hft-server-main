@@ -3222,14 +3222,23 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if baseline <= 0 or baseline > live_qty:
             baseline = live_qty
 
+        # ????? _calculate_tp_quantities??? _tp_slices_for_initial ??
+        # ???????????????????????????????????????
+        # ????????????????"?????? / ??????????"??????
+        # ????????????????????????????????TP2 ????
+        # ????????????"???"?
+        tp1_qty, tp2_qty, tp3_qty = self._calculate_tp_quantities(
+            int(baseline), list(ratios),
+        )
+
         # ????????TP3??????????? baseline ?????????
         if len(remaining) == 1:
             idx = remaining[0]
             level = idx + 1
             if level == 3:
                 return {3: live_qty}
-            q = max(1, int(round(baseline * ratios[idx])))
-            return {level: min(q, live_qty)}
+            q = tp1_qty if level == 1 else tp2_qty
+            return {level: min(max(1, q), live_qty)}
 
         # TP1+TP2 ???1?????TP3
         # ??live_qty??2?????TP1?TP2=0
@@ -3241,11 +3250,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 out[3] = 0
             return out
 
-        # ?? baseline????????? live_qty??? floor/ceil ??? live_qty
-        tp1_qty = max(1, int(math.floor(baseline * ratios[0])))
-        tp2_qty = max(1, int(math.ceil(baseline * ratios[1])))
-        tp1_qty = min(tp1_qty, live_qty)
-        tp2_qty = min(tp2_qty, live_qty)
+        tp1_qty = min(max(1, tp1_qty), live_qty)
+        tp2_qty = min(max(1, tp2_qty), live_qty)
         # ?? tp1 + tp2 ??? live_qty??????
         if tp1_qty + tp2_qty > live_qty:
             # ???? TP1?TP2 ?????
@@ -7119,7 +7125,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 if abs(o["price"] - px) <= tolerance
             ]
             for o in at_px:
-                if o["qty"] != target_q and o.get("orderId"):
+                # Only cancel when the live order is OVERSIZED vs target.
+                # An UNDERSIZED order is normal for a level that partially
+                # filled while staying open (order still resting with the
+                # remainder) -- cancelling+replacing at the full target in
+                # that case would double-count the already-filled portion.
+                if o["qty"] > target_q and o.get("orderId"):
                     deepcoin_client.cancel_order(self.symbol, ord_id=o["orderId"])
                     cancelled += 1
                     time.sleep(0.2)
