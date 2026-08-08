@@ -4139,7 +4139,13 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         """
         fill = float(entry if entry is not None else (self.watched_entry or self.tv_price or 0))
         side = str(side or self.current_side or "").strip().upper()
-        tv_sl = float(tv_sl if tv_sl is not None else (getattr(self, "tv_sl_ref", 0) or 0))
+        # ?? tv_sl_ref ??????????? open ????? tv_sl_ref?????
+        # self.tv_sl(???????TV??????)??? frozen_hard_sl_px ????
+        # ?0??????? _shield_stop_price ??????? tv_sl?????1.15x???
+        tv_sl = float(
+            tv_sl if tv_sl is not None
+            else (getattr(self, "tv_sl_ref", 0) or getattr(self, "tv_sl", 0) or 0)
+        )
         tv_entry = float(getattr(self, "tv_price", 0) or 0)
         if tv_entry <= 0:
             tv_entry = fill
@@ -5768,6 +5774,14 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         if getattr(self, "tv_sl", 0) > 0:
             if not force and not self._can_maintain_shield_now(force=force):
                 return getattr(self, "shield_active", False)
+            # ????? open ????? frozen_hard_sl_px?????? tv_sl(??1.15x
+            # ???)??? _shield_stop_price ????????????????
+            # ??????????????????? cur>0 ??? no-op?
+            if self._frozen_hard_px() <= 0:
+                self._lock_frozen_hard_sl_from_tv(
+                    entry=self.watched_entry, side=self.current_side,
+                    source="?????",
+                )
             return self._sync_tv_sl_stop(
                 real_amt,
                 reason="??TV???",
