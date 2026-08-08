@@ -1551,6 +1551,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         }
         side = "LONG" if pos.get("posSide") == "long" else "SHORT"
         real_amt = self._safe_qty(pos.get("size"))
+        entry = float(pos.get("avgPx") or pos.get("entry_price", 0) or 0)
         saved_watched = self._safe_qty(self.watched_qty)
         saved_initial = self._safe_qty(self.initial_qty)
 
