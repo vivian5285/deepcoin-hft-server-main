@@ -663,7 +663,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             )
             self._perform_live_takeover(pos, source="????", manual_open=True)
             # v16.25 ???takeover ? pos ?????
-            pos_after = self._query_position()
+            pos_after = self._get_active_position()
+            if pos_after == "QUERY_FAILED":
+                pos_after = None
             if pos_after is None or self._safe_qty(pos_after.get("size", 0)) <= 0:
                 logger.warning("?? [????] takeover???????????")
                 return
