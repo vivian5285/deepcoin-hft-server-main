@@ -289,9 +289,10 @@ restart_service() {
     # shellcheck disable=SC1091
     if [ -d "venv" ] && source venv/bin/activate 2>/dev/null; then
         nohup venv/bin/python -m gunicorn \
-            -w 2 \
+            -w 1 --threads 4 \
             -b "0.0.0.0:$PORT" \
-            --timeout 60 \
+            --timeout 300 \
+            --keep-alive 5 \
             --access-logfile logs/gunicorn_access.log \
             --error-logfile logs/gunicorn_error.log \
             --capture-output \
@@ -299,9 +300,10 @@ restart_service() {
             > /dev/null 2>&1 &
     else
         nohup python3 -m gunicorn \
-            -w 2 \
+            -w 1 --threads 4 \
             -b "0.0.0.0:$PORT" \
-            --timeout 60 \
+            --timeout 300 \
+            --keep-alive 5 \
             --access-logfile logs/gunicorn_access.log \
             --error-logfile logs/gunicorn_error.log \
             --capture-output \
