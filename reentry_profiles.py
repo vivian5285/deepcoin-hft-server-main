@@ -507,18 +507,11 @@ def radar_gate_price_from_tps(
 
 
 def radar_gate_label(reentry_attempt: int = 0, ratio: Optional[float] = None) -> str:
-    _ = reentry_attempt
-    return radar_gate_label_from_ratio(ratio)
-
-
-def radar_gate_label_from_ratio(ratio: Optional[float] = None) -> str:
-    try:
-        r = float(ratio)
-    except (TypeError, ValueError):
-        r = 0.0
-    if 0.65 <= r <= 0.95:
-        return f"ADX启动 {r:.0%}×1.35ATR"
-    return "ADX启动 65%~90%×1.35ATR"
+    """规格 v2.1：绝对价格锚定标签（首次=TP1-TP2中点，重入=TP2绝对价）。
+    ratio 参数已废弃（旧 ADX 插值比例公式不再驱动激活判断），保留仅为
+    兼容旧调用签名。"""
+    _ = ratio
+    return "TP2绝对价" if int(reentry_attempt or 0) >= 1 else "TP1-TP2中点"
 
 
 def tier_coeffs(tier: int, profile: Optional[Dict[str, Any]] = None) -> Dict[str, float]:

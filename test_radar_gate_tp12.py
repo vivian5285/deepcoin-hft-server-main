@@ -72,8 +72,14 @@ class TestActivationTp12Absolute(unittest.TestCase):
         self.assertEqual(activation_mode_for_attempt(0), ACTIVATION_MODE_FIRST)
         self.assertEqual(activation_mode_for_attempt(1), ACTIVATION_MODE_REENTRY)
         self.assertEqual(MAX_REENTRIES, 1)
-        self.assertAlmostEqual(activation_frac_for_attempt(0), 0.0)
-        self.assertAlmostEqual(activation_frac_for_attempt(1), 1.0)
+        # v2.1: radar_activation_frac is a legacy/vestigial field left over
+        # from the old ADX-interpolated-ratio activation formula. The real
+        # gate is exclusively the absolute TP1/TP2 price anchor
+        # (radar_gate_price_from_tps below); this field no longer varies by
+        # attempt and is kept only for state-schema backward compatibility,
+        # currently a flat constant.
+        self.assertAlmostEqual(activation_frac_for_attempt(0), 0.78)
+        self.assertAlmostEqual(activation_frac_for_attempt(1), 0.78)
         self.assertEqual(radar_gate_label(0), "TP1-TP2中点")
         self.assertEqual(radar_gate_label(1), "TP2绝对价")
         self.assertEqual(tier_label(2), "强趋势")
@@ -161,36 +167,52 @@ class TestActivationTp12Absolute(unittest.TestCase):
             entry + atr * 1.1475, places=2,
         )
 
-    def test_arm_stop_half_atr(self):
-        self.assertAlmostEqual(ARM_SL_ATR, 0.5)
-        self.assertAlmostEqual(arm_stop_price("LONG", 3000, 20), 2990.0)
-        self.assertAlmostEqual(arm_stop_price("SHORT", 3000, 20), 3010.0)
+    def test_arm_stop_breakeven_no_atr_jump(self):
+        """v16.8.0+/v2.1: marathon radar arms at breakeven (entry ± tick ±
+        fee_cover), never an ATR jump -- ARM_SL_ATR is fixed at 0.0."""
+        self.assertAlmostEqual(ARM_SL_ATR, 0.0)
+        # breakeven = entry + fee_cover (round-trip) + tick, entry - ... for short
+        self.assertAlmostEqual(arm_stop_price("LONG", 3000, 20), 3002.41, places=2)
+        self.assertAlmostEqual(arm_stop_price("SHORT", 3000, 20), 2997.59, places=2)
 
 
 class TestTierCoeffs(unittest.TestCase):
     def test_eth_three_tiers(self):
+        """v2.1 (498757d parity, 2026-08-08): step/breath params widened
+        ~40-60% vs the old v1.0 table; weak(T0)=0.70, strong(T2)=1.00."""
         eth = get_reentry_profile("ETHUSDT")
         self.assertEqual(len(eth["tiers"]), 3)
         t0 = tier_coeffs(0, eth)
         t2 = tier_coeffs(2, eth)
-        self.assertAlmostEqual(t0["step_trigger_atr"], 0.40)
-        self.assertAlmostEqual(t2["step_trigger_atr"], 0.60)
+        self.assertAlmostEqual(t0["step_trigger_atr"], 0.70)
+        self.assertAlmostEqual(t2["step_trigger_atr"], 1.00)
+        # strong tier must never be tighter than weak tier (market runs
+        # ahead, radar trails at a safe distance behind it)
+        self.assertGreaterEqual(t2["step_trigger_atr"], t0["step_trigger_atr"])
+        self.assertGreaterEqual(t2["breath_tp12"], t0["breath_tp12"])
 
     def test_xau_three_tiers(self):
+        """v2.1: XAU has its own independent tier table (was previously
+        silently aliased to ETH's table until today's fix -- confirmed here
+        by checking XAU's mid-tier breath value differs from ETH's)."""
         xau = get_reentry_profile("XAUUSDT")
+        eth = get_reentry_profile("ETHUSDT")
+        self.assertIsNot(xau["tiers"], eth["tiers"])
         t1 = tier_coeffs(1, xau)
-        self.assertAlmostEqual(t1["step_trigger_atr"], 0.40)
+        self.assertAlmostEqual(t1["step_trigger_atr"], 0.85)
+        self.assertNotAlmostEqual(t1["breath_tp12"], tier_coeffs(1, eth)["breath_tp12"])
 
     def test_overlay_disables_early_be(self):
         out = apply_tier_to_breath_profile(
             dict(BREATH_ETH), 1, get_reentry_profile("ETHUSDT"),
         )
         self.assertAlmostEqual(out["early_be_atr"], 0.0)
-        self.assertAlmostEqual(out["initial_sl_atr"], 0.5)
+        # v2.1: marathon arm is breakeven-only, never an ATR jump
+        self.assertAlmostEqual(out["initial_sl_atr"], 0.0)
 
     def test_breath_baseline(self):
         eth = get_breath_profile("ETHUSDT")
-        self.assertAlmostEqual(eth["initial_sl_atr"], 0.5)
+        self.assertAlmostEqual(eth["initial_sl_atr"], 0.0)
         self.assertAlmostEqual(eth["early_be_atr"], 0.0)
 
 
@@ -279,7 +301,9 @@ class TestEngine(unittest.TestCase):
         b = bump_after_reentry_fill(0, 0.0, "ETHUSDT", adx_tier=0)
         self.assertEqual(b["reentry_attempt"], 1)
         self.assertEqual(b["radar_tier"], 1)
-        self.assertAlmostEqual(b["radar_activation_frac"], 1.0)
+        # radar_activation_frac is vestigial (see test_modes) -- the real
+        # reentry gate is TP2 absolute price, not this ratio.
+        self.assertAlmostEqual(b["radar_activation_frac"], 0.78)
 
     def test_init_cycle_first_mode(self):
         st = init_cycle_on_open(
@@ -287,11 +311,11 @@ class TestEngine(unittest.TestCase):
             symbol="ETHUSDT", adx_tier=2,
         )
         self.assertEqual(st["adx_tier"], 2)
-        self.assertAlmostEqual(st["radar_activation_frac"], 0.0)
+        self.assertAlmostEqual(st["radar_activation_frac"], 0.78)
         self.assertTrue(st["radar_pending_arm"])
 
     def test_next_frac(self):
-        self.assertAlmostEqual(next_activation_frac(0.0, 1), 1.0)
+        self.assertAlmostEqual(next_activation_frac(0.0, 1), 0.78)
 
     def test_blank_and_tag(self):
         blank = blank_reentry_state()
