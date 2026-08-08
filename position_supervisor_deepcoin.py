@@ -361,7 +361,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                         continue
                     self._run_idle_live_reconcile()
                 except Exception as e:
-                    logger.error(f"??????: {e}")
+                    logger.error(f"idle patrol failed: {e}", exc_info=True)
                 finally:
                     self._lock.release()
 
@@ -1854,7 +1854,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                     "reentry_state": self._reentry_state_dict(),
                 }, f)
         except Exception as e:
-            logger.error(f"??????: {e}")
+            logger.error(f"save_state failed: {e}", exc_info=True)
 
     @staticmethod
     def _safe_qty(val, default=0):
