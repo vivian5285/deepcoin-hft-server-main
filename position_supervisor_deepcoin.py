@@ -1183,6 +1183,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             tp_ok = 0
         if tp_ok < 3:
             for src in sources:
+                if not src:
+                    continue
                 src_side = (src.get("action") or src.get("side") or "").upper()
                 if src_side in ("LONG", "SHORT") and side and src_side != side:
                     continue
@@ -1208,6 +1210,8 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         if float(getattr(self, "tv_sl", 0) or 0) <= 0:
             for src in sources:
+                if not src:
+                    continue
                 sl = float(src.get("tv_sl", 0) or 0)
                 if sl > 0:
                     self.tv_sl = sl
