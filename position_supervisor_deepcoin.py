@@ -982,6 +982,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         for entry in reversed(entries):
             if entry.get("symbol") != self.symbol:  # v16.26: ? symbol ??
                 continue
+            action = str(entry.get("action") or "").upper()
             if action.startswith("CLOSE"):
                 continue
             if action in ("LONG", "SHORT"):
