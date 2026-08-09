@@ -809,6 +809,20 @@ class DeepcoinClient:
             return res["data"]
         return []
 
+    def get_recent_fills(self, symbol="ETH-USDT-SWAP", begin_ms=None, limit=100):
+        """GET /deepcoin/trade/fills — 成交明细（核对 TP 限价成交 vs 手工减仓）。
+
+        binance parity (get_recent_user_trades)：私有WS推送有重连缺口，缺口期间
+        插针成交只能靠这个按时间过滤的成交历史接口兜底核实，不能只信WS事件。
+        """
+        params = {"instType": "SWAP", "instId": symbol, "limit": max(1, min(int(limit or 100), 100))}
+        if begin_ms is not None:
+            params["begin"] = int(begin_ms)
+        res = self._request("GET", "/trade/fills", params, _throttle_kind="rest_query")
+        if res and isinstance(res.get("data"), list):
+            return res["data"]
+        return []
+
     def _safe_cancel(self, endpoint, params):
         # v16.10+：撤单用 force=True（关键防御操作）
         res = self._request("POST", endpoint, params, _throttle_kind="rest_trade", _throttle_force=True)

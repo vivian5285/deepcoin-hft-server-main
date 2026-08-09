@@ -3133,6 +3133,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._price_reached_tp1_zone(curr_px, sl["price"])
                 or getattr(self, "_radar_armed_after_tp1", False)
                 or getattr(self, "_ws_tp1_fill_hint", False)
+                or self._tp1_confirmed_via_trade_history(live_qty)
             ):
                 break
             cum += int(sl["qty"])
@@ -7144,6 +7145,39 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
     def _detect_tp_fills_by_reduction(self, old_qty, new_qty, curr_px=0.0, initial=None):
         return []
+
+    def _tp1_confirmed_via_trade_history(self, live_qty, lookback_ms=86400000):
+        """
+        binance parity (_detect_tp_fills_from_trades)：私有WS若断线重连，插针
+        成交可能被漏推送，_ws_tp1_fill_hint 就不会置位；此时只靠现价抽样判断
+        TP1 是否到区域，跟binance纯REST轮询同款漏判风险(2026-08-09 ZEC 实盘
+        复现)。用成交历史(权威、不依赖WS推送/抽样时机)兜底核实一次。
+        """
+        baseline = self._tp_baseline_qty(live_qty)
+        live_qty = self._safe_qty(live_qty)
+        if baseline <= live_qty:
+            return False
+        tp1_px = float(self.tv_tps[0] or 0) if self.tv_tps else 0.0
+        if tp1_px <= 0:
+            return False
+        now_ms = int(time.time() * 1000)
+        fills = deepcoin_client.get_recent_fills(
+            self.symbol, begin_ms=now_ms - int(lookback_ms),
+        )
+        if not fills:
+            return False
+        close_side = "sell" if self.current_side == "LONG" else "buy"
+        tol_px = max(1.5, tp1_px * 0.0012)
+        for f in fills:
+            if str(f.get("side") or "").lower() != close_side:
+                continue
+            try:
+                fpx = float(f.get("fillPx") or 0)
+            except (TypeError, ValueError):
+                continue
+            if fpx > 0 and abs(fpx - tp1_px) <= tol_px:
+                return True
+        return False
 
     def _cancel_tp_orders_at_levels(self, levels):
         cancelled = 0
