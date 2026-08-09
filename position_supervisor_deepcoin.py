@@ -1280,6 +1280,12 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._shield_cancelled_ids = set()
         self.tv_tps = [0.0, 0.0, 0.0]
         self.tv_sl = 0.0
+        # frozen_hard_sl_px 是"锁定一次、永不改价"的硬止损，只在其对应的
+        # 那一笔仓位生命周期内有效；不清零会导致下一笔全新开仓(不同entry/
+        # tv_sl)误用上一笔仓位算出的旧止损价，可能离新入场价极近甚至反向
+        # (2026-08-09 实盘复现：BNB新仓entry=600.99却复用了旧仓entry=606.47
+        # 算出的602.02，开仓7分钟内就被打穿)。
+        self.frozen_hard_sl_px = 0.0
         if not getattr(self, "open_regime", None):
             self.open_regime = self.regime
         if not getattr(self, "open_atr", None):
@@ -2854,6 +2860,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self._shield_sltp_set_at = 0.0
         self._shield_cancelled_ids = set()
         self.current_side = None
+        self.frozen_hard_sl_px = 0.0
         # ?? v1.0 ?8-9?????????? + ?????
         self.exit_ownership = "NONE"
         self.ownership_locked_at = 0.0
@@ -2981,6 +2988,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         self.last_tv_signal = None
         self.last_tv_side = None
         self.tv_sl = 0.0
+        self.frozen_hard_sl_px = 0.0
         self.tv_tps = [0.0, 0.0, 0.0]
         self.tv_price = 0.0
         self.watched_entry = 0.0
@@ -10027,6 +10035,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
                 self._shield_cancelled_ids = set()
                 # v16.22 ???????????????????????????? tv_sl/tv_tps
                 self.tv_sl = 0.0
+                self.frozen_hard_sl_px = 0.0
                 self.tv_tps = [0.0, 0.0, 0.0]
                 self._snapshot_sizing_principal("???????")
             else:
