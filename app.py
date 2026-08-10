@@ -89,6 +89,18 @@ def health():
             s: bool(getattr(sup, "monitoring", False))
             for s, sup in SUPERVISORS.items()
         },
+        # 部署安全阀：任一品种正在开仓执行中(_open_in_progress)时不应重启，
+        # 否则会撞上"市价单已成交但仓位查询/TP绑定尚未走完"的窗口，重启会
+        # 把这笔仓位打成孤儿仓，靠接管兜底而非正常TV关联流程（对齐binance
+        # f162ede，binance 2026-08-10 实盘 BNBUSDT 开仓中途被部署重启命中过）。
+        "open_in_progress": {
+            s: bool(getattr(sup, "_open_in_progress", False))
+            for s, sup in SUPERVISORS.items()
+        },
+        "deploy_safe": not any(
+            bool(getattr(sup, "_open_in_progress", False))
+            for sup in SUPERVISORS.values()
+        ),
     }), 200
 
 
