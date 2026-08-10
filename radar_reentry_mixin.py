@@ -274,9 +274,9 @@ class RadarReentryMixin:
             or getattr(self, "current_atr", 0)
             or 0
         )
-        if atr <= 0 and hasattr(self, "_get_locked_initial_atr"):
+        if atr <= 0 and hasattr(self, "_locked_initial_atr"):
             try:
-                atr = float(self._get_locked_initial_atr() or 0)
+                atr = float(self._locked_initial_atr() or 0)
             except Exception:
                 atr = 0.0
         profile = getattr(self, "breath_profile", None) or {}

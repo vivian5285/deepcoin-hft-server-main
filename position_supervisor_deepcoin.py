@@ -1260,7 +1260,7 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             _atr = float(getattr(self, "open_atr", 0) or getattr(self, "cycle_open_atr", 0) or 0)
             if _atr <= 0:
                 try:
-                    _atr = float(self._get_locked_initial_atr() or 0)
+                    _atr = float(self._locked_initial_atr() or 0)
                 except Exception:
                     _atr = 0.0
             if _entry > 0 and _atr > 0:
@@ -9223,7 +9223,11 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
             tp1_px = float(tps[0] or 0) if len(tps) > 0 else 0.0
             tp2_px = float(tps[1] or 0) if len(tps) > 1 else 0.0
             if tp1_px > 0 and tp2_px > 0:
-                self.radar_activation_price = radar_gate_price_from_tps(tp1_px, tp2_px)
+                self.radar_activation_price = radar_gate_price_from_tps(
+                    tp1_px, tp2_px,
+                    entry=float(entry_price or 0),
+                    atr=float(self._locked_initial_atr() or 0),
+                )
         except Exception:
             pass
 
@@ -9382,11 +9386,15 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
         tp1_px = float(tps[0] or 0) if len(tps) > 0 else 0.0
         tp2_px = float(tps[1] or 0) if len(tps) > 1 else 0.0
         attempt = int(getattr(self, "reentry_attempt", 0) or 0)
+        entry_px = float(getattr(self, "watched_entry", 0) or 0)
+        atr_v = float(self._locked_initial_atr() or 0)
 
         # ?????????????
         if frozen > 0 and tp1_px > 0 and tp2_px > 0:
             if not activated:
-                expect = radar_gate_price_from_tps(tp1_px, tp2_px, attempt)
+                expect = radar_gate_price_from_tps(
+                    tp1_px, tp2_px, attempt, entry=entry_px, atr=atr_v,
+                )
                 if expect > 0 and abs(frozen - expect) / max(expect, 1e-9) > 0.002:
                     self.radar_activation_price = expect
                     return expect
@@ -9394,7 +9402,9 @@ class PositionSupervisor(PipelineBridgeMixin, RadarReentryMixin):
 
         # ????
         if tp1_px > 0 and tp2_px > 0:
-            px = radar_gate_price_from_tps(tp1_px, tp2_px, attempt)
+            px = radar_gate_price_from_tps(
+                tp1_px, tp2_px, attempt, entry=entry_px, atr=atr_v,
+            )
             if px > 0:
                 self.radar_activation_price = px
                 return px

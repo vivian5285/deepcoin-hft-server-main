@@ -160,6 +160,9 @@ def _tick_size(profile: Dict[str, Any]) -> float:
     return t if t > 0 else 0.01
 
 
+TP3_CONFIRM_ATR = 1.0  # 刚过TP3但还没走出这么远之前，呼吸空间暂不放宽到tp3_plus
+
+
 def _zone_trail_atr(
     *,
     side: str,
@@ -174,19 +177,28 @@ def _zone_trail_atr(
 ) -> Tuple[float, str]:
     """
     按价格相对 TP 进度返回呼吸空间（×ATR）与区名。
-    TP1–TP2 → breath_tp12；TP2–TP3 → breath_tp23；TP3+ → coeff(min~max)。
+    TP1–TP2 → breath_tp12；TP2–TP3 → breath_tp23；
+    刚过TP3但还没走出 tp3_confirm_atr(默认1×ATR) → tp3_confirm，仍用 breath_tp23
+    这么紧（防"一冲到TP3就立刻回落"的假突破，不另挂TP3限价单跟雷达抢单——
+    两条腿同时在场有竞态成交风险，binance v15.9.0 踩过、v16.4.0 已删除）；
+    确认走出这段缓冲、真延续了 → tp3_plus，放开到 coeff(min~max)。
     """
     side_u = str(side or "").upper()
     b12 = float(profile.get("breath_tp12") or 1.2)
     b23 = float(profile.get("breath_tp23") or 1.6)
     tp1_a = float(profile.get("tp1_atr") or TP1_ATR)
     tp2_a = float(profile.get("tp2_atr") or TP2_ATR)
+    confirm_atr = float(
+        profile.get("tp3_confirm_atr")
+        if profile.get("tp3_confirm_atr") is not None
+        else TP3_CONFIRM_ATR
+    )
 
     # 优先 TV 价；否则用 ATR 倍数估进度
     if side_u == "LONG":
-        past_tp3 = (tp3_px > 0 and price >= tp3_px) or (
-            tp3_px <= 0 and price >= entry + (tp2_a + 1.0) * atr
-        )
+        tp3_ref = tp3_px if tp3_px > 0 else entry + (tp2_a + 1.0) * atr
+        past_tp3 = price >= tp3_ref
+        past_tp3_confirmed = price >= tp3_ref + confirm_atr * atr
         past_tp2 = (tp2_px > 0 and price >= tp2_px) or (
             tp2_px <= 0 and price >= entry + tp2_a * atr
         )
@@ -194,9 +206,9 @@ def _zone_trail_atr(
             tp1_px <= 0 and price >= entry + tp1_a * atr
         )
     else:
-        past_tp3 = (tp3_px > 0 and price <= tp3_px) or (
-            tp3_px <= 0 and price <= entry - (tp2_a + 1.0) * atr
-        )
+        tp3_ref = tp3_px if tp3_px > 0 else entry - (tp2_a + 1.0) * atr
+        past_tp3 = price <= tp3_ref
+        past_tp3_confirmed = price <= tp3_ref - confirm_atr * atr
         past_tp2 = (tp2_px > 0 and price <= tp2_px) or (
             tp2_px <= 0 and price <= entry - tp2_a * atr
         )
@@ -204,8 +216,10 @@ def _zone_trail_atr(
             tp1_px <= 0 and price <= entry - tp1_a * atr
         )
 
-    if past_tp3:
+    if past_tp3_confirmed:
         return float(coeff), "tp3_plus"
+    if past_tp3:
+        return b23, "tp3_confirm"
     if past_tp2:
         return b23, "tp2_tp3"
     if past_tp1:
@@ -281,7 +295,7 @@ def calculate_stop_long(
     # 马拉松：禁止 TP1/TP2 强制底线抬升（floor_atr<=0 跳过）
     f1 = float(p.get("tp1_floor_atr") or 0.0)
     f2 = float(p.get("tp2_floor_atr") or 0.0)
-    if f2 > 0 and zone in ("tp2_tp3", "tp3_plus"):
+    if f2 > 0 and zone in ("tp2_tp3", "tp3_confirm", "tp3_plus"):
         candidate = max(candidate, entry_price + f2 * initial_atr)
     elif f1 > 0 and zone == "tp1_tp2":
         candidate = max(candidate, entry_price + f1 * initial_atr)
@@ -364,7 +378,7 @@ def calculate_stop_short(
     # 马拉松：禁止 TP1/TP2 强制底线（floor_atr<=0 跳过）
     f1 = float(p.get("tp1_floor_atr") or 0.0)
     f2 = float(p.get("tp2_floor_atr") or 0.0)
-    if f2 > 0 and zone in ("tp2_tp3", "tp3_plus"):
+    if f2 > 0 and zone in ("tp2_tp3", "tp3_confirm", "tp3_plus"):
         floor = entry_price - f2 * initial_atr
         candidate = min(candidate, floor) if candidate > 0 else floor
     elif f1 > 0 and zone == "tp1_tp2":

@@ -481,17 +481,34 @@ def radar_activation_price_adx(
     return round(entry_f - dist, 4)
 
 
+RADAR_GATE_TP1_PROGRESS = 0.8  # 首次开仓：entry→TP1 走完 80%（剩 20%）即激活
+RADAR_GATE_ATR_MULT = 1.5  # 首次开仓：顺向浮盈达到 1.5×ATR 即激活（双触发的另一条腿，对齐binance f162ede数值）
+
+
 def radar_gate_price_from_tps(
     tp1: float,
     tp2: float,
     reentry_attempt: int = 0,
+    entry: float = 0.0,
+    atr: float = 0.0,
     **kwargs,
 ) -> float:
     """
-    【规格 v1.0 · 绝对价格锚定】
-    首次开仓：雷达激活价 = (TP1 + TP2) / 2
-    重入开仓：雷达激活价 = TP2（价格必须真正到达 TP2 才接管）
-    不再使用 ADX 比例 × TP1 距离的旧公式。
+    【规格 v2.1 · TP1临近/ATR双触发（首次，谁先到用谁）· TP2激活（重入）】
+    对齐币安同款修复（binance commit c3c6522 + f162ede）：
+    - 首次开仓 reentry_attempt=0：雷达激活价 = entry 沿盈利方向推进
+      min(0.8×|TP1-entry|, 1.5×ATR) 的距离——即"距TP1剩20%"和"顺向浮盈满
+      1.5×ATR"两条线谁先到就用谁。
+      单纯按 TP1 距离的老公式有个漏洞：强趋势档 TP1 定得更远，连带触发
+      点也被动拉远，导致强趋势单反而更容易在触发前把浮盈吐回去。加一条
+      独立的 ATR 触发线兜底，同时保留 TP1 这条线。
+      ATR 倍数直接对齐 binance 数值（1.5），未按 deepcoin 自己 TV 策略
+      （深币策略.txt）实际分档保本触发（弱0.41×ATR~强1.47×ATR，regime
+      相关）逐档精确校准——2026-08-10 已确认差异并跟用户核实过，用户
+      选择先用统一数值对齐，未来若要精确对齐需解析 webhook 的 tp1_m
+      字段按 regime 动态计算。
+      entry/atr 缺失时（旧调用点未传参）回退到中点公式，保持向后兼容。
+    - 重入开仓 reentry_attempt>=1：雷达激活价 = TP2（不变）
     """
     t1 = float(tp1 or 0)
     t2 = float(tp2 or 0)
@@ -501,17 +518,25 @@ def radar_gate_price_from_tps(
     if attempt >= 1:
         # 重入开仓：TP2 绝对价格
         return round(t2, 4)
-    else:
-        # 首次开仓：TP1-TP2 区间中点
+    e = float(entry or 0)
+    a = float(atr or 0)
+    if e <= 0:
+        # 兼容旧调用签名（未传 entry）：退回 TP1-TP2 区间中点
         return round((t1 + t2) / 2.0, 4)
+    direction = 1.0 if t1 >= e else -1.0
+    dist_tp1 = RADAR_GATE_TP1_PROGRESS * abs(t1 - e)
+    dist_atr = RADAR_GATE_ATR_MULT * a if a > 0 else dist_tp1
+    dist = min(dist_tp1, dist_atr)
+    gate = e + direction * dist
+    return round(gate, 4)
 
 
 def radar_gate_label(reentry_attempt: int = 0, ratio: Optional[float] = None) -> str:
-    """规格 v2.1：绝对价格锚定标签（首次=TP1-TP2中点，重入=TP2绝对价）。
+    """规格 v2.0：TP1临近/ATR双触发标签（首次=双触发，重入=TP2绝对价）。
     ratio 参数已废弃（旧 ADX 插值比例公式不再驱动激活判断），保留仅为
     兼容旧调用签名。"""
     _ = ratio
-    return "TP2绝对价" if int(reentry_attempt or 0) >= 1 else "TP1-TP2中点"
+    return "TP2绝对价" if int(reentry_attempt or 0) >= 1 else "TP1临近/ATR双触发"
 
 
 def tier_coeffs(tier: int, profile: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
